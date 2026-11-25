@@ -45,6 +45,8 @@ export interface PropInfo {
   resolved?: {
     via: 'const' | 'useMemo';
     name: string;
+    /** Start offset of the declarator; props resolving to the same value share this. */
+    declStart: number;
     targetStart: number;
     targetEnd: number;
     /** How many props in this file read the same binding (editing it changes all of them). */
@@ -285,7 +287,7 @@ export function analyze(source: string, file = '<memory>'): Analysis {
             : null;
           if (found) {
             binding = found;
-            info.resolved = { via: found.via, name: found.name, targetStart: found.target.start, targetEnd: found.target.end, sharedBy: 1 };
+            info.resolved = { via: found.via, name: found.name, declStart: found.declStart, targetStart: found.target.start, targetEnd: found.target.end, sharedBy: 1 };
             if (isLiteral(found.target, name)) {
               info.kind = 'resolved';
               const ev = evalLiteral(found.target);
