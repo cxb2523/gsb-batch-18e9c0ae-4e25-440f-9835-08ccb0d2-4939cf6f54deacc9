@@ -133,7 +133,7 @@ p {
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(5, 86px);
+  grid-template-columns: repeat(6, 86px);
   overflow: hidden;
 }
 
@@ -149,6 +149,8 @@ p {
 .stats span {
   display: block;
   font-weight: 800;
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .stats strong {
@@ -156,6 +158,21 @@ p {
   margin-top: 4px;
   font-size: 19px;
   font-variant-numeric: tabular-nums;
+}
+
+#shield.flash {
+  animation: stat-pulse 320ms ease;
+}
+
+@keyframes stat-pulse {
+  0% {
+    color: var(--green);
+    text-shadow: 0 0 12px rgba(98, 245, 154, 0.85);
+  }
+  100% {
+    color: inherit;
+    text-shadow: none;
+  }
 }
 
 .actions {
@@ -255,7 +272,7 @@ p {
   }
 
   .stats {
-    grid-template-columns: repeat(5, 1fr);
+    grid-template-columns: repeat(6, 1fr);
   }
 
   .stats div {

@@ -1,34 +1,42 @@
 import * as THREE from 'three';
+import {
+  HIT_RESULT,
+  clearRunCollections,
+  collectCoin,
+  collectShield,
+  createRunState,
+  loadArchive,
+  recordScore,
+  resetRun,
+  resolveObstacleHit,
+} from './game-state.js';
 
 const lanes = [-3.1, 0, 3.1];
 const groundY = 0.85;
+
+// Two layers of coin state:
+// - `archive` (best score + total coins) is the durable localStorage layer.
+// - `state` holds the current run only and is rebuilt from scratch on restart.
+const storage = (() => {
+  try {
+    return window.localStorage;
+  } catch {
+    return null; // Sandboxed/blocked storage: game still runs, nothing persists.
+  }
+})();
+const archive = loadArchive(storage);
 const state = {
+  ...createRunState(),
   running: false,
   paused: false,
   over: false,
-  lane: 1,
-  targetX: 0,
-  score: 0,
-  best: Number(localStorage.getItem('void-runner-best') || 0),
-  coins: Number(localStorage.getItem('void-runner-coins') || 0),
-  combo: 1,
-  comboTimer: 0,
-  shield: 0,
-  speed: 17,
-  spawnTimer: 0,
-  coinTimer: 0,
-  islandTimer: 0,
-  elapsed: 0,
-  jumpVelocity: 0,
-  sliding: false,
-  slideTimer: 0,
-  landedTimer: 0,
 };
 
 const ui = {
   score: document.querySelector('#score'),
   best: document.querySelector('#best'),
   coins: document.querySelector('#coins'),
+  runCoins: document.querySelector('#runCoins'),
   combo: document.querySelector('#combo'),
   shield: document.querySelector('#shield'),
   center: document.querySelector('#center-panel'),
@@ -144,6 +152,14 @@ for (let i = 0; i < 22; i += 1) {
   bridge.add(rightEdge);
 }
 
+const bridgeStartZ = bridge.children.map((mesh) => mesh.position.z);
+
+function resetBridge() {
+  bridge.children.forEach((mesh, index) => {
+    mesh.position.z = bridgeStartZ[index];
+  });
+}
+
 function spawnIsland(z = -80) {
   const group = new THREE.Group();
   const side = Math.random() > 0.5 ? 1 : -1;
@@ -208,10 +224,19 @@ function formatScore(value) {
 
 function updateUi() {
   ui.score.textContent = formatScore(state.score);
-  ui.best.textContent = formatScore(state.best);
-  ui.coins.textContent = String(state.coins).padStart(3, '0');
+  ui.best.textContent = formatScore(archive.best);
+  ui.coins.textContent = String(archive.coins).padStart(3, '0');
+  if (ui.runCoins) ui.runCoins.textContent = String(state.sessionCoins).padStart(3, '0');
   ui.combo.textContent = `x${state.combo}`;
   ui.shield.textContent = String(state.shield);
+}
+
+// Restart the CSS pulse on the shield readout so a shield break is visible
+// immediately instead of waiting for the next paint of the same value.
+function pulseShield() {
+  ui.shield.classList.remove('flash');
+  void ui.shield.offsetWidth;
+  ui.shield.classList.add('flash');
 }
 
 function setMessage(eyebrow, title, copy, button = 'Start Run') {
@@ -226,50 +251,42 @@ function hideMessage() {
   ui.center.classList.add('hidden');
 }
 
+function disposeTree(root) {
+  root?.traverse?.((child) => {
+    if (child.isMesh || child.isPoints) child.geometry?.dispose();
+  });
+}
+
+// Tear down every scene object that belongs to a run (obstacles, pickups,
+// particles, islands) and empty the tracking arrays. Shared materials are kept;
+// per-particle materials are created per burst and disposed with them.
 function clearRunObjects() {
-  [...obstacles, ...pickups, ...particles].forEach((item) => scene.remove(item.mesh));
-  obstacles.length = 0;
-  pickups.length = 0;
-  particles.length = 0;
+  clearRunCollections({ obstacles, pickups, particles, islands }, (item, kind) => {
+    scene.remove(item.mesh);
+    disposeTree(item.mesh);
+    if (kind === 'particles') item.mesh.material?.dispose?.();
+  });
 }
 
 function startRun() {
   clearRunObjects();
-  Object.assign(state, {
-    running: true,
-    paused: false,
-    over: false,
-    lane: 1,
-    targetX: 0,
-    score: 0,
-    combo: 1,
-    comboTimer: 0,
-    shield: 0,
-    speed: 17,
-    spawnTimer: 0.3,
-    coinTimer: 0.6,
-    islandTimer: 1,
-    elapsed: 0,
-    jumpVelocity: 0,
-    sliding: false,
-    slideTimer: 0,
-    landedTimer: 0,
-  });
+  resetRun(state);
+  resetBridge();
   runner.position.set(0, groundY, 1.2);
   runner.rotation.set(0, 0, 0);
+  for (let i = 0; i < 8; i += 1) spawnIsland(-20 - i * 18);
   ui.pause.textContent = 'Pause';
   hideMessage();
   updateUi();
 }
 
 function gameOver() {
+  if (state.over) return;
   state.running = false;
   state.over = true;
-  state.best = Math.max(state.best, Math.floor(state.score));
-  localStorage.setItem('void-runner-best', String(state.best));
-  localStorage.setItem('void-runner-coins', String(state.coins));
+  recordScore(archive, state.score, storage);
   updateUi();
-  setMessage('Run ended', 'The bridge claimed you', `Score ${formatScore(state.score)} with a x${state.combo} combo. Restart and chase the moon bridge again.`, 'Run Again');
+  setMessage('Run ended', 'The bridge claimed you', `Score ${formatScore(state.score)} with a x${state.combo} combo. You banked ${state.sessionCoins} coin${state.sessionCoins === 1 ? '' : 's'} this run. Restart and chase the moon bridge again.`, 'Run Again');
 }
 
 function togglePause() {
@@ -353,13 +370,15 @@ function spawnObstacle() {
   obstacles.push({ mesh: group, type, rule, radius, scored: false });
 }
 
-function spawnPickup(type = Math.random() > 0.84 ? 'shield' : 'coin') {
-  const lane = Math.floor(Math.random() * lanes.length);
+function spawnPickup(type = Math.random() > 0.84 ? 'shield' : 'coin', options = {}) {
+  const lane = options.lane ?? Math.floor(Math.random() * lanes.length);
+  const z = options.z ?? -82;
+  const y = options.y ?? (type === 'shield' ? 1.55 : 1.25 + Math.random() * 1.25);
   const mesh = new THREE.Mesh(
     type === 'shield' ? new THREE.OctahedronGeometry(0.45, 0) : new THREE.TorusGeometry(0.42, 0.1, 12, 30),
     type === 'shield' ? materials.shield : materials.amber,
   );
-  mesh.position.set(lanes[lane], type === 'shield' ? 1.55 : 1.25 + Math.random() * 1.25, -82);
+  mesh.position.set(lanes[lane], y, z);
   scene.add(mesh);
   pickups.push({ mesh, type, radius: 0.8 });
 }
@@ -384,6 +403,20 @@ function runnerClearance(rule) {
   if (rule === 'jump') return runner.position.y > groundY + 1.05;
   if (rule === 'slide') return state.sliding;
   return false;
+}
+
+// Single entry point for an unmitigated collision so the shield path and the
+// game-over path can never drift apart (`__voidRunner` debug hook reuses it).
+function applyObstacleHit(position) {
+  if (resolveObstacleHit(state) === HIT_RESULT.ABSORBED) {
+    burst(position, 0x62f59a);
+    updateUi();
+    pulseShield();
+    return HIT_RESULT.ABSORBED;
+  }
+  burst(position, 0xff4266);
+  gameOver();
+  return HIT_RESULT.GAME_OVER;
 }
 
 function updateRunner(delta) {
@@ -453,12 +486,14 @@ function updateMovingCollection(collection, delta, onNear, onMiss) {
     if (distance < item.radius) {
       onNear(item);
       scene.remove(item.mesh);
+      disposeTree(item.mesh);
       collection.splice(i, 1);
       continue;
     }
     if (item.mesh.position.z > 8) {
       onMiss?.(item);
       scene.remove(item.mesh);
+      disposeTree(item.mesh);
       collection.splice(i, 1);
     }
   }
@@ -471,26 +506,21 @@ function updateWorldObjects(delta) {
       burst(item.mesh.position, 0xffcf5a);
       return;
     }
-    if (state.shield > 0) {
-      state.shield -= 1;
-      state.combo = 1;
-      burst(item.mesh.position, 0x62f59a);
-      return;
-    }
-    burst(item.mesh.position, 0xff4266);
-    gameOver();
+    applyObstacleHit(item.mesh.position);
   }, (item) => {
     if (!item.scored) addCombo(90);
   });
 
   updateMovingCollection(pickups, delta, (item) => {
     if (item.type === 'shield') {
-      state.shield = Math.min(3, state.shield + 1);
+      collectShield(state);
       burst(item.mesh.position, 0x62f59a);
+      updateUi();
     } else {
-      state.coins += 1;
+      collectCoin(state, archive, storage);
       addCombo(120);
       burst(item.mesh.position, 0xffcf5a);
+      updateUi();
     }
   });
 
@@ -500,6 +530,7 @@ function updateWorldObjects(delta) {
     island.mesh.rotation.y += delta * 0.12;
     if (island.mesh.position.z > 18) {
       scene.remove(island.mesh);
+      disposeTree(island.mesh);
       islands.splice(i, 1);
     }
   }
@@ -511,6 +542,8 @@ function updateWorldObjects(delta) {
     particle.mesh.material.opacity = Math.max(0, particle.life);
     if (particle.life <= 0) {
       scene.remove(particle.mesh);
+      particle.mesh.geometry?.dispose();
+      particle.mesh.material?.dispose();
       particles.splice(i, 1);
     }
   }
@@ -558,3 +591,22 @@ window.addEventListener('resize', () => {
 
 updateUi();
 tick();
+
+// Manual verification hook: open the browser console and use these to drive the
+// flows described in README.md without waiting for a lucky spawn.
+window.__voidRunner = {
+  getState: () => ({ ...state }),
+  getArchive: () => ({ ...archive }),
+  getSceneCounts: () => ({
+    obstacles: obstacles.length,
+    pickups: pickups.length,
+    particles: particles.length,
+    islands: islands.length,
+    sceneChildren: scene.children.length,
+  }),
+  startRun,
+  spawnPickup: (type = 'coin', options = {}) => spawnPickup(type, options),
+  spawnIsland: (z = -40) => spawnIsland(z),
+  hitObstacle: (position = runner.position) => applyObstacleHit(position),
+  pulseShield,
+};
