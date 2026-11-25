@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rooftop Sniper: Last Light</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%23f0a45a' stroke-width='2.5'/%3E%3Cpath d='M16 3v10M16 19v10M3 16h10M19 16h10' stroke='%23f0a45a' stroke-width='2'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="game"></canvas>
+      <div id="vignette"></div>
+
+      <!-- ===== scope ===== -->
+      <div id="scope" class="hidden">
+        <svg id="reticle" viewBox="-100 -100 200 200" aria-hidden="true">
+          <circle r="99.4" fill="none" stroke="rgba(0,0,0,0.85)" stroke-width="1.4" />
+          <line x1="-100" y1="0" x2="-7" y2="0" stroke="#050505" stroke-width="1.6" />
+          <line x1="7" y1="0" x2="100" y2="0" stroke="#050505" stroke-width="1.6" />
+          <line x1="0" y1="-100" x2="0" y2="-7" stroke="#050505" stroke-width="1.6" />
+          <line x1="0" y1="7" x2="0" y2="100" stroke="#050505" stroke-width="0.5" />
+          <line x1="-7" y1="0" x2="7" y2="0" stroke="#050505" stroke-width="0.35" />
+          <line x1="0" y1="-7" x2="0" y2="0" stroke="#050505" stroke-width="0.35" />
+          <line x1="-100" y1="0" x2="-60" y2="0" stroke="#050505" stroke-width="3.2" />
+          <line x1="60" y1="0" x2="100" y2="0" stroke="#050505" stroke-width="3.2" />
+          <line x1="0" y1="-100" x2="0" y2="-60" stroke="#050505" stroke-width="3.2" />
+          <line x1="0" y1="60" x2="0" y2="100" stroke="#050505" stroke-width="3.2" />
+          <circle r="0.9" fill="#d9532e" />
+          <g id="holdover-marks"></g>
+        </svg>
+        <div id="scope-zoom">8×</div>
+        <div id="breath"><span>STEADY</span><div class="bar"><i></i></div></div>
+      </div>
+      <div id="scope-flash"></div>
+
+      <div id="crosshair" class="hidden"><i></i><i></i><i></i><i></i></div>
+      <div id="hold-mark" class="hidden"><span>◇</span><em>HOLD</em></div>
+      <div id="hitmarker"></div>
+      <div id="range-readout" class="hidden">DISTANCE — m</div>
+
+      <div id="id-panel" class="hidden">
+        <div class="row type"><span>TARGET</span><b id="id-type">HOSTILE</b></div>
+        <div class="row"><span>RANGE</span><b id="id-range">0 m</b></div>
+        <div class="row"><span>STATUS</span><b id="id-status">EXPOSED</b></div>
+      </div>
+
+      <!-- ===== HUD ===== -->
+      <div id="hud" class="hidden">
+        <div class="hud-tl">
+          <div class="stat big"><span>TIME</span><b id="hud-time">3:00</b></div>
+          <div class="stat"><span>HOSTILES</span><b id="hud-hostiles">5</b></div>
+          <div class="stat"><span>CIVILIAN HITS</span><b id="hud-civ">0</b></div>
+        </div>
+        <div class="hud-tc">
+          <div id="wind"><span>WIND</span><b id="wind-arrow">→</b><b id="wind-speed">0.0 m/s</b></div>
+        </div>
+        <div class="hud-tr">
+          <div class="stat big"><span>SCORE</span><b id="hud-score">0</b></div>
+        </div>
+        <div class="hud-br">
+          <div id="ammo">
+            <div id="ammo-rounds"></div>
+            <div class="ammo-text"><b id="ammo-mag">5</b><span>/ <i id="ammo-reserve">15</i></span></div>
+            <div id="ammo-status">READY</div>
+            <div id="reload-bar"><i></i></div>
+          </div>
+        </div>
+        <div class="hud-bl">
+          <div id="help">
+            <div class="help-title">CONTROLS <em>(H to hide)</em></div>
+            <div><kbd>Mouse</kbd> aim · <kbd>LMB</kbd> fire</div>
+            <div><kbd>RMB</kbd> scope · <kbd>Wheel</kbd>/<kbd>Q</kbd><kbd>E</kbd> zoom</div>
+            <div><kbd>Shift</kbd> steady · <kbd>R</kbd> reload</div>
+            <div><kbd>WASD</kbd> shift position · <kbd>Esc</kbd> pause</div>
+            <div class="drag-hint hidden">Drag to aim · click (no drag) to fire</div>
+          </div>
+        </div>
+        <div class="hud-bc">
+          <button id="btn-aim" class="aim-btn" type="button">AIM</button>
+        </div>
+        <div id="feed"></div>
+        <div id="miss-info"></div>
+      </div>
+
+      <div id="warning" class="hidden"><b>CIVILIAN HIT</b><span>−1500 · MISSION INTEGRITY COMPROMISED</span></div>
+      <div id="lock-prompt" class="hidden">
+        <b>CLICK TO TAKE AIM</b>
+        <span>The first click only captures the mouse — it will not fire.</span>
+      </div>
+      <div id="toast"></div>
+
+      <!-- ===== screens ===== -->
+      <section id="screen-loading" class="screen show">
+        <div class="loading">PREPARING THE CITY…</div>
+      </section>
+
+      <section id="screen-title" class="screen">
+        <div class="title-wrap">
+          <div class="kicker">OPERATION DUSKFALL · MISSION 01</div>
+          <h1>ROOFTOP SNIPER<span>LAST LIGHT</span></h1>
+          <p class="tagline">One rooftop. Three minutes of sun. Five hostiles hidden among the living.</p>
+          <div class="btn-col">
+            <button class="btn primary" id="btn-start" type="button">START MISSION</button>
+            <button class="btn" id="btn-audio-title" type="button">AUDIO: ON</button>
+          </div>
+          <div class="controls-card">
+            <div><kbd>Mouse</kbd> Aim</div>
+            <div><kbd>Left click</kbd> Fire</div>
+            <div><kbd>Right click</kbd> Scope in / out</div>
+            <div><kbd>Wheel</kbd> Scope zoom</div>
+            <div><kbd>Shift</kbd> Hold breath (steady)</div>
+            <div><kbd>R</kbd> Reload</div>
+            <div><kbd>W A S D</kbd> Shift position</div>
+            <div><kbd>Esc</kbd> Pause</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="screen-briefing" class="screen">
+        <div class="panel briefing">
+          <div class="kicker">MISSION BRIEFING</div>
+          <h2>LAST LIGHT</h2>
+          <div class="brief-grid">
+            <div class="brief-text">
+              <p>Armed spotters are coordinating a strike from the rooftops across the river district. Take them out before the sun sets and they vanish into the dark.</p>
+              <ul>
+                <li><b>Eliminate 5 hostiles</b> — 4 armed spotters and 1 recon drone.</li>
+                <li><b>Avoid civilians.</b> Residents are on the same roofs. A civilian hit costs 1500 points; two hits end the mission.</li>
+                <li><b>3:00 on the clock.</b> 20 rounds, 5-round magazine.</li>
+                <li>Hostiles carry a faint <b class="amber">IR strobe</b> on the shoulder — visible only through the scope.</li>
+                <li>Distant targets need holdover. Aim at the <b class="amber">◇ HOLD</b> mark, or use the reticle's range ticks.</li>
+              </ul>
+            </div>
+            <div class="brief-cards">
+              <div class="id-card hostile">
+                <svg viewBox="0 0 60 110" aria-label="Hostile silhouette">
+                  <path d="M24 12 a8 8 0 0 1 16 0 v3 h-16z" fill="#2b2e27" />
+                  <circle cx="32" cy="17" r="7" fill="#2a2724" />
+                  <rect x="20" y="25" width="24" height="34" rx="2" fill="#23261f" />
+                  <rect x="41" y="22" width="9" height="26" fill="#2a2c25" />
+                  <line x1="47" y1="22" x2="49" y2="2" stroke="#111" stroke-width="1" />
+                  <rect x="8" y="36" width="40" height="5" transform="rotate(-18 28 38)" fill="#0f0f0f" />
+                  <rect x="22" y="58" width="9" height="44" fill="#2c2d2c" />
+                  <rect x="33" y="58" width="9" height="44" fill="#2c2d2c" />
+                  <circle cx="22" cy="27" r="2.2" fill="#ff7a3a" />
+                </svg>
+                <b>HOSTILE</b>
+                <span>Helmet · plate carrier · rifle · radio pack · IR strobe</span>
+              </div>
+              <div class="id-card civilian">
+                <svg viewBox="0 0 60 110" aria-label="Civilian silhouette">
+                  <circle cx="30" cy="16" r="7" fill="#c89a78" />
+                  <path d="M23 14 a7 7 0 0 1 14 0z" fill="#3a281c" />
+                  <rect x="20" y="25" width="20" height="32" rx="2" fill="#d9d3c5" />
+                  <rect x="14" y="26" width="5" height="26" fill="#d9d3c5" />
+                  <rect x="41" y="12" width="5" height="18" fill="#d9d3c5" transform="rotate(-20 43 20)" />
+                  <rect x="21" y="57" width="8" height="45" fill="#3f5878" />
+                  <rect x="31" y="57" width="8" height="45" fill="#3f5878" />
+                </svg>
+                <b>CIVILIAN</b>
+                <span>Bare head · light shirt · phone or bag · relaxed walk</span>
+              </div>
+            </div>
+          </div>
+          <div class="btn-row">
+            <button class="btn" id="btn-brief-back" type="button">BACK</button>
+            <button class="btn primary" id="btn-begin" type="button">BEGIN</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="screen-pause" class="screen">
+        <div class="panel small">
+          <div class="kicker">MISSION PAUSED</div>
+          <h2>HOLDING POSITION</h2>
+          <div class="btn-col">
+            <button class="btn primary" id="btn-resume" type="button">RESUME</button>
+            <button class="btn" id="btn-restart" type="button">RESTART MISSION</button>
+            <button class="btn" id="btn-controls" type="button">CONTROLS</button>
+            <button class="btn" id="btn-audio-pause" type="button">AUDIO: ON</button>
+            <button class="btn" id="btn-quit" type="button">RETURN TO TITLE</button>
+          </div>
+          <div id="pause-controls" class="controls-card hidden">
+            <div><kbd>Mouse</kbd> Aim</div>
+            <div><kbd>Left click</kbd> Fire</div>
+            <div><kbd>Right click</kbd> / AIM button: scope</div>
+            <div><kbd>Wheel</kbd> or <kbd>Q</kbd>/<kbd>E</kbd> Zoom</div>
+            <div><kbd>Shift</kbd> Hold breath</div>
+            <div><kbd>R</kbd> Reload</div>
+            <div><kbd>WASD</kbd>/<kbd>Arrows</kbd> Move</div>
+            <div><kbd>H</kbd> Help panel · <kbd>M</kbd> Mute</div>
+            <label class="sens">Mouse sensitivity <input id="sens" type="range" min="0.3" max="2.5" step="0.05" value="1" /><output id="sens-val">1.00</output></label>
+          </div>
+        </div>
+      </section>
+
+      <section id="screen-results" class="screen">
+        <div class="panel small">
+          <div class="kicker" id="res-kicker">MISSION REPORT</div>
+          <h2 id="res-title">MISSION SUCCESS</h2>
+          <p id="res-reason"></p>
+          <div class="results">
+            <div><span>SCORE</span><b id="res-score">0</b></div>
+            <div><span>HOSTILES ELIMINATED</span><b id="res-kills">0 / 5</b></div>
+            <div><span>CIVILIAN HITS</span><b id="res-civ">0</b></div>
+            <div><span>ACCURACY</span><b id="res-acc">0%</b></div>
+            <div><span>TIME REMAINING</span><b id="res-time">0:00</b></div>
+          </div>
+          <div class="btn-row">
+            <button class="btn" id="btn-res-title" type="button">TITLE</button>
+            <button class="btn primary" id="btn-replay" type="button">REPLAY</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="screen-error" class="screen">
+        <div class="panel small">
+          <h2>CAN'T START</h2>
+          <p id="error-text"></p>
+        </div>
+      </section>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

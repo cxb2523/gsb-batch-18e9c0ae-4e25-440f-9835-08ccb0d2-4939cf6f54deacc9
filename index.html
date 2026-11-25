@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Claude Opus 5.5 Games</title>
+<meta name="description" content="Three browser games built with Claude Opus 5.5 and three.js. No install. Click and play.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Cinzel:wght@900&family=Bebas+Neue&family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root { --bg: #07060d; --ink: #e9eef8; --dim: #97a3b8; --line: rgba(255,255,255,.1); }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--ink); font-family: 'Rajdhani', system-ui, sans-serif; min-height: 100vh;
+    background-image: radial-gradient(ellipse at 50% -10%, rgba(120,90,255,.18), transparent 60%); }
+  a { color: inherit; }
+  header { text-align: center; padding: 64px 16px 36px; }
+  .kicker { font: 700 13px 'Orbitron', sans-serif; letter-spacing: .45em; color: #b9a8ff; }
+  h1 { font: 900 clamp(34px, 6vw, 64px)/1.05 'Orbitron', sans-serif; letter-spacing: .04em; margin: 14px 0 12px; }
+  header p { font-size: 19px; color: var(--dim); max-width: 620px; margin: 0 auto; line-height: 1.45; }
+  main { max-width: 1160px; margin: 0 auto; padding: 8px 16px 64px; display: grid; gap: 22px;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .card { border: 1px solid var(--line); background: rgba(255,255,255,.025); display: flex; flex-direction: column;
+    border-radius: 14px; overflow: hidden; transition: transform .18s, border-color .18s, box-shadow .18s; }
+  .card:hover { transform: translateY(-4px); border-color: var(--accent); box-shadow: 0 14px 40px -18px var(--accent); }
+  .art { height: 190px; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
+  .art span { position: relative; z-index: 1; text-align: center; }
+  .body { padding: 20px 22px 22px; display: flex; flex-direction: column; gap: 12px; flex: 1; }
+  .genre { font: 700 12px 'Orbitron', sans-serif; letter-spacing: .25em; color: var(--accent); }
+  .body p { color: #c3cbda; font-size: 17px; line-height: 1.45; }
+  .keys { font-size: 15px; color: var(--dim); line-height: 1.5; }
+  .keys b { color: var(--ink); font-weight: 700; }
+  .actions { display: flex; gap: 10px; margin-top: auto; padding-top: 6px; flex-wrap: wrap; }
+  .btn { text-decoration: none; font: 700 14px 'Orbitron', sans-serif; letter-spacing: .18em; padding: 12px 20px; border-radius: 8px; }
+  .play { background: var(--accent); color: #0a0810; }
+  .play:hover { filter: brightness(1.15); }
+  .src { border: 1px solid var(--line); color: var(--dim); }
+  .src:hover { color: var(--ink); border-color: var(--dim); }
+
+  .neon { --accent: #39e6ff; }
+  .neon .art { background: radial-gradient(ellipse at 50% 120%, rgba(255,61,207,.45), transparent 60%), linear-gradient(#0a0620, #04020c);
+    background-size: auto; }
+  .neon .art::before { content: ''; position: absolute; inset: -40% -20% 0; transform: perspective(300px) rotateX(58deg);
+    background-image: linear-gradient(rgba(57,230,255,.55) 1px, transparent 1px), linear-gradient(90deg, rgba(57,230,255,.55) 1px, transparent 1px);
+    background-size: 34px 34px; top: 45%; }
+  .neon .art span { font: 900 40px/0.95 'Orbitron', sans-serif; color: #eafcff; text-shadow: 0 0 18px #39e6ff, 0 0 44px rgba(57,230,255,.6); }
+  .neon .art span i { display: block; font-style: normal; color: transparent; -webkit-text-stroke: 1.5px #ff3dcf; text-shadow: 0 0 20px rgba(255,61,207,.8); }
+
+  .mortal { --accent: #e0b25a; }
+  .mortal .art { background: radial-gradient(circle at 50% 60%, rgba(200,40,30,.55), transparent 55%), linear-gradient(#1a0806, #050202); }
+  .mortal .art span { font: 900 44px/1 'Cinzel', serif; color: #ffe2a8; letter-spacing: .04em;
+    text-shadow: 0 2px 0 #6b1c10, 0 0 26px rgba(255,120,60,.6); }
+  .mortal .art span small { display: block; font: 400 22px 'Bebas Neue', sans-serif; letter-spacing: .5em; color: #d8b98a; margin-top: 6px; text-shadow: none; }
+
+  .sniper { --accent: #ff9a4a; }
+  .sniper .art { background: linear-gradient(#2a1540 0%, #b8465a 45%, #ffb05a 72%, #3a2230 73%, #120c16 100%); }
+  .sniper .art::before { content: ''; position: absolute; left: 50%; top: 50%; width: 120px; height: 120px; margin: -60px 0 0 -60px;
+    border: 2px solid rgba(10,8,14,.75); border-radius: 50%;
+    background: linear-gradient(rgba(10,8,14,.75), rgba(10,8,14,.75)) center/2px 100% no-repeat, linear-gradient(rgba(10,8,14,.75), rgba(10,8,14,.75)) center/100% 2px no-repeat; }
+  .sniper .art span { font: 400 46px/0.95 'Bebas Neue', sans-serif; letter-spacing: .08em; color: #fff4e6; text-shadow: 0 3px 18px rgba(0,0,0,.55); }
+  .sniper .art span small { display: block; font-size: 22px; letter-spacing: .4em; color: #ffe0bf; }
+
+  footer { text-align: center; padding: 0 16px 48px; color: var(--dim); font-size: 15px; line-height: 1.6; }
+  footer a { color: #b9a8ff; }
+</style>
+</head>
+<body>
+<header>
+  <div class="kicker">BUILT WITH CLAUDE OPUS 5.5</div>
+  <h1>Three Browser Games</h1>
+  <p>Arena shooter, fighting game and sniper mission, each made with three.js. No install and no account. Pick one and play.</p>
+</header>
+
+<main>
+  <article class="card neon">
+    <div class="art"><span>NEON<i>SIEGE</i></span></div>
+    <div class="body">
+      <div class="genre">SCI-FI ARENA SHOOTER</div>
+      <p>Fight endless robot waves in a neon arena. Dash through bots, reflect their bolts with your shield, grab heavier weapons, and survive the Overseer boss every 5th wave.</p>
+      <div class="keys"><b>WASD</b> move · <b>Mouse</b> aim · <b>Click</b> fire · <b>Space</b> dash · <b>Right click</b> shield · <b>1-5</b> weapons</div>
+      <div class="actions">
+        <a class="btn play" href="neon-siege/">PLAY</a>
+        <a class="btn src" href="https://github.com/PromptEngineer48/claude-opus-5.5-games/tree/main/neon-siege">SOURCE</a>
+      </div>
+    </div>
+  </article>
+
+  <article class="card mortal">
+    <div class="art"><span>MORTAL CLASH<small>HUMAN VS MACHINE</small></span></div>
+    <div class="body">
+      <div class="genre">1V1 FIGHTING GAME</div>
+      <p>A best-of-rounds fighter against a CPU opponent. Pick your fighter and a difficulty, then chain punches into kicks, block, sweep, and land your special.</p>
+      <div class="keys"><b>A/D</b> move · <b>W</b> jump · <b>S</b> crouch · <b>J</b> punch · <b>K</b> kick · <b>L</b> block · <b>I</b> special · <b>Enter</b> start</div>
+      <div class="actions">
+        <a class="btn play" href="mortal-clash/">PLAY</a>
+        <a class="btn src" href="https://github.com/PromptEngineer48/claude-opus-5.5-games/tree/main/mortal-clash">SOURCE</a>
+      </div>
+    </div>
+  </article>
+
+  <article class="card sniper">
+    <div class="art"><span>ROOFTOP SNIPER<small>LAST LIGHT</small></span></div>
+    <div class="body">
+      <div class="genre">FIRST-PERSON SNIPER</div>
+      <p>Sunset over a procedural city. Scope in, tell armed spotters from civilians, account for drop and wind, and clear 5 hostiles before the light goes.</p>
+      <div class="keys"><b>Mouse</b> aim · <b>Click</b> fire · <b>Right click</b> scope · <b>Wheel</b> zoom · <b>Shift</b> hold breath · <b>R</b> reload</div>
+      <div class="actions">
+        <a class="btn play" href="rooftop-sniper/offline/index.html">PLAY</a>
+        <a class="btn src" href="https://github.com/PromptEngineer48/claude-opus-5.5-games/tree/main/rooftop-sniper">SOURCE</a>
+      </div>
+    </div>
+  </article>
+</main>
+
+<footer>
+  Best on a desktop or laptop with keyboard and mouse, in Chrome or Edge.<br>
+  Source and run-locally instructions on <a href="https://github.com/PromptEngineer48/claude-opus-5.5-games">GitHub</a>.
+</footer>
+</body>
+</html>
