@@ -183,6 +183,11 @@ export class Weapon {
   }
 
   update(dt) {
+    // Pause is authoritative: while paused neither bolt/reload timers nor
+    // airborne rounds may advance. (The frame loop already skips this call in
+    // most cases; the guard also keeps direct update() callers honest.)
+    if (this.game.state === 'paused') return;
+
     if (this.state !== 'ready') {
       this.timer -= dt;
       if (this.timer <= 0) {
@@ -200,13 +205,28 @@ export class Weapon {
         }
       }
     }
-    for (let i = this.inFlight.length - 1; i >= 0; i--) {
-      const s = this.inFlight[i];
-      s.t -= dt;
-      if (s.t <= 0) {
-        this.inFlight.splice(i, 1);
-        this.game.resolveShot(s);
-      }
+
+    if (this.inFlight.length === 0) return;
+    for (const s of this.inFlight) s.t -= dt;
+
+    // Resolve in firing order (oldest first). Each round is removed before its
+    // resolver runs so it can only ever settle once; rounds that are already
+    // at/below zero (e.g. they matured across a pause) all settle on this frame.
+    const due = [];
+    for (let i = 0; i < this.inFlight.length; ) {
+      if (this.inFlight[i].t <= 0) due.push(this.inFlight.splice(i, 1)[0]);
+      else i++;
     }
+    for (const s of due) this.game.resolveShot(s);
+  }
+
+  // Resolve every still-airborne round in launch order immediately. Called when
+  // a mission is finalized (ending -> results) so a long-flight round is never
+  // silently discarded by the state transition. Clearing first guarantees each
+  // round resolves exactly once even if a resolver re-enters this weapon.
+  settleAll() {
+    if (this.inFlight.length === 0) return;
+    const pending = this.inFlight.splice(0, this.inFlight.length);
+    for (const s of pending) this.game.resolveShot(s);
   }
 }

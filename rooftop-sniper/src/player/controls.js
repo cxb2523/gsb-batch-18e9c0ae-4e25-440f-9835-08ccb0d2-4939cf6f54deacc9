@@ -195,7 +195,7 @@ export class Controls {
       if (e.code === 'Escape') {
         // With pointer lock, the browser consumes Escape and pointerlockchange pauses us.
         if (g.state === 'playing' && !this.locked) g.pause();
-        else if (g.state === 'paused') g.resume();
+        else if (g.state === 'paused') g.resumeFromKey();
         return;
       }
       if (e.repeat) return;
@@ -209,7 +209,9 @@ export class Controls {
     window.addEventListener('blur', () => {
       this.keys.clear();
       this.drag = null;
-      if (this.game.state === 'playing' && this.mode === 'drag') this.game.pause();
+      // Same close-out as manual Escape / visibilitychange. pause() ignores
+      // non-playing states, so this is safe alongside pointerlockchange.
+      this.game.pause();
     });
   }
 

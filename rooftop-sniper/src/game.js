@@ -77,13 +77,16 @@ export class Game {
 
     window.addEventListener('resize', () => this.onResize());
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden && this.state === 'playing') this.pause();
+      const hidden = document.hidden === true || document.visibilityState === 'hidden';
+      if (hidden && this.state === 'playing') this.pause();
     });
 
     this.timer = new THREE.Timer();
     this.showTitle();
     this.renderer.setAnimationLoop(() => this.frame());
-    if (import.meta.env.DEV) window.__game = this; // handy for debugging in the console
+    // Debug/automation handle (also exposed in production builds so packaged
+    // offline builds can be exercised by browser tests).
+    window.__game = this;
   }
 
   loadSettings() {
@@ -168,14 +171,21 @@ export class Game {
     this.screens.show('pause');
   }
 
-  resume(fromButton = false) {
+  resume() {
     if (this.state !== 'paused') return;
-    // ignore the Escape keypress that may arrive right after the browser released the pointer
-    if (!fromButton && performance.now() - this.pausedAt < 400) return;
     this.state = 'playing';
     this.screens.hideAll();
     this.controls.requestLock();
     this.hud.setLockPrompt(!this.controls.inputActive());
+  }
+
+  // Keyboard resume path. With pointer lock the browser can deliver the Escape
+  // keypress just after pointerlockchange already paused the game; ignore that
+  // one stale press. Programmatic / button resume always goes through resume().
+  resumeFromKey() {
+    if (this.state !== 'paused') return;
+    if (performance.now() - this.pausedAt < 400) return;
+    this.resume();
   }
 
   toggleAudio() {
@@ -234,6 +244,10 @@ export class Game {
   }
 
   checkEnd() {
+    // End conditions are only judged during live play. In particular, pausing
+    // must never trigger the "out of ammunition" ending; the next playing frame
+    // calls checkEnd() again with the real remaining ammunition.
+    if (this.state !== 'playing') return;
     if (this.pendingEnd) return;
     const m = this.mission;
     const remaining = this.targets.hostilesRemaining();
@@ -258,6 +272,10 @@ export class Game {
   }
 
   finishMission() {
+    // Land any rounds that outlasted the ending overlay before stats are
+    // tallied, so a fired bullet is never dropped by the ending -> results
+    // transition and the results screen includes its score/kill.
+    this.weapon.settleAll();
     const { success, reason } = this.pendingEnd;
     const m = this.mission;
     const accuracy = m.shots ? m.hostileHits / m.shots : 0;
