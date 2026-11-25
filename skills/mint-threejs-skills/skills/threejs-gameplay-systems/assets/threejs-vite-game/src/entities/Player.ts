@@ -47,6 +47,15 @@ export class Player {
     this.group.add(nose);
   }
 
+  /** Restore transform and all smoothed motion state to the spawn point. */
+  reset(): void {
+    this.move.set(0, 0);
+    this.targetVelocity.set(0, 0, 0);
+    this.velocity.set(0, 0, 0);
+    this.group.position.set(0, 0, 0);
+    this.group.rotation.set(0, 0, 0);
+  }
+
   update(delta: number, elapsed: number, input: InputController, tuning: PlayerTuning, bounds: ArenaBounds): void {
     input.readMovement(this.move);
     const dash = input.isDashHeld() ? tuning.dashMultiplier : 1;

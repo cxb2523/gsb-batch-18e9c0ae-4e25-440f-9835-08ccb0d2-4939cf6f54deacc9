@@ -1,15 +1,30 @@
 /// <reference types="vite/client" />
 
+interface ThreeGamePickupDiagnostic {
+  index: number;
+  active: boolean;
+  visible: boolean;
+  collected: boolean;
+  position: { x: number; y: number; z: number };
+  rotation: { x: number; y: number; z: number };
+  rotationY: number;
+  coreRotationX: number;
+}
+
 interface ThreeGameDiagnostics {
   frame: number;
   elapsed: number;
   score: number;
   targetScore: number;
   complete: boolean;
+  /** True while screenshot pause freezes the simulation. */
+  paused: boolean;
   player: {
     position: { x: number; y: number; z: number };
     speed: number;
   };
+  /** Per-relay visibility and transform/animation-phase state. */
+  pickups: ThreeGamePickupDiagnostic[];
   renderer: {
     calls: number;
     triangles: number;

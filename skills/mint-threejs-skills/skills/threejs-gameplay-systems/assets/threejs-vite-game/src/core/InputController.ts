@@ -110,6 +110,20 @@ export class InputController {
     return this.dashDown;
   }
 
+  /**
+   * Drop any held keys / stick vector. Used by a full run reset so input that
+   * was held through a state or screenshot-pause transition cannot carry
+   * residual movement into the fresh run.
+   */
+  resetInput(): void {
+    this.keys.clear();
+    this.dashDown = false;
+    this.pointer.set(0, 0);
+    this.pointerState.active = false;
+    this.pointerState.id = null;
+    this.updateKnob();
+  }
+
   dispose(): void {
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('keyup', this.onKeyUp);

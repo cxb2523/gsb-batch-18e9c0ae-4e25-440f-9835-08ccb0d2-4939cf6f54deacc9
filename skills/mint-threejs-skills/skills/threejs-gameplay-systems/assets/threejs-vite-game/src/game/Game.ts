@@ -268,6 +268,9 @@ export class Game {
       },
       setPausedForScreenshot: (paused: boolean) => {
         this.pausedForScreenshot = paused;
+        // Publish immediately so diagnostics match on the same evaluate() tick
+        // as the hook call, even before the next animation frame.
+        this.publishDiagnostics();
       },
       setReducedMotion: (enabled: boolean) => {
         this.reducedMotion = enabled;
@@ -282,15 +285,24 @@ export class Game {
     this.score = 0;
     this.elapsed = 0;
     this.complete = false;
-    this.player.group.position.set(0, this.player.group.position.y, 0);
-    this.player.velocity.set(0, 0, 0);
+    // A restart drops held input and restores the player transform/velocity so
+    // no residual motion or completion state survives. The screenshot-pause
+    // flag is intentionally left untouched: reset while paused must stay
+    // paused until the test explicitly resumes.
+    this.input.resetInput();
+    this.player.reset();
     for (const pickup of this.pickups) {
+      // reset() restores visibility AND every animation phase (rotation, core
+      // spin, float phase); then the seeded RNG gives a fresh deterministic
+      // spawn rotation instead of the pre-collection angle.
       pickup.reset();
       pickup.group.rotation.y = this.rng() * Math.PI * 2;
     }
     this.cameraRig.snapTo(this.player.group.position);
     this.hud.setTarget(this.pickups.length);
     this.hud.update(this.score, this.pickups.length, this.elapsed, this.complete);
+    // Keep diagnostics atomically consistent with the HUD right after the hook.
+    this.publishDiagnostics();
   }
 
   private completeRun(): void {
@@ -300,6 +312,7 @@ export class Game {
     this.score = this.pickups.length;
     this.complete = true;
     this.hud.update(this.score, this.pickups.length, this.elapsed, this.complete);
+    this.publishDiagnostics();
   }
 
   private publishDiagnostics(): void {
@@ -310,6 +323,7 @@ export class Game {
       score: this.score,
       targetScore: this.pickups.length,
       complete: this.complete,
+      paused: this.pausedForScreenshot,
       player: {
         position: {
           x: this.player.group.position.x,
@@ -318,6 +332,25 @@ export class Game {
         },
         speed: this.player.velocity.length(),
       },
+      pickups: this.pickups.map((pickup) => ({
+        index: pickup.index,
+        active: pickup.active,
+        visible: pickup.group.visible,
+        collected: !pickup.active,
+        position: {
+          x: pickup.group.position.x,
+          y: pickup.group.position.y,
+          z: pickup.group.position.z,
+        },
+        rotation: {
+          x: pickup.group.rotation.x,
+          y: pickup.group.rotation.y,
+          z: pickup.group.rotation.z,
+        },
+        // Convenience scalar mirroring rotation.y for phase-reset assertions.
+        rotationY: pickup.group.rotation.y,
+        coreRotationX: pickup.coreRotationX,
+      })),
       renderer: {
         calls: info.render.calls,
         triangles: info.render.triangles,
