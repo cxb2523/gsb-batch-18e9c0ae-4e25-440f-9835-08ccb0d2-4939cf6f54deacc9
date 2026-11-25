@@ -1,0 +1,25 @@
+{
+  "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
+  "groupings": [
+    {
+      "title": "Start here",
+      "description": "Install the full workflow for building Three.js projects with Mint assets.",
+      "skills": ["mint-threejs-skills"]
+    },
+    {
+      "title": "Apps and scenes",
+      "description": "Build viewers, configurators, interactive scenes, and their controls and visuals.",
+      "skills": ["threejs-app-director", "threejs-interaction-systems", "threejs-visual-systems"]
+    },
+    {
+      "title": "Browser games",
+      "description": "Build game loops, movement, input, menus, and touch controls.",
+      "skills": ["threejs-game-director", "threejs-gameplay-systems", "threejs-game-ui-designer"]
+    },
+    {
+      "title": "Debug and release",
+      "description": "Profile rendering and verify the player or viewer journey before release.",
+      "skills": ["threejs-debug-profiler", "threejs-qa-release"]
+    }
+  ]
+}
