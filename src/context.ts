@@ -83,7 +83,8 @@ export class Context extends PathBuilder {
   public imageSmoothingEnabled: boolean;
   public imageSmoothingQuality: string;
   public filter: string;
-  public lineDashOffset: number;
+  private _lineDash: number[];
+  private _lineDashOffset: number;
   public shadowBlur: number;
   public shadowColor: string;
   public shadowOffsetX: number;
@@ -131,6 +132,7 @@ export class Context extends PathBuilder {
     this._fontVariantCaps = "normal";
     this._letterSpacing = { value: 0, unit: "px" };
     this.lineDashOffset = 0;
+    this._lineDash = [];
     this._textRendering = "auto";
     this._wordSpacing = { value: 0, unit: "px" };
     this.lang = "inherit";
@@ -213,6 +215,37 @@ export class Context extends PathBuilder {
   set miterLimit(val: number) {
     const v = Number(val);
     if (Number.isFinite(v) && v > 0) this._miterLimit = v;
+  }
+
+  /** The distance into the repeating dash pattern at which stroking starts. */
+  get lineDashOffset(): number {
+    return this._lineDashOffset;
+  }
+
+  set lineDashOffset(val: number) {
+    // unrestricted double: NaN and Infinity are retained by the IDL conversion
+    this._lineDashOffset = Number(val);
+  }
+
+  /**
+   * Sets the even-length dash/gap pattern, in user-space units. An odd input is repeated to
+   * make it even, as Canvas requires.
+   */
+  setLineDash(segments: Iterable<number> | ArrayLike<number>): void {
+    requireArgs(arguments.length, 1, "setLineDash");
+    if (!segments || (typeof segments !== "object" && typeof segments !== "function")) {
+      throw new TypeError("setLineDash: argument 1 is not a sequence");
+    }
+    const list = Array.from(segments as Iterable<number>, (v) => Number(v));
+    // Per Canvas/WPT, a negative or non-finite entry makes the whole call invalid; the old
+    // dash list is left in place rather than throwing.
+    if (list.some((v) => !Number.isFinite(v) || v < 0)) return;
+    this._lineDash = list.length % 2 === 0 ? list : list.concat(list);
+  }
+
+  /** A copy of the current normalized dash pattern. */
+  getLineDash(): number[] {
+    return this._lineDash.slice();
   }
 
   private _globalAlpha: number;
@@ -523,6 +556,8 @@ export class Context extends PathBuilder {
       _textRendering: this._textRendering,
       _letterSpacing: this._letterSpacing,
       _wordSpacing: this._wordSpacing,
+      _lineDash: this._lineDash.slice(),
+      _lineDashOffset: this._lineDashOffset,
       lang: this.lang,
       imageSmoothingEnabled: this.imageSmoothingEnabled,
       lineCap: this.lineCap,
@@ -620,10 +655,6 @@ export class Context extends PathBuilder {
       this._transform.identity();
       this._transform.multiply([...args] as Matrix);
     }
-  }
-
-  protected pathTransform(): Transform {
-    return this._transform;
   }
 
   getTransform() {
@@ -1203,12 +1234,11 @@ export class Context extends PathBuilder {
   }
 
   /**
-   * The device-space path a drawing method acts on: the given Path2D under the current
-   * transform, or the context's own path.
+   * The device-space path a drawing method acts on. Both Path2D paths and the context's own
+   * path are stored in user space, so the current transform is applied at use time.
    */
   private devicePath(path?: Path2D): PathCmd[] {
-    if (!path) return this.path;
-    return mapPath(path.path, (pt) => this._transform.transformPoint(pt));
+    return mapPath(path ? path.path : this.path, (pt) => this._transform.transformPoint(pt));
   }
 
   /**
@@ -1216,9 +1246,11 @@ export class Context extends PathBuilder {
    * but a Path2D first is a fill rule, so a missing or wrong path throws when the rule is parsed.
    */
   private pathAndRule(args: unknown[], method: string): [PathCmd[], unknown] {
-    if (args[0] instanceof Path2D) return [this.devicePath(args[0]), args[1] === undefined ? "nonzero" : args[1]];
+    if (args[0] instanceof Path2D) {
+      return [this.devicePath(args[0]), args[1] === undefined ? "nonzero" : args[1]];
+    }
     if (args.length >= 2) throw new TypeError(`${method}: argument 1 is not a Path2D`);
-    return [this.path, args[0] === undefined ? "nonzero" : args[0]];
+    return [this.devicePath(), args[0] === undefined ? "nonzero" : args[0]];
   }
 
   /**
@@ -1248,8 +1280,10 @@ export class Context extends PathBuilder {
     if (arguments.length > 0 && !(path instanceof Path2D)) {
       throw new TypeError("stroke: argument 1 is not a Path2D");
     }
-    const device = this.devicePath(path);
-    this.paint(() => this.strokePath(device));
+    // Keep the path in user space while building the outline; transforming the resulting
+    // polygons applies the CTM to both geometry and line width.
+    const userPath = path ? path.path : this.path;
+    this.paint(() => this.strokePath(userPath));
   }
 
   private strokePath(path: PathCmd[]): void {
@@ -1274,18 +1308,18 @@ export class Context extends PathBuilder {
   }
 
   /**
-   * The device-space edges of the stroke outline of `path` (in device space), to fill with the
-   * nonzero rule, or null if the current transform can't be inverted.
+   * The device-space edges of the stroke outline of `userPath`. The outline is built in user
+   * space, so the CTM in effect at the stroke/hit-test call scales line width and dashes along
+   * with the path; its polygons are then mapped to device space. Null for a singular transform.
    */
-  private strokeOutline(path: PathCmd[]): Line[] | null {
-    // the stroke is traced in the user space of the transform in effect now, which need not
-    // be the one the path was built with: scale(2, 1) makes vertical lines twice as thick
+  private strokeOutline(userPath: PathCmd[]): Line[] | null {
     const m = this._transform.getMatrix();
     const det = m[0] * m[3] - m[1] * m[2];
     if (!det || !Number.isFinite(det)) return null;
-    const inverse = this._transform.cloneTransform();
-    inverse.invert();
-    const subpaths = pathToSubpaths(path, (pt) => inverse.transformPoint(pt));
+    let subpaths = pathToSubpaths(userPath);
+    if (this._lineDash.length > 0) {
+      subpaths = subpaths.flatMap((subpath) => dashSubpath(subpath, this._lineDash, this._lineDashOffset));
+    }
     const polygons = strokePolygons(subpaths, {
       width: this._lineWidth,
       cap: this._lineCap,
@@ -1339,7 +1373,8 @@ export class Context extends PathBuilder {
     }
     const [x, y] = withPath ? args.slice(1) : args;
     if (!allFinite(x, y)) return false;
-    const lines = this.strokeOutline(this.devicePath(withPath ? (args[0] as Path2D) : undefined));
+    const userPath = withPath ? (args[0] as Path2D).path : this.path;
+    const lines = this.strokeOutline(userPath);
     return !!lines && pointInLines(lines, Number(x), Number(y), "nonzero");
   }
 
@@ -1784,11 +1819,11 @@ function pathToLines(path) {
 }
 
 /**
- * Split a device-space path into the subpaths to stroke, in the space given by `toUser`.
- * Curves are flattened to lines, consecutive duplicate points are dropped, and a subpath
- * that is only a moveTo (no segments, not even zero-length ones) is left out.
+ * Split a user-space path into the subpaths to stroke. Curves are flattened to lines,
+ * consecutive duplicate points are dropped, and a subpath that is only a moveTo (no segments,
+ * not even zero-length ones) is left out.
  */
-function pathToSubpaths(path: PathCmd[], toUser: (pt: Point) => Point): Subpath[] {
+function pathToSubpaths(path: PathCmd[]): Subpath[] {
   const subpaths: Subpath[] = [];
   let sub: (Subpath & { tangents: (Point | null)[]; segments: number }) | null = null;
   let curr: Point | null = null;
@@ -1800,18 +1835,17 @@ function pathToSubpaths(path: PathCmd[], toUser: (pt: Point) => Point): Subpath[
   };
   const start = (pt: Point) => {
     finish();
-    sub = { points: [toUser(pt)], tangents: [null], closed: false, segments: 0 };
+    sub = { points: [pt], tangents: [null], closed: false, segments: 0 };
   };
-  // `tangent` (device space) marks a point inside a curve, where the stroke bends rather
+  // `tangent` (in path/user space) marks a point inside a curve, where the stroke bends rather
   // than joins
   const lineTo = (pt: PointIsh, tangent: PointIsh | null = null) => {
-    if (!sub) start(curr);
+    if (!sub) start(curr as Point);
     sub.segments++;
-    const u = toUser(new Point(pt.x, pt.y));
+    const u = new Point(pt.x, pt.y);
     let t: Point | null = null;
     if (tangent && (tangent.x || tangent.y)) {
-      const v = toUser(new Point(pt.x + tangent.x, pt.y + tangent.y));
-      t = new Point(v.x - u.x, v.y - u.y);
+      t = new Point(tangent.x, tangent.y);
     }
     const last = sub.points.length - 1;
     if (samePoint(sub.points[last], u)) {
@@ -1849,6 +1883,92 @@ function pathToSubpaths(path: PathCmd[], toUser: (pt: Point) => Point): Subpath[
   }
   finish();
   return subpaths;
+}
+
+/**
+ * Split one flattened user-space subpath into the open pieces selected by a Canvas dash
+ * pattern. Dash lengths are user units, so mapping the resulting outlines through the CTM
+ * scales the dashes together with line width and geometry.
+ */
+function dashSubpath(sub: Subpath, dash: number[], offset: number): Subpath[] {
+  const source = sub.points;
+  if (source.length < 2) return [];
+
+  const points = source.slice();
+  const tangents = (sub.tangents ?? []).slice(0, points.length);
+  while (tangents.length < points.length) tangents.push(null);
+  if (sub.closed && !samePoint(points[0], points[points.length - 1])) {
+    points.push(points[0]);
+    tangents.push(null);
+  }
+
+  const cumulative = [0];
+  for (let i = 1; i < points.length; i++) {
+    cumulative[i] = cumulative[i - 1] + Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+  }
+  const total = cumulative[cumulative.length - 1];
+  if (!(total > 0)) return [];
+
+  const period = dash.reduce((sum, n) => sum + n, 0);
+  if (!(period > 0)) return [];
+  const phase = ((offset % period) + period) % period;
+
+  type Interval = [number, number];
+  const intervals: Interval[] = [];
+  let patternStart = 0;
+  for (let j = 0; j < dash.length; j += 2) {
+    const dashLength = dash[j];
+    const patternEnd = patternStart + dashLength;
+    if (dashLength > 0) {
+      for (let k = -1; k <= Math.ceil(total / period) + 1; k++) {
+        const start = k * period + patternStart - phase;
+        const end = k * period + patternEnd - phase;
+        const a = Math.max(0, start);
+        const b = Math.min(total, end);
+        if (b > a + 1e-10) intervals.push([a, b]);
+      }
+    }
+    patternStart = patternEnd + (dash[j + 1] ?? 0);
+  }
+  intervals.sort((x, y) => x[0] - y[0]);
+
+  const sample = (distance: number): Point => {
+    const d = Math.max(0, Math.min(total, distance));
+    let i = 0;
+    while (i < cumulative.length - 2 && cumulative[i + 1] < d) i++;
+    const segmentLength = cumulative[i + 1] - cumulative[i];
+    const t = segmentLength > 0 ? (d - cumulative[i]) / segmentLength : 0;
+    return new Point(
+      points[i].x + (points[i + 1].x - points[i].x) * t,
+      points[i].y + (points[i + 1].y - points[i].y) * t,
+    );
+  };
+
+  const result: Subpath[] = [];
+  for (const [a, b] of intervals) {
+    if (sub.closed && a <= 1e-9 && total - b <= 1e-9) return [sub];
+    const outPoints: Point[] = [sample(a)];
+    const outTangents: (Point | null)[] = [null];
+    const append = (pt: Point, tangent: Point | null) => {
+      const last = outPoints[outPoints.length - 1];
+      if (!samePoint(last, pt)) {
+        outPoints.push(pt);
+        outTangents.push(tangent);
+      }
+    };
+    for (let i = 1; i < points.length - 1; i++) {
+      if (cumulative[i] > a && cumulative[i] < b) {
+        const tangent = tangents[i];
+        append(
+          new Point(points[i].x, points[i].y),
+          tangent ? new Point(tangent.x, tangent.y) : null,
+        );
+      }
+    }
+    append(sample(b), null);
+    if (outPoints.length >= 2) result.push({ points: outPoints, tangents: outTangents, closed: false });
+  }
+  return result;
 }
 
 /** The point at parameter t on a cubic Bézier curve. */

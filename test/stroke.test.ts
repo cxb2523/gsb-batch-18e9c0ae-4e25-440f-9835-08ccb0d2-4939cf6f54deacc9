@@ -154,10 +154,11 @@ describe("line joins", () => {
 
 describe("stroke transforms", () => {
   it("uses the transform in effect when stroking, not when the path was built", () => {
-    // a path built untransformed, stroked under scale(10, 1): vertical lines get 10x wider
+    // A user-space line at x=5 is mapped to x=50 by scale(10, 1); the same scale makes a
+    // width of 2 user units extend 10 device pixels to either side.
     const px = stroke((ctx) => {
-      ctx.moveTo(50, 0);
-      ctx.lineTo(50, 50);
+      ctx.moveTo(5, 0);
+      ctx.lineTo(5, 50);
       ctx.save();
       ctx.scale(10, 1);
       ctx.lineWidth = 2;

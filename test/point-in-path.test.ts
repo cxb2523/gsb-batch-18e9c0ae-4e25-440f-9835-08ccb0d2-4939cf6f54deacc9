@@ -49,13 +49,16 @@ describe("isPointInPath", () => {
     expect(ctx.isPointInPath(58, 33)).toBe(false); // in the bounding box, outside the arc
   });
 
-  it("tests canvas coordinates, using the transform the path was built with", () => {
+  it("applies the transform in effect when hit-testing, not when building", () => {
     const ctx = context();
-    ctx.translate(50, 0);
     ctx.rect(0, 0, 20, 20);
-    ctx.translate(0, 50); // ignored: the path is already built
+    ctx.translate(50, 0);
     expect(ctx.isPointInPath(60, 10)).toBe(true);
     expect(ctx.isPointInPath(10, 10)).toBe(false);
+
+    ctx.translate(0, 50);
+    expect(ctx.isPointInPath(60, 60)).toBe(true);
+    expect(ctx.isPointInPath(60, 10)).toBe(false);
   });
 
   it("works under huge transforms but is false under non-invertible ones", () => {
@@ -89,10 +92,10 @@ describe("isPointInStroke", () => {
     expect(ctx.isPointInStroke(42, 10)).toBe(true);
   });
 
-  it("uses the current transform for the line width", () => {
+  it("uses the current transform for geometry and line width", () => {
     const ctx = context();
-    ctx.moveTo(50, 0);
-    ctx.lineTo(50, 50);
+    ctx.moveTo(5, 0);
+    ctx.lineTo(5, 50);
     ctx.scale(10, 1);
     ctx.lineWidth = 2;
     expect(ctx.isPointInStroke(59, 25)).toBe(true);

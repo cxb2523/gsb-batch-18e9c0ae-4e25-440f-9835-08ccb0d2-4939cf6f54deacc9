@@ -27,47 +27,47 @@ describe("simple transforms", () => {
     expect(context.path[0][1].x).to.eq(5);
   });
 
-  it("draws a translated line", () => {
+  it("keeps translated path points in user space", () => {
     context.save();
     context.translate(5, 0);
     drawLine();
     context.restore();
     expect(context.path[0][0]).to.eq("m");
-    expect(context.path[0][1].x).to.eq(10);
+    expect(context.path[0][1].x).to.eq(5);
   });
 
-  it("rotates a line", () => {
+  it("keeps rotated path points in user space", () => {
     context.save();
     context.rotate((Math.PI / 180.0) * 90);
     drawLine();
     context.restore();
     expect(context.path[0][0]).to.eq("m");
-    expect(context.path[0][1].x).to.eq(-5);
+    expect(context.path[0][1].x).to.eq(5);
     expect(context.path[0][1].y).to.eq(5);
   });
 
-  it("scales a line", () => {
+  it("keeps scaled path points in user space", () => {
     context.save();
     context.scale(2, 2);
     drawLine();
     context.restore();
 
     expect(context.path[0][0]).to.eq("m");
-    expect(context.path[0][1].x).to.eq(10);
-    expect(context.path[0][1].y).to.eq(10);
+    expect(context.path[0][1].x).to.eq(5);
+    expect(context.path[0][1].y).to.eq(5);
 
     expect(context.path[1][0]).to.eq("l");
-    expect(context.path[1][1].x).to.eq(20);
-    expect(context.path[1][1].y).to.eq(20);
+    expect(context.path[1][1].x).to.eq(10);
+    expect(context.path[1][1].y).to.eq(10);
 
     expect(context.path[2][0]).to.eq("l");
-    expect(context.path[2][1].x).to.eq(10);
-    expect(context.path[2][1].y).to.eq(20);
+    expect(context.path[2][1].x).to.eq(5);
+    expect(context.path[2][1].y).to.eq(10);
 
     // closePath() is recorded as a close command that returns to the subpath's start
     expect(context.path[3][0]).to.eq("z");
-    expect(context.path[3][1].x).to.eq(10);
-    expect(context.path[3][1].y).to.eq(10);
+    expect(context.path[3][1].x).to.eq(5);
+    expect(context.path[3][1].y).to.eq(5);
   });
 
   it("transforms a line", async () => {
@@ -85,10 +85,10 @@ describe("simple transforms", () => {
     expect(context.path[0][1].y).to.eq(0);
     expect(context.path[1][0]).to.eq("l");
     expect(context.path[1][1].x).to.eq(20);
-    expect(context.path[1][1].y).to.eq(4);
+    expect(context.path[1][1].y).to.eq(0);
     expect(context.path[2][0]).to.eq("l");
-    expect(context.path[2][1].x).to.eq(18);
-    expect(context.path[2][1].y).to.eq(12);
+    expect(context.path[2][1].x).to.eq(10);
+    expect(context.path[2][1].y).to.eq(10);
 
     context.strokeStyle = "black";
     context.stroke();

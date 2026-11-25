@@ -1,6 +1,5 @@
 import { Point, PointIsh } from "./point.js";
 import { PATH_COMMAND, PathCmd } from "./types.js";
-import type { Transform } from "./transform.js";
 
 // converts every argument first (as WebIDL does) so valueOf side effects happen for all of them
 export const allFinite = (...values: unknown[]) => values.map(Number).every(Number.isFinite);
@@ -52,16 +51,13 @@ export function requireArgs(actual: number, minimum: number, method: string): vo
 /**
  * The path-building methods shared by {@link Context} and {@link Path2D}.
  *
- * Points are stored after mapping through {@link pathTransform}: the context's current
- * transform for a context (so its path is in canvas coordinates), the identity for a Path2D
- * (whose user-space path is transformed when it is drawn).
+ * Every stored point is in user space. Contexts map it through their current transform only
+ * when the path is filled, stroked, clipped to, or hit-tested; Path2D paths stay in the user
+ * space in which they were constructed until a context uses them.
  */
 export abstract class PathBuilder {
   path: PathCmd[] = [];
   protected pathstart?: Point;
-
-  /** The transform applied to points as they are added. */
-  protected abstract pathTransform(): Transform;
 
   /**
    * Moves the starting point of a new sub-path to the (x, y) coordinates.
@@ -96,7 +92,7 @@ export abstract class PathBuilder {
    * @memberof PathBuilder
    * */
   _moveTo(pt) {
-    pt = this.pathTransform().transformPoint(pt);
+    pt = new Point(pt.x, pt.y);
     /**
      * Set the starting co-ordinates for the path starting point
      * @type {Point}
@@ -135,10 +131,10 @@ export abstract class PathBuilder {
    * @memberof PathBuilder
    */
   _lineTo(pt) {
-    this.path.push([PATH_COMMAND.LINE, this.pathTransform().transformPoint(pt)]);
+    this.path.push([PATH_COMMAND.LINE, new Point(pt.x, pt.y)]);
   }
 
-  /** The last point of the current path in device space, or null if the path is empty. */
+  /** The last point of the current path in user space, or null if the path is empty. */
   protected currentPoint(): Point | null {
     const cmd = this.path[this.path.length - 1];
     if (!cmd) return null;
@@ -170,8 +166,9 @@ export abstract class PathBuilder {
     this.ensureSubpath(cp1x, cp1y);
     // stored as the equivalent cubic so filling and stroking share one curve flattener
     const p0 = this.currentPoint();
-    const q = this.pathTransform().transformPoint(new Point(cp1x, cp1y));
-    const p1 = this.pathTransform().transformPoint(new Point(x, y));
+    if (!p0) return;
+    const q = new Point(cp1x, cp1y);
+    const p1 = new Point(x, y);
     const c1 = new Point(p0.x + (2 / 3) * (q.x - p0.x), p0.y + (2 / 3) * (q.y - p0.y));
     const c2 = new Point(p1.x + (2 / 3) * (q.x - p1.x), p1.y + (2 / 3) * (q.y - p1.y));
     this.path.push([PATH_COMMAND.BEZIER_CURVE, c1, c2, p1]);
@@ -216,10 +213,12 @@ export abstract class PathBuilder {
    * @memberof PathBuilder
    * */
   _bezierCurveTo(cp1, cp2, pt) {
-    cp1 = this.pathTransform().transformPoint(cp1);
-    cp2 = this.pathTransform().transformPoint(cp2);
-    pt = this.pathTransform().transformPoint(pt);
-    this.path.push([PATH_COMMAND.BEZIER_CURVE, cp1, cp2, pt]);
+    this.path.push([
+      PATH_COMMAND.BEZIER_CURVE,
+      new Point(cp1.x, cp1.y),
+      new Point(cp2.x, cp2.y),
+      new Point(pt.x, pt.y),
+    ]);
   }
 
   /**
@@ -263,10 +262,9 @@ export abstract class PathBuilder {
     if (!allFinite(x1, y1, x2, y2, radius)) return;
     if (radius < 0) throw new DOMException(`arcTo: negative radius ${radius}`, "IndexSizeError");
     this.ensureSubpath(x1, y1);
-    // the geometry is computed in user space, so bring the current point back out of device space
-    const inverse = this.pathTransform().cloneTransform();
-    inverse.invert();
-    const p0 = inverse.transformPoint(this.currentPoint());
+    // The current point and all arcTo geometry are in the path's user space.
+    const p0 = this.currentPoint();
+    if (!p0) return;
     const u1x = p0.x - x1;
     const u1y = p0.y - y1;
     const u2x = x2 - x1;
@@ -447,7 +445,7 @@ export abstract class PathBuilder {
     const first = pointAt(start);
     const curr = this.currentPoint();
     if (!curr) this._moveTo(first);
-    else if (!samePoint(curr, this.pathTransform().transformPoint(first))) this._lineTo(first);
+    else if (!samePoint(curr, first)) this._lineTo(first);
 
     // one cubic Bézier per quarter turn (or less): its error is under 0.03% of the radius
     const pieces = Math.max(1, Math.ceil(Math.abs(sweep) / (Math.PI / 2) - 1e-9));
@@ -460,9 +458,9 @@ export abstract class PathBuilder {
       const p3 = pointAt(a1);
       const t0 = tangentAt(a0);
       const t1 = tangentAt(a1);
-      const c1 = this.pathTransform().transformPoint(new Point(p0.x + k * t0.x, p0.y + k * t0.y));
-      const c2 = this.pathTransform().transformPoint(new Point(p3.x - k * t1.x, p3.y - k * t1.y));
-      const end = this.pathTransform().transformPoint(p3);
+      const c1 = new Point(p0.x + k * t0.x, p0.y + k * t0.y);
+      const c2 = new Point(p3.x - k * t1.x, p3.y - k * t1.y);
+      const end = p3;
       // a zero radius or sweep collapses the curve onto one point; leave it out
       const from = this.currentPoint();
       if (samePoint(from, c1) && samePoint(from, c2) && samePoint(from, end)) continue;

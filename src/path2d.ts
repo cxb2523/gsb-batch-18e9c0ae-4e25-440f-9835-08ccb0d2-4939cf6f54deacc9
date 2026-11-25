@@ -4,8 +4,6 @@ import { Point } from "./point.js";
 import { Transform } from "./transform.js";
 import { PATH_COMMAND, PathCmd } from "./types.js";
 
-const IDENTITY = new Transform();
-
 /** A copy of `path` with every point mapped through `f`. */
 export function mapPath(path: PathCmd[], f: (pt: Point) => Point): PathCmd[] {
   return path.map((cmd) => {
@@ -36,10 +34,6 @@ export class Path2D extends PathBuilder {
     } else if (path !== undefined) {
       parseSvgPath(String(path), this);
     }
-  }
-
-  protected pathTransform(): Transform {
-    return IDENTITY;
   }
 
   /**
