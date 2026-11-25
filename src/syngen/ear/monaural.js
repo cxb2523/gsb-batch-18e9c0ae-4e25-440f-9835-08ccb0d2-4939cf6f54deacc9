@@ -55,9 +55,13 @@ syngen.ear.monaural.prototype = {
   },
   /**
    * Prepares the instance for garbage collection.
+   * Disconnects every node in its internal delay, filter, and gain chain.
    * @instance
    */
   destroy: function () {
+    this.delay.disconnect()
+    this.filter.disconnect()
+    this.gain.disconnect()
     return this
   },
   /**

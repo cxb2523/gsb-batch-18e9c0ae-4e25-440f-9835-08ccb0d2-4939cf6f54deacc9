@@ -70,11 +70,13 @@ syngen.ear.binaural.prototype = {
   },
   /**
    * Prepares the instance for garbage collection.
+   * Disconnects its monaural processors and their merger.
    * @instance
    */
   destroy: function () {
     this.left.destroy()
     this.right.destroy()
+    this.merger.disconnect()
     return this
   },
   /**

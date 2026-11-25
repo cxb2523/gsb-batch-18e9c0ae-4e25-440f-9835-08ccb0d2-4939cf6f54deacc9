@@ -64,12 +64,14 @@ syngen.mixer.reverb.send.prototype = {
   },
   /**
    * Prepares the instance for garbage collection.
-   * Immediately disconnects from all inputs and outputs.
+   * Immediately disconnects from all inputs and outputs, including the inner gain and delay chain.
    * @instance
    */
   destroy: function () {
     syngen.mixer.reverb.off('activate', this.onSendActivate)
     syngen.mixer.reverb.off('deactivate', this.onSendDeactivate)
+    this.input.disconnect()
+    this.delay.disconnect()
     this.send.disconnect()
     return this
   },

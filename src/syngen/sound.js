@@ -43,6 +43,7 @@ syngen.sound = {
     this.radius = radius
     this.relative = relative
     this.reverb = reverb
+    this.isDestroying = false
 
     // Set position in space
     this.vector = syngen.tool.vector3d.create({
@@ -83,6 +84,13 @@ syngen.sound = {
     return this
   },
   destroy: function () {
+    // Ensure teardown happens only once, even if called again during the fade
+    if (this.isDestroying) {
+      return this
+    }
+
+    this.isDestroying = true
+
     // Stop update each frame
     syngen.loop.off('frame', this.update)
 

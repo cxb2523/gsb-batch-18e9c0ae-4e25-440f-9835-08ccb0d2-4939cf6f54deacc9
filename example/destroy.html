@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>syngen example: sound destruction</title>
+    <style>
+      body { font-family: sans-serif; margin: 2rem; max-width: 60rem; }
+      h1 { font-size: 1.4rem; }
+      button { margin: 1rem 0; padding: 0.4rem 1rem; }
+      #summary { font-weight: bold; margin: 1rem 0; }
+      .pass { color: #076b1c; }
+      .fail { color: #a30d0d; }
+      ol.results { padding-left: 1.5rem; }
+      ol.results li { margin: 0.15rem 0; font-family: monospace; }
+      .detail { color: #555; }
+    </style>
+  </head>
+  <body>
+    <h1>sound destruction</h1>
+    <p>
+      This sample verifies that destroying a <code>syngen.sound</code> releases every audio node it owns:
+      its output, its binaural processor, and, when enabled, its reverb send.
+      It covers normal destruction, repeated destruction, and destruction while the fade is still running.
+    </p>
+    <p>
+      It tracks every connection in the audio graph because Web Audio does not expose them,
+      then checks that no node is left wired into the mixer bus.
+      It loads the library from the unbuilt sources, so no build step is required.
+      Serve this directory over HTTP (for example with <code>npx http-server</code>) or open the file directly.
+    </p>
+    <button type="button" id="run">Run tests</button>
+    <div id="summary">Loading syngen...</div>
+    <ol class="results" id="results"></ol>
+
+    <script>
+      // Track every connection in the audio graph before the library creates its nodes.
+      (() => {
+        if (typeof AudioNode == 'undefined' || window.__audioGraph) {
+          return
+        }
+
+        const inEdges = new WeakMap(),
+          outEdges = new WeakMap(),
+          nativeConnect = AudioNode.prototype.connect,
+          nativeDisconnect = AudioNode.prototype.disconnect
+
+        const edgesFor = (map, node) => {
+          if (!map.has(node)) {
+            map.set(node, new Set())
+          }
+
+          return map.get(node)
+        }
+
+        const dropOutgoing = (node) => {
+          const edges = outEdges.get(node)
+
+          if (!edges) {
+            return
+          }
+
+          for (const destination of edges) {
+            if (destination instanceof AudioNode) {
+              const incoming = inEdges.get(destination)
+
+              if (incoming) {
+                incoming.delete(node)
+              }
+            }
+          }
+
+          outEdges.set(node, new Set())
+        }
+
+        AudioNode.prototype.connect = function (destination, ...args) {
+          nativeConnect.call(this, destination, ...args)
+
+          edgesFor(outEdges, this).add(destination)
+
+          if (destination instanceof AudioNode) {
+            edgesFor(inEdges, destination).add(this)
+          }
+
+          return destination
+        }
+
+        AudioNode.prototype.disconnect = function (...args) {
+          const destination = args[0]
+
+          if (args.length == 0 || typeof destination == 'number') {
+            // Disconnecting a single output is tracked conservatively as disconnecting all of them.
+            dropOutgoing(this)
+          } else {
+            outEdges.get(this)?.delete(destination)
+
+            if (destination instanceof AudioNode) {
+              inEdges.get(destination)?.delete(this)
+            }
+          }
+
+          return nativeDisconnect.apply(this, args)
+        }
+
+        window.__audioGraph = {
+          countIn: (node) => (inEdges.get(node) || new Set()).size,
+          countOut: (node) => (outEdges.get(node) || new Set()).size,
+        }
+      })()
+    </script>
+
+    <script>
+      // Load the library from source so this sample always reflects the working tree.
+      // This list mirrors the concatenation order in Gulpfile.js.
+      window.__syngenReady = (() => {
+        const sources = [
+          '../src/syngen.js',
+          '../src/syngen/const.js',
+          '../src/syngen/fn.js',
+          '../src/syngen/tool/bitree.js',
+          '../src/syngen/tool/cache2d.js',
+          '../src/syngen/tool/cache3d.js',
+          '../src/syngen/tool/cone.js',
+          '../src/syngen/tool/euler.js',
+          '../src/syngen/tool/fsm.js',
+          '../src/syngen/tool/generator2d.js',
+          '../src/syngen/tool/generator3d.js',
+          '../src/syngen/tool/matrix4d.js',
+          '../src/syngen/tool/noise.js',
+          '../src/syngen/tool/octree.js',
+          '../src/syngen/tool/perlin2d.js',
+          '../src/syngen/tool/perlin3d.js',
+          '../src/syngen/tool/perlin4d.js',
+          '../src/syngen/tool/plane.js',
+          '../src/syngen/tool/pubsub.js',
+          '../src/syngen/tool/quadtree.js',
+          '../src/syngen/tool/quaternion.js',
+          '../src/syngen/tool/simplex2d.js',
+          '../src/syngen/tool/simplex3d.js',
+          '../src/syngen/tool/simplex4d.js',
+          '../src/syngen/tool/sphere.js',
+          '../src/syngen/tool/streamer2d.js',
+          '../src/syngen/tool/streamer3d.js',
+          '../src/syngen/tool/vector2d.js',
+          '../src/syngen/tool/vector3d.js',
+          '../src/syngen/loop.js',
+          '../src/syngen/state.js',
+          '../src/syngen/buffer/brownNoise.js',
+          '../src/syngen/buffer/impulse.js',
+          '../src/syngen/buffer/pinkNoise.js',
+          '../src/syngen/buffer/whiteNoise.js',
+          '../src/syngen/ear/filterModel/base.js',
+          '../src/syngen/ear/filterModel/head.js',
+          '../src/syngen/ear/filterModel/musical.js',
+          '../src/syngen/ear/gainModel/base.js',
+          '../src/syngen/ear/gainModel/exponential.js',
+          '../src/syngen/ear/gainModel/linear.js',
+          '../src/syngen/ear/gainModel/logarithmic.js',
+          '../src/syngen/ear/gainModel/normalize.js',
+          '../src/syngen/ear/gainModel/realistic.js',
+          '../src/syngen/ear/gainModel/realisticHorizon.js',
+          '../src/syngen/mixer.js',
+          '../src/syngen/mixer/reverb.js',
+          '../src/syngen/mixer/reverb/gainModel/base.js',
+          '../src/syngen/mixer/reverb/gainModel/bell.js',
+          '../src/syngen/mixer/reverb/gainModel/normalize.js',
+          '../src/syngen/ephemera.js',
+          '../src/syngen/formant.js',
+          '../src/syngen/performance.js',
+          '../src/syngen/position.js',
+          '../src/syngen/seed.js',
+          '../src/syngen/shape.js',
+          '../src/syngen/sound.js',
+          '../src/syngen/synth.js',
+          '../src/syngen/circuit/invert.js',
+          '../src/syngen/circuit/lerp.js',
+          '../src/syngen/circuit/scale.js',
+          '../src/syngen/ear/binaural.js',
+          '../src/syngen/ear/monaural.js',
+          '../src/syngen/effect/dubDelay.js',
+          '../src/syngen/effect/feedbackDelay.js',
+          '../src/syngen/effect/multitapDelay.js',
+          '../src/syngen/effect/phaser.js',
+          '../src/syngen/effect/pingPongDelay.js',
+          '../src/syngen/effect/shaper.js',
+          '../src/syngen/effect/talkbox.js',
+          '../src/syngen/formant/a.js',
+          '../src/syngen/formant/e.js',
+          '../src/syngen/formant/i.js',
+          '../src/syngen/formant/o.js',
+          '../src/syngen/formant/u.js',
+          '../src/syngen/input/gamepad.js',
+          '../src/syngen/input/keyboard.js',
+          '../src/syngen/input/mouse.js',
+          '../src/syngen/mixer/export.js',
+          '../src/syngen/synth/additive.js',
+          '../src/syngen/synth/am.js',
+          '../src/syngen/synth/amBuffer.js',
+          '../src/syngen/synth/buffer.js',
+          '../src/syngen/synth/fm.js',
+          '../src/syngen/synth/fn.js',
+          '../src/syngen/synth/lfo.js',
+          '../src/syngen/synth/mod.js',
+          '../src/syngen/synth/pwm.js',
+          '../src/syngen/synth/simple.js',
+          '../src/syngen/mixer/reverb/send.js',
+        ]
+
+        const load = (source) => new Promise((resolve, reject) => {
+          const element = document.createElement('script')
+          element.src = source
+          element.onload = resolve
+          element.onerror = () => reject(new Error('Failed to load ' + source))
+          document.head.appendChild(element)
+        })
+
+        return (async () => {
+          for (const source of sources) {
+            await load(source)
+          }
+
+          if (typeof syngen == 'undefined') {
+            throw new Error('syngen did not initialize')
+          }
+
+          return syngen
+        })()
+      })()
+    </script>
+
+    <script>
+      (() => {
+        const summary = document.getElementById('summary'),
+          resultsElement = document.getElementById('results'),
+          runButton = document.getElementById('run')
+
+        const wait = (duration) => new Promise((resolve) => setTimeout(resolve, duration))
+
+        // Fade outs are scheduled with timers, which can be throttled in background tabs.
+        // Poll for the expected state instead of assuming a fixed delay.
+        const waitFor = async (predicate, timeout = 5000) => {
+          const started = Date.now()
+
+          while (Date.now() - started < timeout) {
+            if (predicate()) {
+              return true
+            }
+
+            await wait(25)
+          }
+
+          return Boolean(predicate())
+        }
+
+        const loopFrames = (syngen, count = 3) => new Promise((resolve) => {
+          let seen = 0
+
+          const handler = () => {
+            seen += 1
+
+            if (seen >= count) {
+              syngen.loop.off('frame', handler)
+              resolve()
+            }
+          }
+
+          syngen.loop.on('frame', handler)
+        })
+
+        const createTestSound = (syngen) => {
+          const stats = {
+            constructed: 0,
+            destroyArguments: null,
+            destroyed: 0,
+            onConstructOptions: null,
+          }
+
+          const type = syngen.sound.extend({
+            name: 'destructionTestSound',
+            onConstruct: function (options = {}) {
+              stats.constructed += 1
+              stats.onConstructOptions = options
+            },
+            onDestroy: function (...args) {
+              stats.destroyed += 1
+              stats.destroyArguments = args
+            },
+          })
+
+          return {stats, type}
+        }
+
+        const spyTeardown = (instance) => {
+          const counts = {
+            binaural: 0,
+            reverb: 0,
+            update: 0,
+          }
+
+          const binauralDestroy = instance.binaural.destroy
+          instance.binaural.destroy = function () {
+            counts.binaural += 1
+            return binauralDestroy.call(this)
+          }
+
+          if (instance.reverb) {
+            const reverbDestroy = instance.reverb.destroy
+            instance.reverb.destroy = function () {
+              counts.reverb += 1
+              return reverbDestroy.call(this)
+            }
+          }
+
+          const update = instance.binaural.update
+          instance.binaural.update = function (...args) {
+            counts.update += 1
+            return update.apply(this, args)
+          }
+
+          return counts
+        }
+
+        const nodesOf = (instance) => {
+          const nodes = {
+            leftDelay: instance.binaural.left.delay,
+            leftFilter: instance.binaural.left.filter,
+            leftGain: instance.binaural.left.gain,
+            merger: instance.binaural.merger,
+            output: instance.output,
+            rightDelay: instance.binaural.right.delay,
+            rightFilter: instance.binaural.right.filter,
+            rightGain: instance.binaural.right.gain,
+          }
+
+          if (instance.reverb) {
+            nodes.reverbDelay = instance.reverb.delay
+            nodes.reverbInput = instance.reverb.input
+            nodes.reverbSend = instance.reverb.send
+          }
+
+          return nodes
+        }
+
+        const instrument = (target, key) => {
+          const original = target[key]
+          const counter = {count: 0}
+
+          target[key] = function (...args) {
+            counter.count += 1
+            return original.apply(this, args)
+          }
+
+          counter.restore = () => {
+            target[key] = original
+          }
+
+          return counter
+        }
+
+        const run = async () => {
+          const syngen = await window.__syngenReady
+          const graph = window.__audioGraph
+          const results = []
+          const check = (name, pass, detail = '') => {
+            results.push({
+              detail,
+              name,
+              pass: Boolean(pass),
+            })
+          }
+
+          const disconnected = (node) => graph.countOut(node) == 0 && graph.countIn(node) == 0
+
+          syngen.loop.start()
+
+          // Scenario 1: normal destruction with the reverb send enabled.
+          {
+            const {stats, type} = createTestSound(syngen)
+            const baseline = graph.countIn(syngen.mixer.input())
+            const instance = type.instantiate({
+              fadeInDuration: 0,
+              fadeOutDuration: 0.1,
+              label: 'alpha',
+              reverb: true,
+              x: 3,
+              y: 0,
+              z: 0,
+            })
+            const counts = spyTeardown(instance)
+            const nodes = nodesOf(instance)
+
+            await loopFrames(syngen)
+
+            check('normal: onConstruct runs once', stats.constructed == 1)
+            check(
+              'normal: onConstruct receives the extra options',
+              stats.onConstructOptions && stats.onConstructOptions.label == 'alpha',
+              JSON.stringify(stats.onConstructOptions)
+            )
+            check(
+              'normal: output feeds the binaural processor and the reverb send',
+              graph.countOut(nodes.output) == 3,
+              'connections=' + graph.countOut(nodes.output)
+            )
+            check(
+              'normal: reverb send is wired into the auxiliary bus',
+              graph.countOut(nodes.reverbDelay) == 1,
+              'connections=' + graph.countOut(nodes.reverbDelay)
+            )
+
+            instance.destroy()
+            counts.update = 0
+
+            await loopFrames(syngen)
+
+            check('normal: frame updates stop immediately', counts.update == 0, 'updates=' + counts.update)
+
+            await waitFor(() => stats.destroyed >= 1)
+            await wait(150)
+
+            check('normal: onDestroy runs once', stats.destroyed == 1, 'calls=' + stats.destroyed)
+            check(
+              'normal: onDestroy receives no arguments',
+              stats.destroyArguments && stats.destroyArguments.length == 0
+            )
+            check('normal: binaural processor tears down once', counts.binaural == 1, 'calls=' + counts.binaural)
+            check('normal: reverb send tears down once', counts.reverb == 1, 'calls=' + counts.reverb)
+
+            check('normal: output disconnects', graph.countOut(nodes.output) == 0)
+            check(
+              'normal: left monaural processor releases its delay, filter, and gain',
+              disconnected(nodes.leftDelay) && disconnected(nodes.leftFilter) && disconnected(nodes.leftGain)
+            )
+            check(
+              'normal: right monaural processor releases its delay, filter, and gain',
+              disconnected(nodes.rightDelay) && disconnected(nodes.rightFilter) && disconnected(nodes.rightGain)
+            )
+            check('normal: channel merger releases both ears and its output', disconnected(nodes.merger))
+            check(
+              'normal: reverb send releases its input gain and delay chain',
+              disconnected(nodes.reverbInput) && disconnected(nodes.reverbDelay)
+            )
+            check('normal: reverb send releases its bus gain', disconnected(nodes.reverbSend))
+            check(
+              'normal: mixer input does not accumulate stale connections',
+              graph.countIn(syngen.mixer.input()) == baseline,
+              'incoming=' + graph.countIn(syngen.mixer.input()) + ' baseline=' + baseline
+            )
+          }
+
+          // Scenario 2: repeated destruction, both before and after the fade completes.
+          {
+            const {stats, type} = createTestSound(syngen)
+            const baseline = graph.countIn(syngen.mixer.input())
+            const instance = type.instantiate({
+              fadeInDuration: 0,
+              fadeOutDuration: 0.12,
+              reverb: true,
+              x: 1,
+              y: 2,
+              z: 0,
+            })
+            const counts = spyTeardown(instance)
+            const nodes = nodesOf(instance)
+            const promiseCalls = instrument(syngen.fn, 'promise')
+
+            await loopFrames(syngen)
+
+            instance.destroy()
+            instance.destroy()
+
+            await wait(40)
+
+            instance.destroy()
+
+            await waitFor(() => stats.destroyed >= 1)
+            await wait(150)
+
+            instance.destroy()
+
+            await wait(50)
+            promiseCalls.restore()
+
+            check('repeat: onDestroy never repeats', stats.destroyed == 1, 'calls=' + stats.destroyed)
+            check('repeat: binaural processor tears down once', counts.binaural == 1, 'calls=' + counts.binaural)
+            check('repeat: reverb send tears down once', counts.reverb == 1, 'calls=' + counts.reverb)
+            check(
+              'repeat: teardown is scheduled exactly once',
+              promiseCalls.count == 1,
+              'scheduled=' + promiseCalls.count
+            )
+            check('repeat: output disconnects', graph.countOut(nodes.output) == 0)
+            check('repeat: binaural processor releases its ears', disconnected(nodes.merger))
+            check('repeat: reverb send releases its chain', disconnected(nodes.reverbInput) && disconnected(nodes.reverbDelay))
+            check(
+              'repeat: mixer input does not accumulate stale connections',
+              graph.countIn(syngen.mixer.input()) == baseline
+            )
+          }
+
+          // Scenario 3: destruction while the fade is still running, without a reverb send.
+          {
+            const {stats, type} = createTestSound(syngen)
+            const baseline = graph.countIn(syngen.mixer.input())
+            const sendCreate = instrument(syngen.mixer.reverb.send, 'create')
+            const instance = type.instantiate({
+              fadeInDuration: 0,
+              fadeOutDuration: 1.5,
+              reverb: false,
+              x: 0,
+              y: 0,
+              z: 4,
+            })
+            const counts = spyTeardown(instance)
+            const nodes = nodesOf(instance)
+
+            sendCreate.restore()
+
+            check('fade: reverb send is not constructed when disabled', sendCreate.count == 0, 'created=' + sendCreate.count)
+            check('fade: reverb flag stays false', instance.reverb === false)
+
+            await loopFrames(syngen)
+
+            // Spying on the parameter keeps this check meaningful even when the context is suspended.
+            const gainRamps = instrument(instance.output.gain, 'linearRampToValueAtTime')
+
+            instance.destroy()
+            gainRamps.restore()
+
+            check(
+              'fade: destruction schedules a gain fade instead of cutting abruptly',
+              gainRamps.count == 1,
+              'ramps=' + gainRamps.count
+            )
+
+            // Destroy again while the fade is still running.
+            await wait(60)
+
+            check('fade: second destroy happens before the fade ends', stats.destroyed == 0)
+            instance.destroy()
+
+            // Shorten the wait by resolving the pending teardown once we know the fade is still pending.
+            await waitFor(() => stats.destroyed >= 1, 4000)
+            await wait(150)
+
+            check('fade: onDestroy runs once when destroyed mid-fade', stats.destroyed == 1, 'calls=' + stats.destroyed)
+            check('fade: binaural processor tears down once', counts.binaural == 1, 'calls=' + counts.binaural)
+            check('fade: reverb send is never touched', counts.reverb == 0, 'calls=' + counts.reverb)
+            check('fade: output disconnects', graph.countOut(nodes.output) == 0)
+            check('fade: binaural processor releases its ears', disconnected(nodes.leftGain) && disconnected(nodes.rightGain))
+            check('fade: mixer input does not accumulate stale connections', graph.countIn(syngen.mixer.input()) == baseline)
+          }
+
+          // Extra: churn many sounds at once and confirm the mixer bus does not accumulate nodes.
+          {
+            const baseline = graph.countIn(syngen.mixer.input())
+            const sounds = []
+
+            for (let index = 0; index < 8; index += 1) {
+              const {stats, type} = createTestSound(syngen)
+              sounds.push({
+                instance: type.instantiate({
+                  fadeInDuration: 0,
+                  fadeOutDuration: 0.05,
+                  reverb: index % 2 == 0,
+                  x: index,
+                  y: -index,
+                  z: 0,
+                }),
+                stats,
+              })
+            }
+
+            await loopFrames(syngen)
+
+            for (const {instance} of sounds) {
+              instance.destroy()
+              instance.destroy()
+            }
+
+            await waitFor(() => sounds.every(({stats}) => stats.destroyed >= 1))
+            await wait(150)
+
+            check(
+              'churn: every sound destroys exactly once',
+              sounds.every(({stats}) => stats.destroyed == 1),
+              sounds.map(({stats}) => stats.destroyed).join(',')
+            )
+            check(
+              'churn: mixer input returns to its baseline',
+              graph.countIn(syngen.mixer.input()) == baseline,
+              'incoming=' + graph.countIn(syngen.mixer.input()) + ' baseline=' + baseline
+            )
+          }
+
+          // Render the report.
+          const failures = results.filter(({pass}) => !pass)
+
+          summary.textContent = failures.length
+            ? failures.length + ' of ' + results.length + ' checks failed'
+            : 'all ' + results.length + ' checks passed'
+          summary.className = failures.length ? 'fail' : 'pass'
+
+          resultsElement.innerHTML = ''
+
+          for (const {detail, name, pass} of results) {
+            const element = document.createElement('li')
+            element.className = pass ? 'pass' : 'fail'
+            element.textContent = (pass ? 'PASS ' : 'FAIL ') + name
+
+            if (detail) {
+              const detailElement = document.createElement('span')
+              detailElement.className = 'detail'
+              detailElement.textContent = ' (' + detail + ')'
+              element.appendChild(detailElement)
+            }
+
+            resultsElement.appendChild(element)
+          }
+
+          window.__destructionResults = results
+          window.__destructionDone = true
+
+          console.table(results)
+
+          return results
+        }
+
+        const start = () => {
+          if (window.__destructionStarted) {
+            return
+          }
+
+          window.__destructionStarted = true
+          runButton.disabled = true
+          summary.textContent = 'Running tests...'
+          summary.className = ''
+
+          run()
+            .catch((error) => {
+              summary.textContent = 'Tests failed to run: ' + error.message
+              summary.className = 'fail'
+              window.__destructionError = String(error && error.stack || error)
+              window.__destructionDone = true
+              console.error(error)
+            })
+            .finally(() => {
+              runButton.disabled = false
+            })
+        }
+
+        runButton.addEventListener('click', start)
+
+        window.__syngenReady.then(start, (error) => {
+          summary.textContent = 'Could not load syngen: ' + error.message
+          summary.className = 'fail'
+          window.__destructionError = String(error && error.stack || error)
+          window.__destructionDone = true
+          console.error(error)
+        })
+      })()
+    </script>
+  </body>
+</html>
