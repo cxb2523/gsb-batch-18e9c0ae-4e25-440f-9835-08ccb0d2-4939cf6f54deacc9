@@ -1,0 +1,72 @@
+name: android-app
+# The Android app is the website's own WASM build in a full-screen WebView (android/webwrap): no Python, no Panda3D, no game files in the app.
+on:
+  workflow_call:                       # the release workflow (native-release.yml) builds the Android app through this
+    inputs:
+      resource_server:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+      release_tag:
+        type: string
+        required: false
+        default: ""
+  workflow_dispatch:
+    inputs:
+      resource_server:
+        description: "URL of the Toontown: Anywhere server the app opens"
+        required: true
+        default: "https://toontown.puffsco.com"
+      version:
+        description: "version name shown to players"
+        required: false
+        default: "0.1"
+permissions:
+  contents: write
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            android
+            ios/panda_ios/make_icon.py
+            ios/panda_ios/icon_source.jpg
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Signing key
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [ -z "$KS_B64" ] && [ -n "$RELEASE_TAG" ]; then echo "A release needs the repository secrets ANDROID_KEYSTORE_B64 and ANDROID_KEYSTORE_PASS (the permanent Android key); refusing to sign a release with a throwaway key"; exit 1; fi
+          if [ -n "$KS_B64" ]; then echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/tta.jks"; echo "KEYSTORE=$RUNNER_TEMP/tta.jks" >> "$GITHUB_ENV"; fi
+      - name: Build
+        env:
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          RESOURCE_SERVER: ${{ inputs.resource_server }}
+          APP_VERSION: ${{ inputs.version }}
+        run: |
+          # the version code must only ever go up: 1.3.2 -> 10302
+          IFS=. read -r MA MI PA _ <<< "${APP_VERSION}.0.0.0"
+          export APP_BUILD=$(( ${MA:-0} * 10000 + ${MI:-0} * 100 + ${PA:-0} ))
+          export PAGE_URL="${RESOURCE_SERVER%/}/play/?install=0"
+          bash android/webwrap/assemble.sh "$GITHUB_WORKSPACE"
+      - name: Attach the APK to the release (or keep it as a trial)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          APP_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then
+            cp out/TTAnywhere.apk "out/TTAnywhere-$APP_VERSION.apk"
+            gh release upload "$RELEASE_TAG" "out/TTAnywhere-$APP_VERSION.apk" out/TTAnywhere.apk --clobber
+          else
+            gh release create "apk-${GITHUB_RUN_ID}" out/TTAnywhere.apk --title "Android app build $GITHUB_RUN_ID" --notes "Trial APK (the web wrapper) from run $GITHUB_RUN_ID. Signed with the repository's Android key when one is set, otherwise with a throwaway key." --prerelease
+          fi

@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Toontown: Anywhere | Play Toontown on mobile and PC, free in your browser</title>
+<meta name="description" content="Play Toontown on mobile with Toontown: Anywhere, a free, fan-made server of the classic Toontown Online game that runs in your web browser on iPhone, iPad, Android, Windows and Linux, with optional full-screen apps. No app store needed: open the page and play.">
+<link rel="canonical" href="https://toontown.puffsco.com/">
+<meta name="theme-color" content="#1c4cc4">
+<link rel="icon" type="image/png" href="/play/favicon.png">
+<link rel="apple-touch-icon" href="/play/icon-180.png">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Toontown: Anywhere">
+<meta property="og:title" content="Toontown: Anywhere: play Toontown on your phone">
+<meta property="og:description" content="Free, fan-made Toontown in your browser on iPhone, iPad, Android, Windows and Linux. Play now or get the app.">
+<meta property="og:url" content="https://toontown.puffsco.com/">
+<meta property="og:image" content="https://toontown.puffsco.com/play/icon-512.png">
+<meta name="twitter:card" content="summary">
+<script type="application/ld+json">
+{"@context": "https://schema.org", "@type": "VideoGame", "name": "Toontown: Anywhere", "alternateName": ["TT: Anywhere", "Toontown mobile"],
+ "url": "https://toontown.puffsco.com/", "description": "A free, fan-made Toontown server played in the web browser or the optional app on iPhone, iPad, Android, Windows and Linux.",
+ "gamePlatform": ["iOS", "Android", "Web browser", "Windows", "Linux"], "applicationCategory": "Game", "genre": ["MMO", "Family"],
+ "playMode": "MultiPlayer", "isAccessibleForFree": true, "image": "https://toontown.puffsco.com/play/icon-512.png",
+ "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
+ "sameAs": ["https://discord.gg/f7YYstu7dA", "https://www.reddit.com/r/ToontownAnywhere/", "https://github.com/lPuffyy/toontown-anywhere"]}
+</script>
+<script type="application/ld+json">
+{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [
+ {"@type": "Question", "name": "Can I play Toontown on my phone or computer?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Toontown: Anywhere runs in your web browser on iPhone, iPad, Android phones and tablets, and on Windows and Linux computers, with touch controls built for small screens. Open toontown.puffsco.com/play, make a toon and play."}},
+ {"@type": "Question", "name": "Is there a Toontown mobile app, and do I need to download it?", "acceptedAnswer": {"@type": "Answer", "text": "No download is needed: the game runs in Safari or Chrome, and you can add it to your Home Screen so it opens full screen like an app. Free mobile and desktop apps are also available for Android, Windows, Linux and Steam Deck, and for iPhone and iPad through SideStore. None of them need an app store."}},
+ {"@type": "Question", "name": "Is it free?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Toontown: Anywhere is free to play, with no purchases."}},
+ {"@type": "Question", "name": "Can I play with friends on other devices?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Phones, tablets and computers all play on the same server with the same account, so you can team up with friends on any device."}}]}
+</script>
+<style>
+/* the game page's own look (web/tta-ui.css): the Toon Display headline font, the cloud-sky picture, yellow buttons and blue-edged cards */
+@font-face { font-family: "Toon Display"; src: url("/_ui/ToonDisplay.ttf") format("truetype"); font-weight: 100 900; font-display: swap; }
+:root { --mf: "Toon Display", "Marker Felt", "MarkerFelt-Wide", "Chalkboard SE", "Comic Sans MS", "Segoe Print", system-ui, sans-serif;
+        --edge: #1f4da6; --stroke: #1c3f9c; --ink: #1a3373; --sun: #ffd926; --btn-edge: #8c520d; --btn-ink: #733805; color-scheme: light }
+* { box-sizing: border-box }
+html { background: #2f86e8 }
+body { margin: 0; min-height: 100vh; color: var(--ink); font: 17px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+       background: #2f86e8 url(/_ui/background.jpg) center top / cover no-repeat fixed }
+a { color: var(--edge); font-weight: 700 }
+.wrap { max-width: 780px; margin: 0 auto; display: grid; gap: 22px;
+        padding: max(36px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(32px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)) }
+.hero { text-align: center; display: grid; justify-items: center; gap: 12px; padding: 26px 18px 30px; border-radius: 28px;
+        background: rgba(20, 70, 190, .45); box-shadow: 0 6px 0 rgba(10, 40, 120, .3), inset 0 0 0 3px rgba(255,255,255,.35) }
+.hero img { width: 104px; height: 104px; border-radius: 24px; box-shadow: 0 4px 0 rgba(0,0,0,.35) }
+.toon { font-family: var(--mf); font-weight: 700; paint-order: stroke fill; margin: 0; line-height: 1.05 }
+h1.toon { font-size: clamp(2.4rem, 9vw, 4rem); color: var(--sun); -webkit-text-stroke: 7px var(--stroke); text-wrap: balance }
+.lede { margin: 0; max-width: 32em; color: #fff; font: 700 1.2rem/1.4 var(--mf); text-shadow: 0 2px 0 rgba(0,0,0,.35); text-wrap: balance }
+.play { display: inline-block; margin-top: 6px; background: var(--sun); color: var(--btn-ink); border: 4px solid var(--btn-edge); border-radius: 18px;
+        font: 700 1.7rem var(--mf); text-decoration: none; padding: 8px 44px; box-shadow: 0 5px 0 rgba(0,0,0,.35) }
+.play:active { transform: translateY(3px); box-shadow: 0 2px 0 rgba(0,0,0,.35) }
+.sub { margin: 0; color: rgba(255,255,255,.92); font-size: .95rem; text-shadow: 0 1px 3px rgba(20,51,115,.7) }
+.card { background: rgba(255,255,255,.95); border: 4px solid var(--edge); border-radius: 22px; padding: 16px 20px 18px; min-width: 0 }
+h2.toon { font-size: 1.7rem; color: #fff; -webkit-text-stroke: 5px var(--stroke); margin-bottom: 8px }
+h3.toon { font-size: 1.3rem; color: var(--edge); margin-bottom: 6px }
+.cards { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)) }
+.cards .card { border-width: 3px; border-radius: 18px; background: #fff }
+p { margin: 0 }
+ol, ul { margin: 0; padding-left: 1.3em }
+li + li { margin-top: 4px }
+.dl { display: inline-block; margin-top: 8px; background: var(--sun); color: var(--btn-ink); border: 3px solid var(--btn-edge); border-radius: 14px;
+      font: 700 1.15rem var(--mf); text-decoration: none; padding: 5px 20px; box-shadow: 0 4px 0 rgba(0,0,0,.3) }
+.dl:active { transform: translateY(2px); box-shadow: 0 2px 0 rgba(0,0,0,.3) }
+.note { font-size: .9rem; margin-top: 6px }
+summary { cursor: pointer; padding: 8px 0 }
+summary:focus-visible, .dl:focus-visible, .copy:focus-visible { outline: 3px solid var(--edge); outline-offset: 2px }
+.mt6 { margin-top: 6px }
+.mt10 { margin-top: 10px }
+.flat { padding: 0 }
+.url { word-break: break-all; display: block }
+.copy { margin-top: 6px; font: 700 .85rem system-ui, sans-serif; color: var(--btn-ink); background: var(--sun); border: 2px solid var(--btn-edge); border-radius: 10px; padding: 4px 12px; cursor: pointer }
+.sub a { color: #fff }
+html { scroll-behavior: smooth }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto } }
+#apps { scroll-margin-top: 16px }
+.faq { display: grid; gap: 6px }
+.faq p + h3 { margin-top: 10px }
+footer { text-align: center; color: #fff; font-size: .85rem; text-shadow: 0 1px 3px rgba(20,51,115,.8) }
+footer a { color: #fff }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="hero">
+  <img src="/play/icon-512.png" alt="Toontown: Anywhere icon" width="104" height="104">
+  <h1 class="toon">Toontown: Anywhere</h1>
+  <p class="lede">Play Toontown on your phone, tablet or computer. Free, in your web browser or as an app: no app store needed.</p>
+  <a class="play" href="#apps">Play now</a>
+  <p class="sub">Works in Safari on iPhone and iPad, and in Chrome on Android and computers.</p>
+  <p class="sub">Help and chat: <a href="https://discord.gg/f7YYstu7dA" rel="noopener">Discord</a></p>
+</header>
+
+<main class="wrap flat">
+  <section class="card">
+    <h2 class="toon">Toontown on mobile and PC</h2>
+    <p>Toontown: Anywhere is the classic Toontown Online game, free to play on mobile phones and tablets as well as on computers. It runs the whole game in your browser, with touch controls made for phones and tablets, and keyboard and game controller support.
+      Make a toon, train your gags, fight Cogs with friends, go fishing, and decorate your estate.</p>
+  </section>
+
+  <section class="card" id="apps">
+    <h2 class="toon">Get the app</h2>
+    <p>Pick how you want to play. The app is the same game as the website, with the same account, settings and chat. Everything here is free and needs no app store.</p>
+    <a class="dl" href="/play/">Play in your browser</a>
+    <div class="cards mt10">
+      <div class="card">
+        <h3 class="toon">iPhone and iPad</h3>
+        <p><b>Recommended:</b> play in Safari and add it to your Home Screen. It opens full screen and updates itself.</p>
+        <a class="dl" href="/play/">Play in Safari</a>
+        <p class="note">Then tap <b>Share</b> (tap <b>&hellip;</b> first if you don't see it), <b>Add to Home Screen</b>, <b>Add</b>.</p>
+        <details class="note mt6">
+          <summary><b>Learn more:</b> install the app with SideStore</summary>
+          <p class="mt6">Already use <a href="https://sidestore.io" rel="noopener">SideStore</a> or AltStore? Add this source to install the app.</p>
+          <code class="url mt6" id="src">https://github.com/lPuffyy/toontown-anywhere/releases/latest/download/altstore.json</code>
+          <button class="copy" type="button" id="copysrc">Copy source</button>
+        </details>
+      </div>
+      <div class="card">
+        <h3 class="toon">Android</h3>
+        <p>Download the APK and open it (allow installs from your browser if asked). For automatic updates, add this project to <a href="https://github.com/ImranR98/Obtainium" rel="noopener">Obtainium</a>.</p>
+        <a class="dl" href="https://github.com/lPuffyy/toontown-anywhere/releases/latest/download/TTAnywhere.apk" rel="noopener">Download APK</a>
+        <details class="note mt6">
+          <summary><b>Learn more:</b> no download, from Chrome</summary>
+          <ol class="mt6">
+            <li>Open <a href="/play/">toontown.puffsco.com/play</a> in Chrome.</li>
+            <li>Tap the <b>&#8942;</b> menu, then <b>Install app</b> (or <b>Add to Home screen</b>).</li>
+            <li>Open <b>TT: Anywhere</b> from your Home screen.</li>
+          </ol>
+        </details>
+      </div>
+      <div class="card">
+        <h3 class="toon">Windows</h3>
+        <p>Installs for your account, no administrator needed. Updates itself.</p>
+        <a class="dl" href="https://github.com/lPuffyy/toontown-anywhere/releases/latest/download/TTAnywhere-Setup.exe" rel="noopener">Download for Windows</a>
+        <p class="note">Windows may warn about an unknown publisher: choose <b>More info</b>, then <b>Run anyway</b>.</p>
+      </div>
+      <div class="card">
+        <h3 class="toon">Linux and Steam Deck</h3>
+        <p>One AppImage file: download it, allow it to run as a program, open it. Updates itself.</p>
+        <a class="dl" href="https://github.com/lPuffyy/toontown-anywhere/releases/latest/download/TTAnywhere-x86_64.AppImage" rel="noopener">Download AppImage</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2 class="toon">Good to know</h2>
+    <ul>
+      <li>The first start downloads the game files (about 390 MB), so use Wi-Fi. They stay on your device after that.</li>
+      <li>Pick a name and a password, then choose <b>Play</b>. Use the same ones next time, on any device.</li>
+      <li>Stuck on a task? The <a href="/guide/">quest guide</a> lists every Toontask and where to go.</li>
+    </ul>
+  </section>
+
+  <section class="card" id="faq">
+    <h2 class="toon">Questions</h2>
+    <div class="faq">
+      <h3 class="toon">Can I play Toontown on my phone or computer?</h3>
+      <p>Yes. Toontown: Anywhere runs in your web browser on iPhone, iPad, Android phones and tablets, and on Windows and Linux computers, with touch controls built for small screens.
+        Open <a href="/play/">toontown.puffsco.com/play</a>, make a toon and play.</p>
+      <h3 class="toon">Is there a Toontown mobile app, and do I need to download it?</h3>
+      <p>No download is needed: the game runs in Safari or Chrome, and you can add it to your Home Screen so it opens full screen like an app.
+        Free mobile and desktop <a href="#apps">apps</a> are also available for Android, Windows, Linux and Steam Deck, and for iPhone and iPad through SideStore. None of them need an app store.</p>
+      <h3 class="toon">Is it free?</h3>
+      <p>Yes. Toontown: Anywhere is free to play, with no purchases.</p>
+      <h3 class="toon">Can I play with friends on other devices?</h3>
+      <p>Yes. Phones, tablets and computers all play on the same server with the same account, so you can team up with friends on any device.</p>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2 class="toon">Community</h2>
+    <p>Get help, report bugs and meet other toons on <a href="https://discord.gg/f7YYstu7dA" rel="noopener">Discord</a>
+      and <a href="https://www.reddit.com/r/ToontownAnywhere/" rel="noopener">r/ToontownAnywhere</a>.
+      The code is open on <a href="https://github.com/lPuffyy/toontown-anywhere" rel="noopener">GitHub</a>.</p>
+  </section>
+</main>
+
+<footer>
+  <p>Toontown: Anywhere is an unofficial, free, fan-made project built on <a href="https://github.com/open-toontown/open-toontown" rel="noopener">Open Toontown</a>.
+    It is not affiliated with, endorsed by, or connected to Disney or any other Toontown server.</p>
+  <p>Made by <a href="https://github.com/lPuffyy" rel="noopener">lPuffyy</a>. Source on <a href="https://github.com/lPuffyy/toontown-anywhere" rel="noopener">GitHub</a>.</p>
+  <p>Based on Toontown Infinite (<a href="https://github.com/TT-Infinite-Archive/source" rel="noopener">source code</a>).</p>
+</footer>
+</div>
+<script>
+(function () {
+  var play = document.querySelector("a.play[href='#apps']"), apps = document.getElementById("apps");
+  if (play && apps) play.addEventListener("click", function (e) {     // scroll without putting #apps in the address, so a refresh starts at the top
+    e.preventDefault();
+    apps.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+  var b = document.getElementById("copysrc"), t = document.getElementById("src");
+  if (!b || !t) return;
+  b.addEventListener("click", function () {
+    var done = function () { b.textContent = "Copied"; setTimeout(function () { b.textContent = "Copy source"; }, 2000); };
+    var pick = function () { var r = document.createRange(); r.selectNodeContents(t); var sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t.textContent.trim()).then(done, pick); else pick();
+  });
+})();
+</script>
+</body>
+</html>

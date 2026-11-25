@@ -1,0 +1,15 @@
+# Caddy for the direct WebSocket route: gets its own HTTPS certificate for ws.puffsco.com through the Cloudflare DNS challenge and passes /ws
+# to the game's bridge. The router maps external TCP 4443 to port 8443 here.
+services:
+  caddy:
+    build: .
+    image: ot-direct-caddy:local
+    container_name: ot-direct
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data:/data
+      - ./config:/config

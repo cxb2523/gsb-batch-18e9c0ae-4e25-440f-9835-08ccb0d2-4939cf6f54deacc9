@@ -1,0 +1,36 @@
+{
+  "name": "ttanywhere",
+  "productName": "TTAnywhere",
+  "version": "1.3.1",
+  "description": "Toontown: Anywhere for Windows and Linux: the website's own game in a full-screen window",
+  "main": "main.js",
+  "private": true,
+  "author": "Toontown: Anywhere",
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "build:win": "node tools/build.js win",
+    "build:linux": "node tools/build.js linux"
+  },
+  "devDependencies": {
+    "@electron/packager": "^18.3.6",
+    "electron": "^39.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.puffsco.toontownanywhere",
+    "productName": "Toontown Anywhere",
+    "copyright": "Toontown: Anywhere",
+    "npmRebuild": false,
+    "afterPack": "tools/afterpack.js",
+    "directories": { "output": "out" },
+    "files": ["main.js", "updater.js", "uninstall.js", "updatekey.js", "assets/icon.png", "package.json"],
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Game",
+      "executableName": "ttanywhere",
+      "icon": "assets/icon.png",
+      "artifactName": "TTAnywhere-${version}-x86_64.AppImage"
+    }
+  }
+}

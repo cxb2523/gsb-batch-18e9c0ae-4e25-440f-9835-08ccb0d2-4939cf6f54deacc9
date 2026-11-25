@@ -1,0 +1,226 @@
+name: Release the apps
+
+# Push a tag like v1.2.0 (it must match the number in the VERSION file) and this builds EVERY platform from that one commit
+# (Windows app and setup program, Linux AppImage, Android APK, iPhone and iPad app), signs the Windows and Linux update lists, and publishes
+# one GitHub release holding all the files. Every app is the website's own game in a full-screen window (desktop/, ios/webwrap).
+# Installed apps read the newest release from GitHub and update themselves. "Run workflow" by hand builds everything as a trial (no release).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ios:
+        description: "also build the iPhone and iPad app (the costly macOS minutes)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  # One tag builds every platform and publishes one release. The release is a draft until every build has finished, so the platforms can
+  # never be out of step: a failed build leaves the draft unpublished (fix it, then run the workflow again for the same tag).
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: VERSION
+      - name: Read the app version, and make sure the tag matches it
+        id: v
+        run: |
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "The tag $GITHUB_REF_NAME does not match the app version $VERSION"; exit 1
+          fi
+      - name: Start the draft release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "v${{ steps.v.outputs.version }}" >/dev/null 2>&1; then
+            gh release create "v${{ steps.v.outputs.version }}" --draft --title "Toontown: Anywhere ${{ steps.v.outputs.version }}" \
+              --notes "Windows: download TTAnywhere-Setup.exe (not code-signed yet, so SmartScreen may warn: More info, then Run anyway). Linux and Steam Deck: download TTAnywhere-x86_64.AppImage, make it executable and run it. Android: download TTAnywhere.apk (or add the repo to Obtainium). iPhone and iPad: add the source https://github.com/${{ github.repository }}/releases/latest/download/altstore.json to SideStore or AltStore. Installed apps update themselves."
+          fi
+
+  ios:
+    needs: prepare
+    if: github.ref_type == 'tag' || inputs.ios
+    uses: ./.github/workflows/ios-app.yml
+    with:
+      resource_server: ${{ vars.GAME_SERVER_URL || 'https://toontown.puffsco.com' }}
+      version: ${{ needs.prepare.outputs.version }}
+      build: ${{ github.run_number }}
+      release_tag: ${{ github.ref_type == 'tag' && format('v{0}', needs.prepare.outputs.version) || '' }}
+
+  android:
+    needs: prepare
+    uses: ./.github/workflows/android-app.yml
+    secrets: inherit
+    with:
+      resource_server: ${{ vars.GAME_SERVER_URL || 'https://toontown.puffsco.com' }}
+      version: ${{ needs.prepare.outputs.version }}
+      release_tag: ${{ github.ref_type == 'tag' && format('v{0}', needs.prepare.outputs.version) || '' }}
+
+  windows:
+    needs: prepare
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install the build tools
+        run: |
+          python -m pip install pyinstaller pillow cryptography
+          cd desktop && npm install --no-audit --no-fund
+
+      - name: Make the app icon
+        run: |
+          python ios/panda_ios/make_icon.py desktop/build/icon
+          cp desktop/build/icon/AppIcon-1024.png desktop/assets/icon.png
+
+      - name: Build the app
+        working-directory: desktop
+        run: |
+          node tools/build.js win
+          python tools/make_zip.py out/TTAnywhere-win32-x64 "dist/TTAnywhere-${{ needs.prepare.outputs.version }}-windows.zip"
+
+      - name: Check that the built app starts and loads the game page
+        shell: pwsh
+        run: |
+          $env:TTA_SELFTEST_OUT = Join-Path $env:RUNNER_TEMP 'selftest.txt'
+          $p = Start-Process -FilePath "desktop/out/TTAnywhere-win32-x64/TTAnywhere.exe" -ArgumentList '--selftest' -Wait -PassThru
+          if (Test-Path $env:TTA_SELFTEST_OUT) { Get-Content $env:TTA_SELFTEST_OUT }
+          if ($p.ExitCode -ne 0) { Write-Error "the built app failed its self-test (exit $($p.ExitCode))"; exit 1 }
+
+      - name: Build the setup program
+        working-directory: desktop
+        run: python tools/build_installer.py "dist/TTAnywhere-${{ needs.prepare.outputs.version }}-windows.zip"
+
+      - name: Sign the update list
+        working-directory: desktop
+        env:
+          TTA_UPDATE_KEY: ${{ secrets.TTA_UPDATE_KEY }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if [ -z "$TTA_UPDATE_KEY" ]; then echo "Add the repository secret TTA_UPDATE_KEY (the private signing key, hex)"; exit 1; fi
+          printf '%s' "$TTA_UPDATE_KEY" > "$RUNNER_TEMP/update.key"
+          python tools/sign_tool.py check "$RUNNER_TEMP/update.key"
+          python tools/sign_tool.py publish "$RUNNER_TEMP/update.key" "dist/TTAnywhere-$VERSION-windows.zip" release --platform windows \
+            --url "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/TTAnywhere-$VERSION-windows.zip"
+          rm -f "$RUNNER_TEMP/update.key"
+          cp "dist/TTAnywhere-Setup-$VERSION.exe" release/
+          cp "dist/TTAnywhere-Setup-$VERSION.exe" release/TTAnywhere-Setup.exe     # a name that never changes, for the download button
+
+      - name: Keep the files (manual runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-files
+          path: desktop/release/*
+          retention-days: 7
+
+      - name: Add the Windows files to the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: gh release upload "v$VERSION" desktop/release/* --clobber
+
+  linux:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install the build tools
+        run: |
+          python -m pip install pillow cryptography
+          cd desktop && npm install --no-audit --no-fund
+
+      - name: Make the app icon
+        run: |
+          python ios/panda_ios/make_icon.py desktop/build/icon
+          cp desktop/build/icon/AppIcon-1024.png desktop/assets/icon.png
+
+      - name: Build the AppImage
+        working-directory: desktop
+        run: node tools/build.js linux
+
+      - name: Check that the built app starts and loads the game page
+        working-directory: desktop
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb libgbm1 libnss3 libasound2t64 libgtk-3-0t64 || true
+          export TTA_SELFTEST_OUT="$RUNNER_TEMP/selftest.txt"
+          APP="$PWD/out/TTAnywhere-$VERSION-x86_64.AppImage"
+          chmod +x "$APP"
+          export ELECTRON_ENABLE_LOGGING=1
+          mkdir "$RUNNER_TEMP/unpacked" && cd "$RUNNER_TEMP/unpacked" && "$APP" --appimage-extract > /dev/null
+          if ! xvfb-run -a ./squashfs-root/ttanywhere --selftest --disable-gpu --disable-dev-shm-usage; then
+            echo "the built app failed its self-test"; cat "$TTA_SELFTEST_OUT" 2>/dev/null; exit 1
+          fi
+          cat "$TTA_SELFTEST_OUT"
+
+      - name: Sign the update list
+        working-directory: desktop
+        env:
+          TTA_UPDATE_KEY: ${{ secrets.TTA_UPDATE_KEY }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if [ -z "$TTA_UPDATE_KEY" ]; then echo "Add the repository secret TTA_UPDATE_KEY (the private signing key, hex)"; exit 1; fi
+          printf '%s' "$TTA_UPDATE_KEY" > "$RUNNER_TEMP/update.key"
+          python tools/sign_tool.py check "$RUNNER_TEMP/update.key"
+          python tools/sign_tool.py publish "$RUNNER_TEMP/update.key" "out/TTAnywhere-$VERSION-x86_64.AppImage" release --platform linux \
+            --url "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/TTAnywhere-$VERSION-x86_64.AppImage"
+          rm -f "$RUNNER_TEMP/update.key"
+          cp "out/TTAnywhere-$VERSION-x86_64.AppImage" release/TTAnywhere-x86_64.AppImage     # a name that never changes, for the download button
+
+      - name: Keep the files (manual runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release-files
+          path: desktop/release/*
+          retention-days: 7
+
+      - name: Add the Linux files to the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: gh release upload "v$VERSION" desktop/release/* --clobber
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [prepare, windows, linux, ios, android]
+    # (a tag always builds every platform)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release (every platform built)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "v${{ needs.prepare.outputs.version }}" --repo "$GITHUB_REPOSITORY" --draft=false --latest

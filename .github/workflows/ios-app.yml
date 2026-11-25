@@ -1,0 +1,86 @@
+name: ios-app
+# The iOS app is the website's own WASM build in a full-screen WKWebView (ios/webwrap): no Python, no Panda3D, no game files in the app.
+on:
+  workflow_call:                       # the release workflow (native-release.yml) builds the iOS app through this, so every platform is built from one tag
+    inputs:
+      resource_server:
+        type: string
+        required: true
+      stage_release:
+        type: string
+        required: false
+        default: ""                    # (not used any more: it only fed the old native app; kept so callers need no change)
+      version:
+        type: string
+        required: false
+        default: ""
+      build:
+        type: string
+        required: false
+        default: "1"
+      release_tag:
+        type: string
+        required: false
+        default: ""
+  workflow_dispatch:                   # a trial build by hand: no release
+    inputs:
+      resource_server:
+        description: "URL of the Toontown: Anywhere server the app opens, e.g. https://toontown.puffsco.com"
+        required: true
+        default: "https://toontown.puffsco.com"
+      stage_release:
+        description: "not used any more (the web wrapper needs no Panda3D stage); any value"
+        required: false
+        default: ""
+permissions:
+  contents: write
+jobs:
+  app:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            ios
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build
+        env:
+          RESOURCE_SERVER: ${{ inputs.resource_server }}
+          APP_VERSION: ${{ inputs.version }}
+          APP_BUILD: ${{ inputs.build }}
+        run: |
+          export PAGE_URL="${RESOURCE_SERVER%/}/play/?install=0"
+          export BUNDLE_ID=com.puffsco.toontownanywhere
+          export APP_NAME="Toontown: Anywhere"
+          export DISPLAY_NAME="TT: Anywhere"
+          export IPA_NAME=TTAnywhere.ipa
+          bash ios/webwrap/assemble.sh "$GITHUB_WORKSPACE"
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true            # (the account's artifact storage can be full: the release upload below does not depend on it)
+        with:
+          name: TTAnywhere-ipa
+          path: out/TTAnywhere.ipa
+      - name: Attach the IPA and the SideStore / AltStore source to the release
+        if: ${{ inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          cp out/TTAnywhere.ipa "TTAnywhere-$VERSION.ipa"
+          python3 -m pip install --quiet pillow
+          python3 ios/panda_ios/make_icon.py icon-out
+          cp icon-out/AppIcon-1024.png icon.png
+          python3 ios/panda_ios/make_source.py "$GITHUB_REPOSITORY" "$TAG" "$VERSION" "TTAnywhere-$VERSION.ipa" icon.png altstore.json
+          gh release upload "$TAG" "TTAnywhere-$VERSION.ipa" icon.png altstore.json --clobber
+      - name: Keep the IPA as a release asset (does not count against artifact storage)
+        if: ${{ inputs.release_tag == '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="ipa-${GITHUB_RUN_ID}"
+          gh release create "$TAG" out/TTAnywhere.ipa --title "iOS app build $GITHUB_RUN_ID" --notes "Unsigned IPA (the web wrapper) from run $GITHUB_RUN_ID." --prerelease

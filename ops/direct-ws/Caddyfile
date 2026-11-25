@@ -1,0 +1,27 @@
+# The game's direct WebSocket route (not through the Cloudflare tunnel). Only /ws is passed on; nothing else of the server is reachable here.
+# DNS: ws.puffsco.com -> the home IP, DNS only (grey cloud). Router: external 4443 -> Zima 8443 (TCP). The certificate comes from the DNS
+# challenge (needs CF_API_TOKEN in .env), so no port 80/443 is needed.
+{
+	auto_https disable_redirects
+}
+
+ws.puffsco.com {
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+	}
+	@game path /ws
+	handle @game {
+		reverse_proxy 192.168.40.134:7380 {
+			# the game's nginx reads the player's address from this header (the tunnel sets it; here Caddy does)
+			header_up CF-Connecting-IP {remote_host}
+			flush_interval -1
+		}
+	}
+	@probe path /__d
+	handle @probe {
+		respond 204
+	}
+	handle {
+		respond "Not found" 404
+	}
+}

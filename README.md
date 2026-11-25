@@ -1,0 +1,75 @@
+# Toontown: Anywhere
+
+**Play Toontown on iPhone, iPad, Android and PC, free, in your web browser: <https://toontown.puffsco.com/>**
+
+An **unofficial, fan-made** way to play Toontown on your phone: in your browser, as an installable web app for iPhone, iPad
+and Android. It is not affiliated with, endorsed by, or connected to Disney.
+
+The game is built on **[Open Toontown](https://github.com/open-toontown/open-toontown)** (the open-source Toontown
+Online code) with this project's own changes, and it runs on its own server. The browser client is Python running in WebAssembly
+([pygbag](https://github.com/pygame-web/pygbag) with Panda3D).
+
+## Play
+
+Open **<https://toontown.puffsco.com/play/>** on your phone or tablet, then add it to your Home Screen so it opens full
+screen in landscape.
+
+**iPhone or iPad (Safari):** open the address, tap **Share** (tap the **...** button first if you don't see it), then
+**View More** if it is shown, then **Add to Home Screen**, then **Add**. Open **TT: Anywhere** from your Home Screen.
+
+**Android (Chrome works best):** open the address in the browser app itself, tap the **...** menu, then **Install app**
+(or **Add to Home screen**), and open **TT: Anywhere** from your Home screen.
+
+Good to know:
+
+- The first start downloads the game files (about 390 MB). Use Wi-Fi. They are kept on the device afterwards. Keep the
+  app installed to the Home Screen: Safari can clear the saved files of a normal browser tab after about a week without use.
+- Phones drop the connection when you switch to another app. Coming back, the game tries to reconnect by itself.
+- Pick a name and a password and tap **Play**. If you have been here before, use the same ones. Passwords can be
+  recovered with the two answers you set up (**Forgot password?**).
+
+## What the game records
+
+To find and fix crashes, the page sends **error and crash information** to the game's server: Python error messages, page errors, lost
+connections, the kind of phone and browser, the screen size, and the **sign-in name** (never the password). It does not record
+touches, chat or screenshots. A report is kept only on that server and is read only by the developer when a bug is being looked at.
+Opening the page with `?log=1` added to the address turns on a fuller log for that visit, which a player may be asked to use when a
+specific problem is being chased.
+
+## Community
+
+- **Discord:** <https://discord.gg/f7YYstu7dA>, for help, bug reports and chat.
+- **Reddit:** <https://www.reddit.com/r/ToontownAnywhere/s/p7FFnl9jGJ>, r/ToontownAnywhere.
+
+## What is in this repository
+
+This repository holds everything written to run the game, but **no game files**: no models, textures, sounds or
+Disney content. The game's own code, the changes to it and the server's Docker image live in the project's fork of Open Toontown, [open-toontown-anywhere](https://github.com/lPuffyy/open-toontown-anywhere).
+
+| Folder | What it is |
+|---|---|
+| [`web/`](web) | The browser client: the page's screens (sign-in, loading, controls), the Python glue that runs Open Toontown in the browser, and the scripts that build the download packs and the page. |
+| [`desktop/`](desktop) | The Windows and Linux apps: the website's own game in a full-screen window (Electron), with the setup program and the self-update. |
+| [`ios/webwrap/`](ios/webwrap), [`android/webwrap/`](android/webwrap) | The iPhone/iPad and Android apps: the same page in a full-screen web view. |
+| [`ops/`](ops) | Small services that run beside the game server in their own containers: the Discord server-status message and the read-only bug-report collector. |
+| [`tools/`](tools) | Migration of the old Toontown: Anywhere accounts, and small operations scripts. |
+| [`docs/`](docs) | The full write-up of the system. |
+
+Start with **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**. The other documents:
+
+- [docs/OPERATIONS.md](docs/OPERATIONS.md): running, updating, backing up and debugging the live server.
+- [docs/MIGRATION.md](docs/MIGRATION.md): how the old server's players were moved over, and what changed for them.
+- [docs/CHANGES.md](docs/CHANGES.md): everything that differs from stock Open Toontown, and the known problems.
+- [docs/TODO.md](docs/TODO.md): open work, with Fish Bingo (switched off because it causes crashes) at the top.
+
+## Status
+
+Live and under active development. Known problems are listed in [docs/CHANGES.md](docs/CHANGES.md#known-problems).
+
+## License and notices
+
+This project's own code is under the BSD 3-Clause License, see [LICENSE](LICENSE). Open Toontown is under the BSD 3-Clause
+License too, and Panda3D under a modified BSD license. Third-party components and credits are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Toontown is a trademark of Disney. This is a fan project with no commercial purpose.

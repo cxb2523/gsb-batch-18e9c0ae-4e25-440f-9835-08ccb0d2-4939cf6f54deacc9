@@ -1,0 +1,17 @@
+name: Settings spec check
+
+# The web app embeds a fallback copy of the shared settings description; this fails if the two drift apart.
+on:
+  push:
+  pull_request:
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: The settings spec in the web app is the same as shared/
+        run: python desktop/tools/check_spec.py
