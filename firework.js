@@ -19,8 +19,16 @@ export const makeFirework = (canvasManager, audioManager) => {
     () => {}
   );
 
+  // Once a level transition starts we stop launching new firework pops and
+  // collapse any in-flight explosion into a single bounded wrap-up, so the
+  // effect can't carry over into the next level or accumulate forever.
+  let finished = false;
+  let released = false;
+
   const draw = (deltaTime) => {
-    if (!baseBall.isPopped() && baseBall.getVelocity().y > 1) {
+    if (released) return;
+
+    if (!finished && !baseBall.isPopped() && baseBall.getVelocity().y > 1) {
       // Give fireworks pops a downwards trajectory
       baseBall.pop({ x: 0, y: 2 });
       audioManager.playSequentialPluck();
@@ -29,5 +37,22 @@ export const makeFirework = (canvasManager, audioManager) => {
     baseBall.draw(deltaTime);
   };
 
-  return { draw };
+  const finish = (deadline) => {
+    if (released) return;
+    finished = true;
+
+    if (baseBall.isPopped()) baseBall.finish(deadline);
+    else baseBall.release();
+  };
+
+  const release = () => {
+    released = true;
+    baseBall.release();
+  };
+
+  return {
+    draw,
+    finish,
+    release,
+  };
 };

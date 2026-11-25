@@ -17,6 +17,21 @@ export const makeLevelManager = (
   const CTX = canvasManager.getContext();
   const countdownDuration = 2400;
   const circleRadius = 112;
+  // Pause before showing the interstitial so the player can watch the final
+  // bubble pop. The timer is owned by the level manager so that it can be
+  // cancelled whenever the level lifecycle is torn down (game over, restart,
+  // preview switch) or when the interstitial is shown through another path.
+  const interstitialDelay = 600;
+  // A level transition moves through these phases. Advancing is only allowed
+  // from "interstitial", and the phase changes synchronously, so repeated
+  // pointer/keyboard input or a stale queued timer can never advance twice.
+  const PHASE = {
+    playing: "playing",
+    settling: "settling",
+    interstitial: "interstitial",
+    advancing: "advancing",
+    gameover: "gameover",
+  };
   let scoreStore;
   let level;
   let previousLevelValue;
@@ -28,6 +43,8 @@ export const makeLevelManager = (
   let hasShownPreviewInitialMessage;
   let levelStarted;
   let missedFirstBubble;
+  let phase;
+  let pendingInterstitialTimeout;
 
   const levelCountdownText = makeTextBlock(
     canvasManager,
@@ -78,14 +95,25 @@ export const makeLevelManager = (
     precision: 120,
   });
 
+  const clearPendingInterstitial = () => {
+    if (pendingInterstitialTimeout) {
+      clearTimeout(pendingInterstitialTimeout);
+      pendingInterstitialTimeout = false;
+    }
+  };
+
   const reset = () => {
+    clearPendingInterstitial();
     level = previewData ? previewData.name : 1;
     previousLevelValue = false;
     hasCompletedInitialAdvance = false;
     interstitialShowing = false;
+    interstitialStart = false;
     gameOver = false;
     hasShownPreviewInitialMessage = false;
     missedFirstBubble = false;
+    levelStarted = false;
+    phase = PHASE.playing;
   };
   reset();
 
@@ -95,21 +123,52 @@ export const makeLevelManager = (
   const isLastLevel = () => level >= levelData.length;
 
   const showLevelInterstitial = () => {
+    // Showing is idempotent: a duplicate request (e.g. the queued pop timer
+    // firing alongside an explicit miss) must not restart the screen or fire
+    // the interstitial callback twice.
+    if (interstitialShowing) return;
+    clearPendingInterstitial();
+    phase = PHASE.interstitial;
     interstitialShowing = true;
     interstitialStart = Date.now();
     onInterstitial(interstitialStart);
   };
 
-  const levelCountingDown = () => Date.now() - levelStarted < countdownDuration;
+  // Called when the final bubble of a level is popped. Schedules a single
+  // interstitial after a short pause. Repeated calls while the level is
+  // settling (or is already showing the interstitial) are ignored, so a
+  // duplicate pop notification cannot queue a second timer.
+  const scheduleLevelInterstitial = () => {
+    if (phase !== PHASE.playing) return;
 
-  const dismissInterstitialAndAdvanceLevel = () => {
+    phase = PHASE.settling;
+    clearPendingInterstitial();
+    pendingInterstitialTimeout = setTimeout(() => {
+      pendingInterstitialTimeout = false;
+      if (phase !== PHASE.settling) return;
+      phase = PHASE.interstitial;
+      showLevelInterstitial();
+    }, interstitialDelay);
+  };
+
+  // Cancel the queued interstitial without tearing down the level. Used when
+  // the game ends or the level lifecycle restarts before the timer fires.
+  const cancelPendingInterstitial = () => {
+    clearPendingInterstitial();
+    if (phase === PHASE.settling) phase = PHASE.playing;
+  };
+
+  const levelCountingDown = () =>
+    !!levelStarted && Date.now() - levelStarted < countdownDuration;
+
+  const advanceLevelAndStart = () => {
     if (previewData) {
       hasShownPreviewInitialMessage = true;
       level = previewData.name;
     }
 
     // On the initial interstitial we want to show the "next" level, aka
-    // "Level 1". However on subsequent  interstitials we want to show the
+    // "Level 1". However on subsequent interstitials we want to show the
     // completed level aka the previous level, and only transition the level
     // indicator once the player has advanced by hitting "Continue"
     else if (hasCompletedInitialAdvance) {
@@ -130,17 +189,37 @@ export const makeLevelManager = (
       } par so far`,
     ]);
 
-    interstitialShowing = false;
-    interstitialStart = false;
     levelStarted = Date.now();
     levelNumberSpringPosition.resetValue(
       canvasManager.getHeight() / 2 - circleRadius - 13
     );
 
     onAdvance();
+
+    // The new level is live as soon as its bubbles exist, even though its
+    // countdown overlay is still animating. Popping during the countdown is
+    // still impossible because the bubbles aren't drawn until it ends.
+    if (phase === PHASE.advancing) phase = PHASE.playing;
+  };
+
+  const dismissInterstitialAndAdvanceLevel = () => {
+    // Only a shown interstitial may advance the level. This guard makes
+    // repeat clicks, space/enter presses, and stale timers no-ops.
+    if (phase !== PHASE.interstitial) return false;
+
+    // Consume the interstitial before invoking the advance callback so a
+    // synchronous re-entry can't advance a second time.
+    phase = PHASE.advancing;
+    interstitialShowing = false;
+    interstitialStart = false;
+    clearPendingInterstitial();
+    advanceLevelAndStart();
+    return true;
   };
 
   const onGameOver = () => {
+    clearPendingInterstitial();
+    phase = PHASE.gameover;
     interstitialShowing = true;
     interstitialStart = Date.now();
     gameOver = true;
@@ -255,7 +334,10 @@ export const makeLevelManager = (
     levelCountingDown,
     drawLevelCountdown,
     showLevelInterstitial,
+    scheduleLevelInterstitial,
+    cancelPendingInterstitial,
     dismissInterstitialAndAdvanceLevel,
+    isSettling: () => phase === PHASE.settling,
     setMissedFirstBubble: () => (missedFirstBubble = true),
     missedFirstBubble: () => missedFirstBubble,
     isLastLevel,

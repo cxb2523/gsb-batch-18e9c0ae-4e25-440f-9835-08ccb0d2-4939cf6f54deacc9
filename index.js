@@ -97,23 +97,85 @@ const CTX = canvasManager.getContext();
 
 levelManager.setScoreStore(scoreStore);
 
-// These are all reset on game restart
-let activePointers;
-let pointerTriggerOutput;
-let previousLevelBalls;
-let balls;
-let ripples;
-let fireworks;
-let showInterstitialTimeout;
+// A level switch is a single, cancellable transition. These constants bound
+// the "one-shot" wrap-up of the finished level's effects and debounce the
+// interstitial input so a double click/key can't advance twice.
+const LEVEL_WRAP_UP_DURATION = 1200;
+const INTERSTITIAL_ACTION_DEBOUNCE = 320;
 
-function resetGame() {
-  clearTimeout(showInterstitialTimeout);
+// These are all reset on game restart
+let activePointers = [];
+let pointerTriggerOutput = [];
+let previousLevelBalls = [];
+let balls = [];
+let ripples = [];
+let fireworks = [];
+// True from the moment the final bubble is popped until the next level (or
+// restart) begins. Guarantees the finish wrap-up runs at most once per level.
+let levelFinishStarted;
+// Debounces interstitial actions (pointer clicks, space/enter) across the
+// restart path, where a fresh interstitial is shown immediately.
+let lastInterstitialActionAt = 0;
+
+function releaseBalls(list) {
+  list.forEach((ball) => ball.release());
+}
+
+function releaseFireworks(list) {
+  list.forEach((firework) => firework.release());
+}
+
+// Tear down only the finished level's wrap-up (popping fragments + fireworks).
+// Safe to call repeatedly; the arrays are emptied and release is idempotent.
+function releaseWrapUp() {
+  releaseBalls(previousLevelBalls);
+  releaseFireworks(fireworks);
+  previousLevelBalls = [];
+  fireworks = [];
+  levelFinishStarted = false;
+}
+
+function clearTransientEffects() {
   activePointers = [];
   pointerTriggerOutput = [];
-  previousLevelBalls = [];
-  balls = [];
   ripples = [];
-  fireworks = [];
+}
+
+// Called exactly once when the last bubble of a level is popped. The still-
+// popping fragments are handed off to a bounded, one-shot wrap-up; everything
+// else from the finished level (live/unplayed balls, trails, ripples) is dropped
+// immediately so it can never bleed into the next level.
+function beginLevelFinishing() {
+  if (levelFinishStarted) return;
+  levelFinishStarted = true;
+
+  // Any pop-queued interstitial is superseded by this explicit wrap-up.
+  levelManager.cancelPendingInterstitial();
+
+  const deadline = Date.now() + LEVEL_WRAP_UP_DURATION;
+  const popping = balls.filter((b) => b.isPopping());
+
+  balls.forEach((b) => {
+    if (!popping.includes(b)) b.release();
+  });
+  balls = [];
+
+  // Never stack a wrap-up on top of an older one.
+  releaseBalls(previousLevelBalls);
+  previousLevelBalls = popping;
+  popping.forEach((b) => b.finish(deadline));
+
+  fireworks.forEach((f) => f.finish(deadline));
+
+  clearTransientEffects();
+}
+
+function resetGame() {
+  levelManager.cancelPendingInterstitial();
+  releaseWrapUp();
+  releaseBalls(balls);
+  balls = [];
+  clearTransientEffects();
   lifeManager.reset();
   levelManager.reset();
   tutorialManager.isTutorialComplete()
@@ -125,28 +187,64 @@ function resetGame() {
 resetGame();
 
 function resetLevelData() {
-  fireworks = [];
+  // The previous level's wrap-up is intentionally kept here: it plays on as a
+  // one-shot flourish over the interstitial and the next level's countdown,
+  // then the draw loop releases it. Only transient input effects are cleared.
+  clearTransientEffects();
   audioManager.resetPluckSequence();
 }
 
 function resetPreviewData() {
+  levelManager.cancelPendingInterstitial();
+  clearTransientEffects();
   audioManager.resetPluckSequence();
   lifeManager.reset();
   scoreStore.reset();
 }
 
 function resetOngoingVisuals() {
-  activePointers = [];
-  pointerTriggerOutput = pointerTriggerOutput.filter((b) => !b.isGone());
-  ripples = [];
+  clearTransientEffects();
+}
+
+// Bubbles are only hittable while they are actually being drawn. During the
+// end-of-level settle pause and a new level's countdown the bubbles are gone or
+// not drawn yet, so input must be ignored there too — otherwise a stray click
+// (e.g. the tail of a Continue burst) could pop an invisible bubble and trigger
+// a second advance.
+function levelInteractionAllowed() {
+  const tutorialComplete = tutorialManager.isTutorialComplete();
+
+  if (!tutorialComplete) return true;
+
+  return (
+    !levelManager.isInterstitialShowing() &&
+    !levelManager.isSettling() &&
+    !levelManager.levelCountingDown() &&
+    !levelManager.isGameOver()
+  );
 }
 
 function advanceFromInterstitial() {
-  levelManager.isGameOver() ||
-  levelManager.isLastLevel() ||
-  levelManager.missedFirstBubble()
-    ? resetGame()
-    : levelManager.dismissInterstitialAndAdvanceLevel();
+  if (!levelManager.isInterstitialShowing()) return;
+
+  // Ignore a burst of clicks/keys (and the restart path's immediately
+  // re-shown interstitial) within the same gesture.
+  const now = Date.now();
+  if (now - lastInterstitialActionAt < INTERSTITIAL_ACTION_DEBOUNCE) return;
+  lastInterstitialActionAt = now;
+
+  const shouldRestart =
+    levelManager.isGameOver() ||
+    levelManager.isLastLevel() ||
+    levelManager.missedFirstBubble();
+
+  if (shouldRestart) {
+    // resetGame() clears the interstitial state, any queued timer, and the
+    // leftover effects before showing a fresh screen.
+    resetGame();
+  } else {
+    levelManager.dismissInterstitialAndAdvanceLevel();
+  }
 }
 
 canvasManager.getElement().addEventListener("pointerdown", (e) => {
@@ -158,6 +256,10 @@ canvasManager.getElement().addEventListener("pointerdown", (e) => {
       advanceFromInterstitial,
       shareImageManager.share
     );
+  } else if (!levelInteractionAllowed()) {
+    // A new level is still counting down; bubbles aren't drawn yet, so ignore.
+    e.preventDefault();
+    return;
   } else {
     try {
       canvasManager.getElement().setPointerCapture(pointerId);
@@ -376,7 +478,15 @@ animate((deltaTime) => {
       triggerTimedOutHoldBlasts();
     }
 
-    detectCollisionsForGameObjects();
+    // Skip collision pops while the new level is counting down: its bubbles
+    // exist but aren't drawn yet, so a lingering blast/slingshot must not pop
+    // them invisibly.
+    if (
+      !levelManager.isInterstitialShowing() &&
+      !levelManager.levelCountingDown()
+    ) {
+      detectCollisionsForGameObjects();
+    }
 
     // Draw text elements (level, life, interstitial) underneath bubbles
     levelManager.drawInterstitialMessage({
@@ -458,11 +568,31 @@ animate((deltaTime) => {
 
     // Draw main game elements
     ripples.forEach((r) => r.draw());
-    previousLevelBalls.forEach((b) => b.draw(deltaTime));
-    fireworks.forEach((f) => f.draw(deltaTime));
+
+    // The finished level's wrap-up (popping fragments + fireworks) is a single
+    // one-shot flourish: it plays through the end-of-level pause and the
+    // interstitial, then is released the moment the next level's countdown
+    // begins, so it can never be painted on top of the new bubbles or
+    // accumulate. During the tutorial there is no level transition, so the
+    // popping hand-off keeps its original behaviour.
+    const tutorialComplete = tutorialManager.isTutorialComplete();
+    const countdownVisible = levelManager.levelCountingDown();
+
+    if (!tutorialComplete) {
+      previousLevelBalls.forEach((b) => b.draw(deltaTime));
+    } else {
+      const wrapUpVisible =
+        levelManager.isSettling() || levelManager.isInterstitialShowing();
+      if (wrapUpVisible) {
+        previousLevelBalls.forEach((b) => b.draw(deltaTime));
+        fireworks.forEach((f) => f.draw(deltaTime));
+      } else if (previousLevelBalls.length || fireworks.length) {
+        releaseWrapUp();
+      }
+    }
 
     levelManager.drawLevelCountdown(deltaTime);
-    if (!levelManager.levelCountingDown()) {
+    if (!countdownVisible) {
       balls.forEach((b) => b.draw(deltaTime));
     }
 
@@ -512,12 +642,12 @@ function onPointerTrigger(output) {
 
 function onPop() {
   if (balls.filter((b) => b.inPlay()).length === 0) {
-    // Pause before showing interstitial so user can see the final bubble pop
-    clearTimeout(showInterstitialTimeout);
-    showInterstitialTimeout = setTimeout(
-      levelManager.showLevelInterstitial,
-      600
-    );
+    // The pop that empties the level immediately folds the leftovers into a
+    // one-shot wrap-up (so they can't bleed into the next level), then asks
+    // the level manager to queue the single delayed interstitial. Both calls
+    // are idempotent, so duplicate pop notifications are harmless.
+    beginLevelFinishing();
+    levelManager.scheduleLevelInterstitial();
   }
 }
 
@@ -533,6 +663,11 @@ function onMiss() {
       if (levelManager.getLevel() === 1) {
         levelManager.setMissedFirstBubble();
       }
+      // A miss that clears the level skips the celebration wait; fold any
+      // in-flight pops into the same one-shot wrap-up (so they can't bleed
+      // into the next level) and show the interstitial immediately. Both
+      // helpers are idempotent, so a pop/miss race stays safe.
+      beginLevelFinishing();
       levelManager.showLevelInterstitial();
     }
   }
@@ -545,7 +680,13 @@ function onTutorialPop() {
 }
 
 function onGameEnd() {
-  clearTimeout(showInterstitialTimeout);
+  // Drop any queued level-complete interstitial and release the finished
+  // level's leftover fragments before the game-over screen takes over.
+  levelManager.cancelPendingInterstitial();
+  releaseWrapUp();
+  releaseBalls(balls);
+  balls = [];
+  clearTransientEffects();
   audioManager.playLose();
   levelManager.onGameOver();
 }
@@ -556,6 +697,9 @@ function onInterstitial() {
   resetOngoingVisuals();
 
   if (!levelManager.isGameOver() && levelManager.isLastLevel()) {
+    // Starting a fresh set of fireworks replaces (and releases) any that were
+    // still playing so they never accumulate across interstitials.
+    releaseFireworks(fireworks);
     fireworks = new Array(8)
       .fill()
       .map(() => makeFirework(canvasManager, audioManager));
@@ -563,16 +707,22 @@ function onInterstitial() {
 }
 
 function onLevelAdvance() {
+  // resetLevelData() deliberately keeps the previous level's wrap-up so it can
+  // finish its one-shot flourish over the new level's countdown.
   resetLevelData();
 
-  // Allow popping animation to finish playing for previous level bubbles
-  previousLevelBalls = balls.filter((b) => b.isPopping());
+  // The finish wrap-up is already held in previousLevelBalls (handed off by
+  // beginLevelFinishing); anything still popping in `balls` shouldn't exist.
   balls = makeLevelBalls(
     canvasManager,
     levelManager.getLevelData(),
     onPop,
     onMiss
   );
+  // A brand-new level is live, so its own finish wrap-up may begin once its
+  // bubbles are popped. (The previous wrap-up is still drawn until the
+  // countdown ends, then released.)
+  levelFinishStarted = false;
 
   // Call on first interaction. Subsequent calls are ignored.
   audioManager.initialize();
@@ -582,9 +732,8 @@ function onLevelAdvance() {
 function onPreviewAdvance() {
   resetPreviewData();
 
-  // Allow popping animation to finish playing for previous level bubbles
-  previousLevelBalls = balls.filter((b) => b.isPopping());
   balls = makeLevelBalls(canvasManager, previewData, onPop, onMiss);
+  levelFinishStarted = false;
 
   // Call on first interaction. Subsequent calls are ignored.
   audioManager.initialize();

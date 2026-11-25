@@ -543,6 +543,17 @@ Player Interaction
 
 The level manager also controls the interstitial messages shown between gameplay states.
 
+### Level transition lifecycle
+
+Clearing a level is a single, cancellable transition rather than a set of ad-hoc timers. It is handled by `level.js` (state machine) and `index.js` (effects + input):
+
+1. **Settle.** When the final bubble is popped, `onPop` calls `beginLevelFinishing()` (once per level) and `levelManager.scheduleLevelInterstitial()`. The still-popping fragments, trails, and fireworks are folded into a bounded, one-shot wrap-up; everything else from the finished level is released immediately so it cannot bleed into the next level.
+2. **Interstitial.** After a short delay (`interstitialDelay`, 600 ms) the level manager shows the interstitial. The timer is owned by the level manager, and showing is idempotent, so duplicate pop/miss notifications cannot queue a second screen.
+3. **Advance.** Only an interstitial in the `interstitial` phase may advance. `dismissInterstitialAndAdvanceLevel()` switches to the `advancing` phase synchronously before running the callback, so repeated pointer clicks, space/enter presses, and stale timers are no-ops — the level number moves exactly once per Continue.
+4. **Countdown / go live.** The new level's bubbles exist immediately but are not drawn (and not interactive) until the countdown ends. The previous level's wrap-up is released the moment the countdown begins.
+
+Game over (`onGameEnd`), restart (`resetGame`), and preview switches (`resetPreviewData`) all call `cancelPendingInterstitial()` and release the wrap-up, so no queued level timer or leftover effect survives a teardown. Entering the next level also replaces (and releases) any previous fireworks, so they never accumulate.
+
 ---
 
 # 🗺️ Level Data

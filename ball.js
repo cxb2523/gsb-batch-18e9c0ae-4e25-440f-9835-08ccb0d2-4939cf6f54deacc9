@@ -33,6 +33,28 @@ export const makeBall = (
   let poppedParticles = [];
   let sparks = [];
   let missed = false;
+  // When a level is being torn down we want the remaining pop animation to
+  // collapse into a single, bounded wrap-up instead of lingering indefinitely.
+  // A finish deadline shortens the animation so it is fully over by that time.
+  let finishDeadline = false;
+  let released = false;
+
+  const getPopAnimationDuration = () => {
+    if (finishDeadline === false) return popAnimationDuration;
+    // Math.max(1, ...) avoids a zero-length clampedProgress (division by zero)
+    return Math.max(
+      1,
+      Math.min(popAnimationDuration, finishDeadline - poppedTime)
+    );
+  };
+
+  const getPopAnimationDurationMax = () => {
+    if (finishDeadline === false) return popAnimationDurationMax;
+    return Math.max(
+      1,
+      Math.min(popAnimationDurationMax, finishDeadline - poppedTime)
+    );
+  };
 
   const baseParticle = makeParticle(canvasManager, {
     radius,
@@ -45,9 +67,14 @@ export const makeBall = (
     onLeftTouch,
   });
 
-  const inPlay = () => !popped && !missed && baseParticle.getDuration() > delay;
+  const inPlay = () =>
+    !released &&
+    !popped &&
+    !missed &&
+    baseParticle.getDuration() > delay;
 
   const inViewport = () => {
+    if (released) return false;
     const { x, y } = baseParticle.getPosition();
     const radius = baseParticle.getRadius();
 
@@ -193,9 +220,13 @@ export const makeBall = (
   };
 
   const draw = (deltaTime) => {
+    if (released) return;
+
     if (popped) {
       const timeSincePopped = Date.now() - poppedTime;
-      if (timeSincePopped > popAnimationDurationMax) {
+      const animationDuration = getPopAnimationDuration();
+      const animationDurationMax = getPopAnimationDurationMax();
+      if (timeSincePopped > animationDurationMax) {
         poppedParticles = [];
         sparks = [];
       } else {
@@ -208,13 +239,13 @@ export const makeBall = (
               ? transition(
                   1,
                   0,
-                  clampedProgress(0, popAnimationDuration, timeSincePopped),
+                  clampedProgress(0, animationDuration, timeSincePopped),
                   easeOutCubic
                 )
               : transition(
                   0.5,
                   1.5,
-                  clampedProgress(0, popAnimationDuration, timeSincePopped),
+                  clampedProgress(0, animationDuration, timeSincePopped),
                   easeOutCubic
                 );
 
@@ -248,7 +279,7 @@ export const makeBall = (
           const length = transition(
             s.getRadius(),
             0,
-            clampedProgress(0, popAnimationDuration, timeSincePopped),
+            clampedProgress(0, animationDuration, timeSincePopped),
             easeOutCubic
           );
 
@@ -302,6 +333,30 @@ export const makeBall = (
     inPlay,
     inViewport,
     isPopping: () =>
-      popped && Date.now() - poppedTime <= popAnimationDurationMax,
+      !released && popped && Date.now() - poppedTime <= popAnimationDurationMax,
+    // Wrap the ongoing pop up into a single one-shot flourish that is fully
+    // over by `deadline` (a Date.now() timestamp). Calling this on a ball that
+    // isn't popping is a no-op, so live bubbles are never destroyed by a level
+    // teardown that races with their pop notification.
+    finish: (deadline) => {
+      if (released) return;
+      if (!popped) {
+        released = true;
+        poppedParticles = [];
+        sparks = [];
+        return;
+      }
+      finishDeadline =
+        finishDeadline === false
+          ? deadline
+          : Math.min(finishDeadline, deadline);
+    },
+    // Immediately stop drawing and drop every retained particle. Used by game
+    // over, restart, and preview switches so nothing is left accumulated.
+    release: () => {
+      released = true;
+      poppedParticles = [];
+      sparks = [];
+    },
   };
 };
