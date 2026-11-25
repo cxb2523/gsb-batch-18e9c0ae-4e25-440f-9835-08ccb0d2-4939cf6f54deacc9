@@ -21,7 +21,7 @@ import {
 } from '../core/operations'
 import { Scene } from '../core/scene'
 import { attachPointerInput } from '../input/pointer'
-import { GlyphAtlas } from '../render/glyphAtlas'
+import { AtlasProvider } from '../render/glyphAtlas'
 import { renderScene } from '../render/scene'
 import { DEFAULT_THEME } from '../render/theme'
 import { createBrushTool } from '../tools/brush'
@@ -66,13 +66,12 @@ export class Editor {
   private readonly theme: Theme
   private readonly tools = new Map<string, Tool>()
 
-  private atlas: GlyphAtlas
+  private readonly atlasProvider: AtlasProvider
   private brush: Emoji = INITIAL_BRUSH
   private brushSize: BrushSize = 1
   private destroyed = false
   private detachInput: () => void
   private dirty = true
-  private dpr = 0
   private frame = 0
   private height = 0
   private hoverPoint: null | { px: number; py: number } = null
@@ -92,7 +91,7 @@ export class Editor {
     container.append(this.canvas)
 
     this.ctx = this.canvas.getContext('2d')!
-    this.atlas = new GlyphAtlas(deviceRatio(), this.theme.fontStack)
+    this.atlasProvider = new AtlasProvider(deviceRatio(), this.theme.fontStack)
 
     const brushTool = createBrushTool()
     const tools = [
@@ -312,8 +311,10 @@ export class Editor {
 
   private draw(): void {
     renderScene(this.ctx, this.scene, {
-      atlas: this.atlas,
+      atlas: this.atlasProvider,
       camera: this.camera,
+      dpr: deviceRatio(),
+      fontStack: this.theme.fontStack,
       height: this.height,
       theme: this.theme,
       width: this.width,
@@ -394,14 +395,8 @@ export class Editor {
   private resize(container: HTMLElement): void {
     const dpr = deviceRatio()
 
-    if (dpr !== this.dpr) {
-      // Every buffer in the atlas was rasterised for the old ratio; moving
-      // the window to a display with a different one would otherwise leave
-      // every glyph soft.
-      this.dpr = dpr
-      this.atlas = new GlyphAtlas(dpr, this.theme.fontStack)
-    }
-
+    // Atlas validity is checked against this ratio at the start of every
+    // draw, so the resize only has to keep the canvas backing store matched.
     this.width = container.clientWidth
     this.height = container.clientHeight
     this.canvas.width = Math.round(this.width * dpr)

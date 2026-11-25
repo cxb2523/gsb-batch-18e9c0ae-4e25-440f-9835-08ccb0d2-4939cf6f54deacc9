@@ -526,4 +526,43 @@ describe('editor input edge cases', () => {
       vi.unstubAllGlobals()
     }
   })
+
+  it('rebuilds the glyph atlas and keeps drawing when the DPR changes', async () => {
+    let resizeCallback: null | ResizeObserverCallback = null
+
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        constructor(callback: ResizeObserverCallback) {
+          resizeCallback = callback
+        }
+
+        disconnect(): void {}
+
+        observe(): void {}
+
+        unobserve(): void {}
+      },
+    )
+
+    const { canvas, container, editor } = mount()
+
+    tap(canvas, 5, 5)
+    await expect.poll(() => editor.toText().length).toBeGreaterThan(0)
+
+    vi.stubGlobal('devicePixelRatio', 2)
+    try {
+      // A display move changes the ratio without changing the container, so
+      // invoke the same callback a real ResizeObserver would run. The draw
+      // loop then resolves the atlas for the new ratio on its next frame.
+      resizeCallback!([], undefined as unknown as ResizeObserver)
+
+      await expect.poll(() => canvas.width).toBe(container.clientWidth * 2)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+
+    expect(editor.getSnapshot().isEmpty).toBe(false)
+    editor.destroy()
+  })
 })

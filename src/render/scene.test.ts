@@ -4,25 +4,32 @@ import type { RenderOptions } from './scene'
 
 import { createCamera } from '../core/camera'
 import { Scene } from '../core/scene'
-import { GlyphAtlas } from './glyphAtlas'
+import { AtlasProvider, GlyphAtlas, nearestAtlasStep } from './glyphAtlas'
 import { renderScene } from './scene'
 import { DEFAULT_THEME } from './theme'
 
 const WIDTH = 120
 const HEIGHT = 120
 
+type PartialDirectOptions = Partial<{
+  atlas: GlyphAtlas
+  camera: RenderOptions['camera']
+  height: RenderOptions['height']
+  theme: RenderOptions['theme']
+  width: RenderOptions['width']
+}>
+
 function bytes(ctx: CanvasRenderingContext2D) {
   return Array.from(ctx.getImageData(0, 0, WIDTH, HEIGHT).data)
 }
 
-function options(overrides: Partial<RenderOptions> = {}): RenderOptions {
+function options(overrides: PartialDirectOptions = {}): RenderOptions {
   return {
-    atlas: new GlyphAtlas(1, DEFAULT_THEME.fontStack),
-    camera: createCamera(),
-    height: HEIGHT,
-    theme: DEFAULT_THEME,
-    width: WIDTH,
-    ...overrides,
+    atlas: overrides.atlas ?? new GlyphAtlas(1, DEFAULT_THEME.fontStack),
+    camera: overrides.camera ?? createCamera(),
+    height: overrides.height ?? HEIGHT,
+    theme: overrides.theme ?? DEFAULT_THEME,
+    width: overrides.width ?? WIDTH,
   }
 }
 
@@ -274,6 +281,98 @@ describe('renderScene', () => {
     expect(() =>
       renderScene(ctx, new Scene(), options({ height: 0, width: 0 })),
     ).not.toThrow()
+  })
+
+  it('renders through an AtlasProvider with unchanged parameters', () => {
+    const ctx = surface()
+    const scene = new Scene()
+    scene.writeCell(1, 1, '❤️')
+    const atlasProvider = new AtlasProvider(1, DEFAULT_THEME.fontStack)
+    const first = atlasProvider.get(1, DEFAULT_THEME.fontStack)
+
+    expect(() =>
+      renderScene(ctx, scene, {
+        atlas: atlasProvider,
+        camera: createCamera(),
+        dpr: 1,
+        fontStack: DEFAULT_THEME.fontStack,
+        height: HEIGHT,
+        theme: DEFAULT_THEME,
+        width: WIDTH,
+      }),
+    ).not.toThrow()
+
+    const centre = Math.round(DEFAULT_THEME.baseCellSize * 1.5)
+
+    expect(pixel(ctx, centre, centre)).not.toEqual([255, 255, 255, 255])
+    expect(atlasProvider.get(1, DEFAULT_THEME.fontStack)).toBe(first)
+  })
+
+  it('swaps in a rebuilt atlas when the device pixel ratio changes', () => {
+    const ctx = surface()
+    const scene = new Scene()
+    scene.writeCell(1, 1, '❤️')
+    const atlasProvider = new AtlasProvider(1, DEFAULT_THEME.fontStack)
+    const before = atlasProvider.get(1, DEFAULT_THEME.fontStack)
+
+    expect(() =>
+      renderScene(ctx, scene, {
+        atlas: atlasProvider,
+        camera: createCamera(),
+        dpr: 2,
+        fontStack: DEFAULT_THEME.fontStack,
+        height: HEIGHT,
+        theme: DEFAULT_THEME,
+        width: WIDTH,
+      }),
+    ).not.toThrow()
+
+    const after = atlasProvider.get(2, DEFAULT_THEME.fontStack)
+
+    expect(after).not.toBe(before)
+
+    const step = nearestAtlasStep(DEFAULT_THEME.baseCellSize)
+    const buffer = after.get(
+      '❤️',
+      DEFAULT_THEME.baseCellSize,
+    ) as HTMLCanvasElement
+
+    expect(buffer.width).toBe(step * 2)
+    expect(after.averageColorRgb('❤️')).not.toBe(before.averageColorRgb('❤️'))
+  })
+
+  it('rebuilds within the render layer when the font stack changes', () => {
+    const ctx = surface()
+    const scene = new Scene()
+    scene.writeCell(0, 0, '❤️')
+    const atlasProvider = new AtlasProvider(1, DEFAULT_THEME.fontStack)
+    const before = atlasProvider.get(1, DEFAULT_THEME.fontStack)
+    const nextFont = 'Georgia, serif'
+
+    renderScene(ctx, scene, {
+      atlas: atlasProvider,
+      camera: createCamera(),
+      dpr: 1,
+      fontStack: nextFont,
+      height: HEIGHT,
+      theme: DEFAULT_THEME,
+      width: WIDTH,
+    })
+
+    const after = atlasProvider.get(1, nextFont)
+
+    expect(after).not.toBe(before)
+    // A second frame with the same font reuses the rebuilt instance.
+    renderScene(ctx, scene, {
+      atlas: atlasProvider,
+      camera: createCamera(),
+      dpr: 1,
+      fontStack: nextFont,
+      height: HEIGHT,
+      theme: DEFAULT_THEME,
+      width: WIDTH,
+    })
+    expect(atlasProvider.get(1, nextFont)).toBe(after)
   })
 })
 

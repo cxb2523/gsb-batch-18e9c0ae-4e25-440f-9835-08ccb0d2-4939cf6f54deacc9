@@ -1,7 +1,7 @@
 import type { Camera } from '../core/camera'
 import type { Scene } from '../core/scene'
 import type { CellBounds } from '../core/types'
-import type { GlyphAtlas } from './glyphAtlas'
+import type { AtlasProvider, GlyphAtlas } from './glyphAtlas'
 import type { LevelOfDetail, Theme } from './theme'
 
 import { cellSizeAt, visibleBounds } from '../core/camera'
@@ -34,8 +34,22 @@ let filledMaxRow = -1
 let filledMinColumn = 0
 let filledMinRow = 0
 
-export type RenderOptions = {
-  atlas: GlyphAtlas
+export type RenderOptions =
+  | (BaseRenderOptions & {
+      /**
+       * Held by the caller. It is asked for the atlas matching `dpr` and
+       * `fontStack` once per frame, so a display, zoom or font change swaps
+       * in a rebuilt atlas without the caller rebuilding it itself.
+       */
+      atlas: AtlasProvider
+      /** Device pixel ratio the frame is rendered at. */
+      dpr: number
+      /** Font stack glyphs must be rasterised with. */
+      fontStack: string
+    })
+  | (BaseRenderOptions & { atlas: GlyphAtlas })
+
+type BaseRenderOptions = {
   camera: Camera
   /** Viewport height in logical pixels. */
   height: number
@@ -57,13 +71,24 @@ export type RenderOptions = {
  * Nothing in the loops below allocates — no cellToScreen (it returns a fresh
  * object per call), no closures, no temporaries. At the smallest zoom this
  * loop runs over tens of thousands of cells per frame.
+ *
+ * The atlas may be supplied directly or through an {@link AtlasProvider}.
+ * With a provider, the valid atlas for the frame's device pixel ratio and
+ * font stack is resolved here, so a display move or a font-stack change
+ * rebuilds the atlas inside the render layer instead of drawing stale
+ * glyphs. Resolution is keyed on the parameters: an unchanged frame reuses
+ * the same instance, and within one frame there is only one resolution.
  */
 export function renderScene(
   ctx: CanvasRenderingContext2D,
   scene: Scene,
   opts: RenderOptions,
 ): void {
-  const { atlas, camera, height, theme, width } = opts
+  const { camera, height, theme, width } = opts
+  // The provider variant carries the parameter pair; resolving it here is
+  // what rebuilds the atlas inside the render layer when either changes.
+  const atlas =
+    'dpr' in opts ? opts.atlas.get(opts.dpr, opts.fontStack) : opts.atlas
 
   ctx.imageSmoothingEnabled = theme.antialias
   ctx.fillStyle = theme.backgroundColor

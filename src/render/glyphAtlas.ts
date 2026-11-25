@@ -14,7 +14,63 @@ const PADDING_RATIO = 0.06
 /** The step used when an average colour is wanted before any glyph is drawn. */
 const DEFAULT_COLOR_STEP = 32
 
+/**
+ * The parameters an atlas is rasterised for. They are part of the atlas's
+ * identity: the same pair always describes the same glyphs at the same
+ * resolution, so a holder can compare pairs to decide whether its atlas is
+ * still valid.
+ */
+export type AtlasKey = {
+  dpr: number
+  fontStack: string
+}
+
 type Rgb = readonly [number, number, number]
+
+/**
+ * Holds one {@link GlyphAtlas} and replaces it once its device pixel ratio
+ * or font stack changes. The render layer talks to this rather than to an
+ * atlas directly, so a window moved to another display, a browser zoom or a
+ * system font fallback all lead to a fresh rasterisation instead of glyphs
+ * drawn from a stale, blurry atlas.
+ *
+ * The old atlas is {@link GlyphAtlas.clear | cleared} before it is dropped,
+ * so its canvas buffers and average-colour tuples are released rather than
+ * accumulating once per parameter change.
+ *
+ * Rebuilds are keyed on the parameters, not on request count: asking twice
+ * with the same pair — twice in one frame, or for the rest of the session —
+ * returns the very same instance without rebuilding.
+ */
+export class AtlasProvider {
+  private current: GlyphAtlas
+  private readonly key: AtlasKey
+
+  constructor(dpr: number, fontStack: string) {
+    this.key = { dpr, fontStack }
+    this.current = new GlyphAtlas(dpr, fontStack)
+  }
+
+  /**
+   * The atlas matching these parameters, rebuilding it first when either one
+   * has changed since the last request. Repeated calls with unchanged
+   * parameters return the same instance.
+   */
+  get(dpr: number, fontStack: string): GlyphAtlas {
+    if (this.key.dpr === dpr && this.key.fontStack === fontStack) {
+      return this.current
+    }
+
+    // Drop every canvas and cached colour the stale atlas owns before the
+    // reference is overwritten, or they live until garbage collection.
+    this.current.clear()
+    this.key.dpr = dpr
+    this.key.fontStack = fontStack
+    this.current = new GlyphAtlas(dpr, fontStack)
+
+    return this.current
+  }
+}
 
 /**
  * Rasterises each emoji once per size step and hands out the buffer, so the
@@ -22,8 +78,8 @@ type Rgb = readonly [number, number, number]
  * colour-glyph rasterisation per frame.
  *
  * The atlas belongs to one device pixel ratio and one font stack. When
- * either changes, the owner builds a new atlas rather than mutating this
- * one.
+ * either changes, the owner clears this instance and builds a new one rather
+ * than mutating it; {@link AtlasProvider} automates that.
  */
 export class GlyphAtlas {
   private readonly averages = new Map<Emoji, Rgb>()
@@ -58,6 +114,13 @@ export class GlyphAtlas {
     return this.averages.get(emoji)!
   }
 
+  /**
+   * Drops every rasterised buffer and every average-colour tuple. The
+   * canvases are released as soon as no other reference remains, which is
+   * what keeps an atlas rebuild from leaking the old caches. The next
+   * {@link get} or {@link averageColorRgb} rasterises into a fresh canvas,
+   * never into a buffer sized for an earlier device pixel ratio.
+   */
   clear(): void {
     this.averages.clear()
     this.buffers.clear()

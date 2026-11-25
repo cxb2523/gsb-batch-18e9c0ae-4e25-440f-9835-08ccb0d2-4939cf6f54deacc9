@@ -1,6 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
-import { ATLAS_STEPS, GlyphAtlas, nearestAtlasStep } from './glyphAtlas'
+import {
+  ATLAS_STEPS,
+  AtlasProvider,
+  GlyphAtlas,
+  nearestAtlasStep,
+} from './glyphAtlas'
 import { DEFAULT_THEME } from './theme'
 
 function atlas(): GlyphAtlas {
@@ -35,6 +40,10 @@ function opaquePixels(source: CanvasImageSource, size: number) {
   return { centreX: sumX / count, centreY: sumY / count, count }
 }
 
+function provider(dpr = 1, fontStack = DEFAULT_THEME.fontStack) {
+  return new AtlasProvider(dpr, fontStack)
+}
+
 describe('nearestAtlasStep', () => {
   it('returns a step from the fixed list', () => {
     expect(ATLAS_STEPS).toContain(nearestAtlasStep(30))
@@ -50,6 +59,91 @@ describe('nearestAtlasStep', () => {
 
   it('clamps a size above the largest step', () => {
     expect(nearestAtlasStep(4000)).toBe(128)
+  })
+})
+
+describe('AtlasProvider', () => {
+  it('returns the same instance while the parameters do not change', () => {
+    const source = provider()
+
+    expect(source.get(1, DEFAULT_THEME.fontStack)).toBe(
+      source.get(1, DEFAULT_THEME.fontStack),
+    )
+  })
+
+  it('rebuilds when the device pixel ratio changes', () => {
+    const source = provider(1)
+    const before = source.get(1, DEFAULT_THEME.fontStack)
+    const after = source.get(2, DEFAULT_THEME.fontStack)
+
+    expect(after).not.toBe(before)
+    expect(source.get(2, DEFAULT_THEME.fontStack)).toBe(after)
+  })
+
+  it('rebuilds when the font stack changes', () => {
+    const source = provider()
+    const before = source.get(1, DEFAULT_THEME.fontStack)
+    const after = source.get(1, 'Georgia, serif')
+
+    expect(after).not.toBe(before)
+    expect(source.get(1, 'Georgia, serif')).toBe(after)
+  })
+
+  it('scales the rebuilt buffers by the new device pixel ratio', () => {
+    const source = provider(1)
+    const step = nearestAtlasStep(32)
+    const first = source
+      .get(1, DEFAULT_THEME.fontStack)
+      .get('❤️', 32) as HTMLCanvasElement
+
+    expect(first.width).toBe(step)
+
+    const rebuilt = source
+      .get(3, DEFAULT_THEME.fontStack)
+      .get('❤️', 32) as HTMLCanvasElement
+
+    expect(rebuilt.width).toBe(step * 3)
+    expect(rebuilt.height).toBe(step * 3)
+  })
+
+  it('clears the old atlas caches when it rebuilds', () => {
+    const source = provider(1)
+    const stale = source.get(1, DEFAULT_THEME.fontStack)
+    const oldBuffer = stale.get('❤️', 32)
+    const oldColour = stale.averageColorRgb('❤️')
+    const clear = vi.spyOn(stale, 'clear')
+
+    const rebuilt = source.get(2, DEFAULT_THEME.fontStack)
+
+    expect(clear).toHaveBeenCalledOnce()
+    // The stale instance must not hand out its old-sized buffer or its old
+    // average-colour tuple once the provider has moved on.
+    expect(stale.get('❤️', 32)).not.toBe(oldBuffer)
+    expect(stale.averageColorRgb('❤️')).not.toBe(oldColour)
+    expect(rebuilt.get('❤️', 32)).not.toBe(oldBuffer)
+    expect(rebuilt.averageColorRgb('❤️')).not.toBe(oldColour)
+  })
+
+  it('does not rebuild twice for the same changed parameters', () => {
+    const source = provider(1)
+    const first = source.get(1, DEFAULT_THEME.fontStack)
+    const clear = vi.spyOn(first, 'clear')
+
+    const rebuilt = source.get(2, DEFAULT_THEME.fontStack)
+
+    expect(clear).toHaveBeenCalledOnce()
+    expect(rebuilt).not.toBe(first)
+
+    // Same parameters again: another rebuild would clear a second time.
+    expect(source.get(2, DEFAULT_THEME.fontStack)).toBe(rebuilt)
+    expect(clear).toHaveBeenCalledOnce()
+  })
+
+  it('rebuilds again when a later parameter change comes in', () => {
+    const source = provider(1)
+    const atTwo = source.get(2, DEFAULT_THEME.fontStack)
+
+    expect(source.get(3, DEFAULT_THEME.fontStack)).not.toBe(atTwo)
   })
 })
 
