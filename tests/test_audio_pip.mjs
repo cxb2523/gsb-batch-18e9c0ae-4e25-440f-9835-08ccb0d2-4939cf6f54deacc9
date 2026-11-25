@@ -262,6 +262,229 @@ test('switching apps preserves system PiP and keeps sending media state without 
   assert.equal(h.media.paused, false);
 });
 
+test('returning from background re-reads the native clock instead of reusing the pre-background anchor', async (t) => {
+  const h = harness(t);
+  await h.media.play(); await h.pip.toggle(); await flush();
+  const session = h.calls.find(([name]) => name === 'open')[1].session;
+  const before = h.calls.at(-1)[1].position;
+  assert.equal(before, 12);
+  // The native clock kept running while the page was frozen: only refresh() knows the
+  // real position; media.currentTime still holds the old anchor.
+  let refreshes = 0;
+  h.media.refresh = async () => {
+    refreshes++;
+    // Media events fire while the bridge is re-reading the native clock, still carrying
+    // the old page anchor. They must not be forwarded as an update.
+    h.media.dispatchEvent(new h.w.Event('timeupdate'));
+    h.media.currentTime = 27; h.media.playbackRate = 1.25; h.media._paused = false;
+  };
+  const stale = h.calls.filter(([name]) => name === 'update').length;
+  Object.defineProperty(h.doc, 'hidden', { configurable: true, value: true });
+  h.doc.dispatchEvent(new h.w.Event('visibilitychange')); await flush();
+  Object.defineProperty(h.doc, 'hidden', { configurable: true, value: false });
+  h.doc.dispatchEvent(new h.w.Event('visibilitychange')); await flush(); await flush();
+  assert.equal(refreshes, 1);
+  const resumed = h.calls.at(-1)[1];
+  assert.equal(resumed.position, 27);
+  // The stale clock never went out: the timeupdate fired from inside refresh() still
+  // read the old 12s anchor and was dropped while the refresh was in flight.
+  const after = h.calls.filter(([name]) => name === 'update').slice(stale);
+  assert.ok(after.length >= 2);
+  assert.ok(after.every(([, value]) => [12, 27].includes(value.position)));
+  assert.equal(after.at(-1)[1].position, 27);
+  assert.equal(resumed.duration, 30);
+  assert.equal(resumed.rate, 1.25);
+  assert.equal(resumed.paused, false);
+  assert.equal(resumed.session, session);
+  // A pageshow (BFCache/foreground restore) must do the same.
+  h.media.refresh = async () => { refreshes++; h.media.currentTime = 29; h.media._paused = true; };
+  h.w.dispatchEvent(new h.w.Event('pageshow'));
+  await flush(); await flush();
+  assert.equal(refreshes, 2);
+  assert.equal(h.calls.at(-1)[1].position, 29);
+  assert.equal(h.calls.at(-1)[1].paused, true);
+  // Native foreground reports sync too.
+  h.media.refresh = async () => { refreshes++; h.media.currentTime = 30; h.media._paused = false; };
+  h.w.dispatchEvent(new h.w.CustomEvent('native-app-state', { detail: { active: true } }));
+  await flush(); await flush();
+  assert.equal(refreshes, 3);
+  assert.equal(h.calls.at(-1)[1].position, 30);
+});
+
+test('late events from a retired session neither end nor drive the live one', async (t) => {
+  const h = harness(t);
+  await h.media.play();
+  await h.pip.toggle(); await flush();
+  const first = h.calls.find(([name]) => name === 'open')[1].session;
+  h.w.dispatchEvent(new h.w.CustomEvent('native-caption-pip', { detail: { session: first, active: false } }));
+  assert.equal(h.pip.isActive(), false);
+  await h.pip.toggle(); await flush();
+  const second = h.calls.filter(([name]) => name === 'open').at(-1)[1].session;
+  assert.notEqual(second, first);
+  assert.equal(h.pip.isActive(), true);
+  const before = { paused: h.media.paused, position: h.media.currentTime, rate: h.media.playbackRate };
+  // A late stop from the old window and its control command must be ignored.
+  h.w.dispatchEvent(new h.w.CustomEvent('native-caption-pip', { detail: { session: first, active: false } }));
+  assert.equal(h.pip.isActive(), true);
+  assert.equal(h.media.disablePictureInPicture, true);
+  h.w.dispatchEvent(new h.w.CustomEvent('native-caption-pip', { detail: { session: first, action: 'pause' } }));
+  assert.equal(h.media.paused, before.paused);
+  h.w.dispatchEvent(new h.w.CustomEvent('native-caption-pip', { detail: { session: first, action: 'seekforward' } }));
+  assert.equal(h.media.currentTime, before.position);
+  // A late close animation report from the old session must not mark the new one busy.
+  h.w.dispatchEvent(new h.w.CustomEvent('native-caption-pip', { detail: { session: first, active: true, closing: true } }));
+  assert.equal(h.pip.isBusy(), false);
+  assert.equal(h.pip.isActive(), true);
+  // Only the live session's own event ends it.
+  h.w.dispatchEvent(new h.w.CustomEvent('native-caption-pip', { detail: { session: second, active: false } }));
+  assert.equal(h.pip.isActive(), false);
+  assert.equal(h.media.disablePictureInPicture, false);
+  assert.equal(h.media.paused, before.paused);
+  assert.equal(h.media.playbackRate, before.rate);
+});
+
+test('close failure keeps the session and PiP lock until the matching close event, then restores the lock', async (t) => {
+  const h = harness(t, { bridgeOverrides: { close: async () => { throw new Error('use system close'); } } });
+  await h.media.play();
+  await h.pip.toggle(); await flush();
+  const session = h.calls.find(([name]) => name === 'open')[1].session;
+  assert.equal(await h.pip.close(), false);
+  assert.equal(h.pip.isActive(), true);
+  assert.equal(h.pip.isBusy(), false);
+  assert.equal(h.media.disablePictureInPicture, true);
+  // The window is still on screen: a stop for another session must not release it.
+  h.w.dispatchEvent(new h.w.CustomEvent('native-caption-pip', { detail: { session: 'stale', active: false } }));
+  assert.equal(h.pip.isActive(), true);
+  assert.equal(h.media.disablePictureInPicture, true);
+  // The live window is still on screen (close was refused), so its own controls stay valid.
+  h.w.dispatchEvent(new h.w.CustomEvent('native-caption-pip', { detail: { session, action: 'play' } }));
+  assert.equal(h.media.paused, false);
+  // A stale session's control must not touch playback.
+  assert.equal(h.media.currentTime, 12);
+  h.w.dispatchEvent(new h.w.CustomEvent('native-caption-pip', { detail: { session: 'stale', action: 'seekforward' } }));
+  assert.equal(h.media.currentTime, 12);
+  h.w.dispatchEvent(new h.w.CustomEvent('native-caption-pip', { detail: { session, active: false } }));
+  assert.equal(h.pip.isActive(), false);
+  assert.equal(h.media.disablePictureInPicture, false);
+  assert.equal(h.media.paused, false);
+});
+
+test('a restored browser-PiP lock survives a teardown whose close was rejected', async (t) => {
+  const h = harness(t);
+  h.media.disablePictureInPicture = true;
+  await h.media.play();
+  await h.pip.toggle(); await flush();
+  h.bridge.close = async () => { throw new Error('still visible'); };
+  assert.equal(await h.pip.close(), false);
+  const session = h.calls.find(([name]) => name === 'open')[1].session;
+  h.w.dispatchEvent(new h.w.CustomEvent('native-caption-pip', { detail: { session, active: false } }));
+  assert.equal(h.pip.isActive(), false);
+  assert.equal(h.media.disablePictureInPicture, true);
+});
+
+test('a BFCache pagehide keeps the session warm and pageshow resyncs it', async (t) => {
+  const h = harness(t);
+  await h.media.play(); await h.pip.toggle(); await flush();
+  const session = h.calls.find(([name]) => name === 'open')[1].session;
+  h.w.dispatchEvent(Object.assign(new h.w.Event('pagehide'), { persisted: true }));
+  assert.equal(h.pip.isActive(), true);
+  assert.equal(h.calls.some(([name]) => name === 'close'), false);
+  h.media.refresh = async () => { h.media.currentTime = 16; h.media._paused = false; };
+  h.w.dispatchEvent(new h.w.Event('pageshow'));
+  await flush(); await flush();
+  assert.equal(h.calls.at(-1)[1].position, 16);
+  assert.equal(h.calls.at(-1)[1].session, session);
+  assert.equal(h.pip.isActive(), true);
+});
+
+test('page unload releases listeners and the native session so it cannot drive a newer window', async (t) => {
+  const h = harness(t);
+  await h.media.play();
+  await h.pip.toggle(); await flush();
+  const session = h.calls.find(([name]) => name === 'open')[1].session;
+  assert.ok(h.pip.listenerCount() > 0);
+  await h.pip.dispose();
+  await flush();
+  assert.ok(h.calls.some(([name, value]) => name === 'close' && value.session === session));
+  assert.equal(h.pip.listenerCount(), 0);
+  const updates = h.calls.filter(([name]) => name === 'update').length;
+  h.media.currentTime = 5; h.media.dispatchEvent(new h.w.Event('seeked'));
+  h.w.dispatchEvent(new h.w.CustomEvent('native-caption-pip', { detail: { session, active: false } }));
+  h.w.dispatchEvent(new h.w.CustomEvent('native-app-state', { detail: { active: true } }));
+  await flush();
+  assert.equal(h.calls.filter(([name]) => name === 'update').length, updates);
+  assert.equal(h.pip.isActive(), false);
+  assert.equal(h.app.classList.contains('is-audio-pip'), false);
+});
+
+test('a rejected update keeps unsent sentences so the next clock sync still carries them', async (t) => {
+  let fail = true;
+  const updates = [];
+  const h = harness(t, { bridgeOverrides: { update: async (value) => {
+    updates.push(value); if (fail) throw new Error('busy');
+  } } });
+  await h.pip.toggle(); await flush();
+  assert.equal(h.pip.isActive(), true);
+  // Fetch a fresh timeline and make sure it never reached native.
+  h.track.sentences[1].translation = '迟到译文';
+  h.pip.refresh(); await flush();
+  assert.equal(updates.some((u) => JSON.stringify(u.sentences || '').includes('迟到译文')), true);
+  fail = false;
+  h.media.currentTime = 20;
+  h.media.dispatchEvent(new h.w.Event('timeupdate')); // throttled, clock-only
+  h.media.dispatchEvent(new h.w.Event('seeked')); await flush(); await flush();
+  const last = updates.at(-1);
+  assert.equal(last.position, 20);
+  assert.equal(last.sentences[1].translation, '迟到译文');
+});
+
+test('content edits push immediately even while clock updates are throttled', async (t) => {
+  const h = harness(t);
+  await h.pip.toggle(); await flush();
+  h.media.dispatchEvent(new h.w.Event('timeupdate'));
+  h.track.sentences[0].text = '改写后的第一句。';
+  h.pip.refresh(); await flush();
+  const last = h.calls.filter(([name]) => name === 'update').at(-1)[1];
+  assert.equal(last.sentences[0].text, '改写后的第一句。');
+});
+
+test('a hung media refresh cannot freeze caption sync forever', async (t) => {
+  const h = harness(t);
+  await h.media.play(); await h.pip.toggle(); await flush();
+  // The native bridge never answers the resume probe.
+  h.media.refresh = () => new Promise(() => {});
+  Object.defineProperty(h.doc, 'hidden', { configurable: true, value: false });
+  h.doc.dispatchEvent(new h.w.Event('visibilitychange'));
+  await flush();
+  const before = h.calls.filter(([name]) => name === 'update').length;
+  // Inside the resume window clock traffic is held back...
+  h.media.currentTime = 14; h.media.dispatchEvent(new h.w.Event('seeked')); await flush();
+  assert.equal(h.calls.filter(([name]) => name === 'update').length, before);
+  // ...but the timeout releases it so later updates still flow.
+  await new Promise((resolve) => setTimeout(resolve, 3200));
+  h.media.currentTime = 21; h.media.dispatchEvent(new h.w.Event('seeked')); await flush();
+  assert.equal(h.pip.isActive(), true);
+  assert.equal(h.calls.at(-1)[1].position, 21);
+});
+
+test('a reverted edit never resurrects an older unconfirmed snapshot', async (t) => {
+  let fail = false;
+  const updates = [];
+  const h = harness(t, { bridgeOverrides: { update: async (value) => {
+    updates.push(value); if (fail) throw new Error('busy');
+  } } });
+  await h.pip.toggle(); await flush();
+  const original = h.track.sentences[1].translation;
+  fail = true;
+  h.track.sentences[1].translation = '临时译文'; h.pip.refresh(); await flush();
+  fail = false;
+  h.track.sentences[1].translation = original; h.pip.refresh(); await flush();
+  // The revert matches what native already has, so no sentence payload is resent.
+  const last = updates.at(-1);
+  assert.equal(last.sentences, undefined);
+  assert.equal(last.position, 12);
+});
+
 test('queued clock updates preserve translations and use monotonic sequence numbers', async (t) => {
   let release, block = false;
   const updates = [];
