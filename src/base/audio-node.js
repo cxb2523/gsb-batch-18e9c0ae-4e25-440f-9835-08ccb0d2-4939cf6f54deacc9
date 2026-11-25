@@ -13,8 +13,16 @@ export default class RAudioNode extends RComponent {
     this.node = null;
     // dictionary of AudioNode parameters (either AudioParams or object properties)
     this.params = {};
+    // the node instance which the recorded connection plan was established for
+    this._connectionPlanNode = null;
+    // whether the node is currently disconnected by the `disconnected` prop
+    this._planDisconnected = false;
+    // the list of arguments used for the last successful connection pass
+    this._connectionPlan = null;
     this.connectToAllDestinations = this.connectToAllDestinations.bind(this);
     this.setParam = this.setParam.bind(this);
+    this.performReconnect = this.performReconnect.bind(this);
+    this.requestReconnect = this.requestReconnect.bind(this);
   }
 
   // recursively builds up a list of nodes pointed to by IDs or lists of IDs
@@ -49,32 +57,200 @@ export default class RAudioNode extends RComponent {
   }
 
   /**
-   * Connects the given AudioNode to this RAudioNode's destinations.
-   * Abstracts away this operation as it's used in multiple lifecycle stages.
+   * Builds the list of arguments which would be used to connect the node to its
+   * current destinations, without actually performing any connection.
    *
-   * @param      {function} destinationFunction The function that will return the destinations
-   * @param      {AudioNode}  webAudioNode  The web audio node
+   * A destination which is referenced by an identifier which cannot be resolved
+   * yet (because the corresponding node has not registered itself in the node
+   * registry) makes the plan incomplete: in that case we must not connect,
+   * because we would silently skip the not-yet-ready target.
+   *
+   * @param      {function}  destinationFunction  returns the destinations
+   * @return     {Object}  { args: Array<Array>, complete: Boolean }
+   */
+  buildConnectionPlan(destinationFunction) {
+    if (typeof destinationFunction !== 'function') {
+      return { args: [], complete: true };
+    }
+
+    let destinations;
+
+    try {
+      destinations = destinationFunction();
+    } catch (e) {
+      return { args: [], complete: false };
+    }
+
+    if (!(destinations instanceof Array)) destinations = [ destinations ];
+
+    const flattened = [];
+
+    for (let element of destinations) {
+      if (Array.isArray(element)) {
+        this.flattenPointers(element, flattened);
+      } else if (typeof element === 'symbol') {
+        flattened.push(this.context.nodes.get(element));
+      } else {
+        flattened.push(element);
+      }
+    }
+
+    const args = [];
+    let complete = true;
+
+    flattened.forEach((destination, di) => {
+      // `undefined` is what both an unresolved identifier and a missing
+      // destination resolve to - either way we cannot connect right now
+      if (destination === undefined) {
+        complete = false;
+        return;
+      }
+
+      // null is an explicit "no destination" (e.g. an empty RSplit input list)
+      if (destination === null) return;
+
+      args.push(this.getConnectionArguments(
+        destination,
+        di,
+        this.props.connectToParam,
+        this.props.connectFromChannel,
+        this.props.connectToChannel));
+    });
+
+    return { args, complete };
+  }
+
+  /**
+   * Compares two connection plans. Used to avoid tearing down and rebuilding
+   * connections when a re-render produced an equivalent set of destinations.
+   *
+   * @param      {Array}  a  connection plan arguments
+   * @param      {Array}  b  other connection plan arguments
+   * @return     {boolean}  True if both plans are equivalent
+   */
+  connectionPlansEqual(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+
+    // compare every connect() argument by identity; AudioNodes, AudioParams
+    // and numeric channel indices are all safe to compare this way
+    return a.every((args, i) => {
+      const other = b[i];
+      return other &&
+        args.length === other.length &&
+        args.every((arg, j) => arg === other[j]);
+    });
+  }
+
+  /**
+   * Brings the node's outgoing connections in line with its current props.
+   *
+   * The connection plan is only rebuilt when the effective destinations (or
+   * the node instance itself) changed, so a re-render which merely updates
+   * parameters does not churn the graph. When the plan did change, all old
+   * connections are removed first and the new ones are established afterwards.
+   *
+   * This is called by the graph update coordinator after the whole updated
+   * subtree has applied its parameter changes.
+   *
+   * @return     {boolean}  False if the destinations could not be resolved yet
+   */
+  performReconnect(destinationFunction) {
+    if (!this.node) return true;
+
+    const disconnected = !!this.props.disconnected;
+
+    if (disconnected) {
+      const alreadyDisconnected =
+        this._connectionPlanNode === this.node && this._planDisconnected;
+
+      if (!alreadyDisconnected) {
+        // tear down the old edges, but do not build a new plan - the node
+        // remains in the registry so it can be reconnected later
+        this.disconnectNode();
+
+        this._connectionPlanNode = this.node;
+        this._planDisconnected = true;
+        this._connectionPlan = null;
+      }
+
+      return true;
+    }
+
+    const destination = typeof destinationFunction === 'function'
+      ? destinationFunction
+      : this.props.destination;
+
+    const { args, complete } = this.buildConnectionPlan(destination);
+
+    if (!complete) {
+      // a destination is not ready yet - keep the current connection and
+      // retry once the coordinator runs another connection pass
+      return false;
+    }
+
+    const planIsStale =
+      this._connectionPlanNode !== this.node ||
+      this._planDisconnected ||
+      !this.connectionPlansEqual(this._connectionPlan, args);
+
+    if (!planIsStale) return true;
+
+    // disconnect the old edges before wiring up the new destination(s)
+    this.disconnectNode();
+
+    this._connectionPlanNode = this.node;
+    this._planDisconnected = false;
+    this._connectionPlan = args;
+
+    args.forEach(connectArgs => {
+      try {
+        this.node.connect(...connectArgs);
+      } catch (e) {
+        console.warn('Could not connect audio node', this.node, e); // eslint-disable-line no-console
+      }
+    });
+
+    return true;
+  }
+
+  disconnectNode() {
+    if (!this.node || typeof this.node.disconnect !== 'function') return;
+
+    try {
+      this.node.disconnect();
+    } catch (e) {
+      // the node may have no outgoing connections at all
+    }
+  }
+
+  /**
+   * Requests a connection update. While a graph update pass is in progress
+   * the request is deferred until the whole subtree has finished updating,
+   * which guarantees reconnections happen after child nodes applied their
+   * parameter changes.
+   */
+  requestReconnect() {
+    this.getGraphUpdates().scheduleConnection(this);
+  }
+
+  /**
+   * Entry point for nodes which (re)connect outside of a normal React update,
+   * most notably scheduled sources restarting after their node instance was
+   * replaced. The optional destination getter is honoured for this call only.
+   *
+   * @param      {function}   destinationFunction  The getter for destinations
+   * @param      {AudioNode}  webAudioNode         The node instance to connect
    */
   connectToAllDestinations(destinationFunction, webAudioNode) {
-    webAudioNode.disconnect();
+    if (webAudioNode && webAudioNode !== this.node) {
+      // the caller wants a different instance than the one we track
+      this.node = webAudioNode;
+    }
 
-    if (destinationFunction && !this.props.disconnected) {
-      let destinations = destinationFunction();
+    if (!this.node) return;
 
-      if (!(destinations instanceof Array)) destinations = [ destinations ];
-
-      this.flattenPointers(destinations).forEach((destination, di) => {
-        if (destination) {
-          const connectArgs = this.getConnectionArguments(
-            destination,
-            di,
-            this.props.connectToParam,
-            this.props.connectFromChannel,
-            this.props.connectToChannel);
-
-          webAudioNode.connect(...connectArgs);
-        }
-      });
+    if (!this.performReconnect(destinationFunction)) {
+      this.getGraphUpdates().retryLater(this);
     }
   }
 
@@ -89,22 +265,87 @@ export default class RAudioNode extends RComponent {
   componentWillUpdate(nextProps, nextState) {
     // update the node's record in the node registry
     if (this.props.identifier !== nextProps.identifier) {
-      this.context.nodes.delete(this.props.identifier);
-      this.context.nodes.set(nextProps.identifier, this.node);
+      if (this.props.identifier !== undefined) {
+        this.context.nodes.delete(this.props.identifier);
+      }
+      if (this.node && nextProps.identifier !== undefined) {
+        this.context.nodes.set(nextProps.identifier, this.node);
+      }
     }
   }
 
-  // we use DidUpdate to connect to new destinations,
-  // because WillUpdate might get called before the new destinations are ready
+  // connect in DidUpdate so that the whole subtree has rendered and every
+  // node has registered itself before destinations are resolved
   componentDidUpdate(prevProps, prevState) {
-    if (prevProps.destination !== this.props.destination) {
-      this.connectToAllDestinations(this.props.destination, this.node);
+    this.requestReconnect();
+  }
+
+  componentDidMount() {
+    super.componentDidMount();
+    this.requestReconnect();
+  }
+
+  /**
+   * Removes the reverse (parent -> this node) connections when the node goes
+   * away. Parents which are already gone are skipped safely.
+   */
+  disconnectFromParents() {
+    const parentFunction = this.props && this.props.parent;
+    if (typeof parentFunction !== 'function') return;
+
+    let parents;
+
+    try {
+      parents = parentFunction();
+    } catch (e) {
+      return;
+    }
+
+    if (parents === null || parents === undefined) return;
+
+    const queue = Array.isArray(parents) ? parents.slice() : [ parents ];
+
+    while (queue.length) {
+      const parentPointer = queue.shift();
+
+      if (parentPointer === null || parentPointer === undefined) continue;
+
+      if (Array.isArray(parentPointer)) {
+        queue.push(...parentPointer);
+        continue;
+      }
+
+      const parentNode = typeof parentPointer === 'symbol'
+        ? this.context.nodes.get(parentPointer)
+        : parentPointer;
+
+      // the parent may have been unmounted already - nothing to disconnect
+      if (!parentNode || typeof parentNode.disconnect !== 'function') continue;
+
+      try {
+        parentNode.disconnect(this.node);
+      } catch (e) {
+        // the parent was not connected to this node (e.g. it was
+        // disconnected itself) - that's fine
+      }
     }
   }
 
   componentWillUnmount() {
-    this.node.disconnect();
-    this.context.nodes.delete(this.props.identifier);
+    this.getGraphUpdates().cancel(this);
+    this.disconnectFromParents();
+
+    if (this.node) {
+      try {
+        this.node.disconnect();
+      } catch (e) {
+        // already disconnected
+      }
+    }
+
+    if (this.props.identifier !== undefined) {
+      this.context.nodes.delete(this.props.identifier);
+    }
   }
 
   resolveTransitionProps(props, propName) {
@@ -147,22 +388,59 @@ export default class RAudioNode extends RComponent {
     }
   }
 
+  /**
+   * Applies a new value to an AudioParam.
+   *
+   * When a transition time is given, the parameter is ramped from its current
+   * value (as reported by the AudioParam at the time of the update) to the new
+   * value over the requested duration, rather than jumping to the target. The
+   * ramp starts at `currentTime` and ends at `currentTime + transitionTime`.
+   *
+   * @param      {AudioParam}  param           The parameter
+   * @param      {number}  value               The target value
+   * @param      {number}  transitionTime      The duration of the ramp in seconds
+   * @param      {string}  transitionCurve     Either `linear` or `exponential`
+   */
   setParam(param, value, transitionTime, transitionCurve) {
+    const now = this.context.audio.currentTime;
+    const hasTransition = typeof transitionTime === 'number' && transitionTime > 0;
+
+    if (!hasTransition) {
+      param.setValueAtTime(value, now);
+      return;
+    }
+
+    // start from the value the parameter actually has right now, so a new
+    // transition continues from wherever the previous one left off
+    const currentValue = typeof param.value === 'number' && isFinite(param.value)
+      ? param.value
+      : value;
+
+    const endTime = now + transitionTime;
+
+    // drop any automation which is still queued so the new ramp is the only
+    // thing driving the parameter from here on
+    if (typeof param.cancelScheduledValues === 'function') {
+      param.cancelScheduledValues(now);
+    }
+    param.setValueAtTime(currentValue, now);
+
     if (transitionCurve) {
       const fn = `${transitionCurve}RampToValueAtTime`;
-      // `exponentialRamp` doesn't seem to work on Firefox, so fall back to linear
-      try {
-        param[fn](value, transitionTime);
-      } catch (e) {
-        param['linearRampToValueAtTime'](value, transitionTime);
-      }
-    } else {
-      param.setValueAtTime(value, transitionTime || this.context.audio.currentTime);
-    }
-  }
 
-  componentDidMount() {
-    this.connectToAllDestinations(this.props.destination, this.node);
+      // exponential ramps are undefined (and throw in some browsers) for
+      // non-positive values, so fall back to a linear ramp
+      if (typeof param[fn] === 'function') {
+        try {
+          param[fn](value, endTime);
+          return;
+        } catch (e) {
+          // fall through to the linear ramp
+        }
+      }
+    }
+
+    param.linearRampToValueAtTime(value, endTime);
   }
 
   render() {

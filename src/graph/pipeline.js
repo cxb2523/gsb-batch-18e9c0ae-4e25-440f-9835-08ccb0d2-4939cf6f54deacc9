@@ -1,4 +1,5 @@
 import React from 'react';
+import PropTypes from 'prop-types';
 import RComponent from './../base/component.js';
 
 import { isConnectable } from './utils.js';
@@ -19,16 +20,19 @@ export default class RPipeline extends RComponent {
   /**
    * Ensures whatever value we get from the `nodes` Map, we resolve it to where the actual AudioNodes are.
    *
-   * @param      {AudioNode|Array}  pointer  The value found in the `nodes` Map
-   * @return     {AudioNode|Array<AudioNode>}  the actual destination(s)
+   * Identifiers which are not (yet) registered are passed through unresolved:
+   * the audio nodes will retry connecting once the target registers itself,
+   * rather than connecting to a stale or missing destination.
+   *
+   * @param      {AudioNode|Symbol|Array}  pointer  The value found in the `nodes` Map
+   * @return     {AudioNode|Symbol|Array}  the actual destination(s)
    */
   resolvePointer(pointer) {
-    // we might find that the pointer actually leads us to a list of other pointers (Symbols)
-    // this happens, for instance, if the next child is a RSplit
     let resolved = pointer;
 
     if (pointer instanceof Array) {
-      // it could also happen that the pointer leads to an AudioNode reference (esp. if it's an AudioContextDestination)
+      // it could also happen that the pointer leads to an AudioNode reference
+      // (esp. if it's an AudioContextDestination)
       resolved = pointer.map(identifier => this.context.nodes.get(identifier) || identifier);
     }
 
@@ -38,6 +42,10 @@ export default class RPipeline extends RComponent {
   /**
    * Tries to provide a destination getter function for the given index in the children array.
    * It optimizes for finding the nearest node in the graph which the given child can connect to.
+   *
+   * The getter returns identifiers for nodes inside the pipeline and lets the
+   * audio node resolve them, so a not-yet-registered target is detected instead
+   * of silently dropped.
    *
    * @param      {number}  currentIndex   The current child's index
    * @param      {Array}  childrenArray  The array of all children in the pipeline
@@ -58,10 +66,20 @@ export default class RPipeline extends RComponent {
       if (childIndex === currentIndex + 1 || !childrenArray[childIndex]) {
         destinationFunction = () => this.props.destination();
       } else {
-        destinationFunction = () => this.resolvePointer(this.context.nodes.get(childrenArray[childIndex].identifier));
+        destinationFunction = () => {
+          const identifier = childrenArray[childIndex].identifier;
+          return this.context.nodes.has(identifier)
+            ? this.resolvePointer(this.context.nodes.get(identifier))
+            : identifier;
+        };
       }
     } else {
-      destinationFunction = () => this.resolvePointer(this.context.nodes.get(childrenArray[currentIndex + 1].identifier));
+      destinationFunction = () => {
+        const identifier = childrenArray[currentIndex + 1].identifier;
+        return this.context.nodes.has(identifier)
+          ? this.resolvePointer(this.context.nodes.get(identifier))
+          : identifier;
+      };
     }
 
     return destinationFunction;
@@ -69,7 +87,7 @@ export default class RPipeline extends RComponent {
 
   resolveParent(currentIndex, childrenArray) {
     if (currentIndex === 0) {
-      return this.getParent || null;
+      return this.props.parent || null;
     } else {
       const children = childrenArray.slice(0, currentIndex);
       const parents = [];
@@ -148,6 +166,34 @@ export default class RPipeline extends RComponent {
     return React.cloneElement(identifiedChild.component, pipelineProps);
   }
 
+  // A pass is opened before the children render and closed after they have all
+  // been committed. This guarantees that reconnections requested by any node
+  // in this pipeline happen only once every child has applied its parameter
+  // updates (children commit before their parent).
+  componentWillMount() {
+    super.componentWillMount();
+    this.beginUpdatePass();
+  }
+
+  componentDidMount() {
+    // closing the mount pass flushes connections which were waiting for a
+    // destination that registered itself during this mount
+    this.endUpdatePass();
+  }
+
+  componentWillUpdate(nextProps, nextState) {
+    this.beginUpdatePass();
+  }
+
+  componentDidUpdate(prevProps, prevState) {
+    this.endUpdatePass();
+  }
+
+  componentWillUnmount() {
+    // balance a pass which may still be open if this pipeline goes away
+    this.endUpdatePass();
+  }
+
   render() {
     this.foundFirstConnectableType = false;
 
@@ -172,3 +218,4 @@ export default class RPipeline extends RComponent {
     return children;
   }
 }
+

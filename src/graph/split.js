@@ -21,14 +21,30 @@ export default class RSplit extends RComponent {
   componentWillMount() {
     super.componentWillMount();
     this.context.nodes.set(this.props.identifier, this.inputs);
+    this.beginUpdatePass();
+  }
+
+  componentDidMount() {
+    this.endUpdatePass();
   }
 
   componentWillUpdate(nextProps, nextState) {
+    this.beginUpdatePass();
+
     // update the node's record in the node registry
     if (this.props.identifier !== nextProps.identifier) {
       this.context.nodes.delete(this.props.identifier);
       this.context.nodes.set(nextProps.identifier, this.inputs);
     }
+  }
+
+  componentDidUpdate(prevProps, prevState) {
+    this.endUpdatePass();
+  }
+
+  componentWillUnmount() {
+    this.endUpdatePass();
+    this.context.nodes.delete(this.props.identifier);
   }
 
   render() {

@@ -1,6 +1,7 @@
 import React from 'react';
 import PropTypes from 'prop-types';
 import RComponent from './component.js';
+import GraphUpdates from './graph-updates.js';
 
 window.AudioContext = window.AudioContext || window.webkitAudioContext || null;
 if (!window.AudioContext) {
@@ -20,6 +21,8 @@ export default class RAudioContext extends React.Component {
     // repository of all nodes in the graph
     // keyed by Symbols
     this.nodes = new Map();
+    // coordinates reconnections which span several components
+    this.graphUpdates = new GraphUpdates();
 
     this._context = new AudioContext(props.options);
 
@@ -38,11 +41,13 @@ export default class RAudioContext extends React.Component {
     return {
       audio: this._context,
       debug: this.props.debug,
-      nodes: this.nodes
+      nodes: this.nodes,
+      graphUpdates: this.graphUpdates
     };
   }
 
   componentWillUnmount() {
+    this.graphUpdates.reset();
     this._context.suspend();
   }
 
@@ -78,5 +83,6 @@ export default class RAudioContext extends React.Component {
 RAudioContext.childContextTypes = {
   audio: PropTypes.instanceOf(AudioContext),
   nodes: PropTypes.instanceOf(Map),
+  graphUpdates: PropTypes.instanceOf(GraphUpdates),
   debug: PropTypes.bool
 };
