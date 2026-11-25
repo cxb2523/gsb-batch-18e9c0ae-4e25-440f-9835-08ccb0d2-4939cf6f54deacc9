@@ -23,6 +23,10 @@ No models are included, so the game runs in greybox: the player, hounds and Fore
 
 Your generations will not match the originals exactly, so ask your agent to check each model against its greybox (stage 5 of the prompt).
 
+## Automated checks
+
+`npm run check:swap` runs `tools/swap-check.mjs`: a headless Chrome/Playwright check that breaks Foreman parts, opens the missile lid, drops debris and warning circles, then mashes M/L and rapid `swapViews()` calls. It asserts the attack list, hit tests, part invulnerability timers, glow/flash/pose state, marker progress, and debris/kit counts all survive the atomic rebuild, in greybox, through the real async M/L path, and with model-flagged views. It starts `vite --port 4291` itself when nothing is serving there. Set `BROWSER_PATH` to a Chrome/Chromium binary if the default channel launch is unavailable. The other `tools/*.mjs` checks still expect a dev server already running on their named port.
+
 ## How it was made
 
 Built from an empty folder by a coding agent (Claude Code, model `claude-opus-5-5`) with prompt draft v3 (what each draft added is in [`../../prompt/CHANGELOG.md`](../../prompt/CHANGELOG.md)); the current version is [`../../prompt/vibe-gaming.md`](../../prompt/vibe-gaming.md). `GDD.md` is the agent's one-page design. `lab.html` (model and parts viewer) and `tools/` are the agent's own test scripts and bots; they drive a local Chrome through `playwright-core` (macOS path) and expect a dev server on the port named in each script.

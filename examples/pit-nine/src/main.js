@@ -3,7 +3,7 @@ import { STEP, CAMERA, FOREMAN } from './config.js';
 import { Game } from './game.js';
 import { createHud } from './hud.js';
 import { initInput, pollInput, input } from './input.js';
-import { nextStyle, applyStyle, getStyle, setModelProvider } from './registry.js';
+import { nextStyle, applyStyle, getStyle, setModelProvider, registerView, createView } from './registry.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import * as models from './models.js';
 import { initSfx, setMuted, isMuted, sfxLog } from './sfx.js';
@@ -192,6 +192,7 @@ window.__models = models;
 window.__sfxLog = sfxLog;
 window.__toggleModels = toggleModels;
 window.__switchStyle = switchStyle;
+window.__registry = { registerView, createView }; // automated checks can stub model-style views without GLBs
 
 // Start: load the models for the current look (unless ?greybox), then begin the round.
 async function start() {

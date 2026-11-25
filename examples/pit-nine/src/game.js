@@ -100,6 +100,7 @@ export class Game {
     this.scene.add(hemi, sun, sun.target);
     this.levelViews = [];
     const floor = view('floor');
+    this.floorView = floor;
     this.scene.add(floor.root);
     for (let i = 0; i < ARENA.wallSegments; i++) {
       const a = (i / ARENA.wallSegments) * Math.PI * 2;
@@ -122,38 +123,128 @@ export class Game {
   }
 
   // ------------------------------------------------------------------ swapping looks
-  // Rebuild every view (greybox <-> models, or another look) in place, mid-round. Gameplay state is untouched.
+  // Rebuild every view (greybox <-> models, or another look) in place, mid-round.
+  // Gameplay state lives on the Body / Foreman / Hound objects and is never replayed here, so a broken part
+  // stays broken (no ghost hit spheres) and a break effect cannot drop a second repair kit. The swap is fully
+  // synchronous: no simulation step, raycast or shot can observe a half-rebuilt view.
   swapViews() {
+    // Build the new look for an old view id and put it exactly where the old root was.
     const replace = (old) => {
       const nv = view(old.id);
       nv.root.position.copy(old.root.position);
       nv.root.quaternion.copy(old.root.quaternion);
+      nv.root.scale.copy(old.root.scale);
       nv.root.visible = old.root.visible;
       const parent = old.root.parent || this.scene;
       parent.remove(old.root);
       parent.add(nv.root);
       return nv;
     };
-    const swapBody = (b) => {
-      b.view = replace(b.view);
-      if (b.state) b.view.setState(b.state);
+    // Move the purely visual state a freshly built view cannot derive from the Body:
+    // the shown state (a hound's 'hurt' look), its clock, hit flash, part glows and hit jolts.
+    const copyLook = (ov, nv) => {
+      if (!ov || !nv || ov === nv) return;
+      if (typeof ov.state === 'string' && 'state' in nv) nv.state = ov.state;
+      if (Number.isFinite(ov.t) && 't' in nv) nv.t = ov.t;
+      if (Number.isFinite(ov.flashT)) nv.flashT = ov.flashT;
+      if (ov.lastFlash !== undefined) nv.lastFlash = ov.lastFlash;
+      if (ov.glow && nv.glow) Object.assign(nv.glow, ov.glow);
+      if (ov.kicks && nv.kicks && typeof nv.kick === 'function') {
+        for (const [name, k] of Object.entries(ov.kicks)) {
+          if (!k?.d) continue;
+          nv.kick(name, k.d.clone ? k.d.clone() : k.d, k.amount);
+          const nk = nv.kicks[name];
+          if (nk && Number.isFinite(k.t)) nk.t = k.t; // continue the same jolt instead of restarting it
+        }
+      }
     };
-    swapBody(this.player);
-    this.hounds.forEach(swapBody);
-    this.kits.forEach(swapBody);
-    for (const m of this.markers) m.missile.view = replace(m.missile.view);
-    const f = this.foreman;
-    f.view = replace(f.view);
-    for (const [name, p] of Object.entries(f.parts)) {
-      if (!p.broken || name === 'core') continue;
-      const gone = f.view.detachPart(name);
-      gone?.parent?.remove(gone);
+    // Write the current hinge pose (rotations / offsets) onto a new view without touching its root transform,
+    // which replace() already copied exactly from the last rendered frame.
+    const applyPose = (b) => {
+      const nv = b.view;
+      for (const k in b.pose) {
+        const dot = k.lastIndexOf('.');
+        const part = nv.part?.(k.slice(0, dot));
+        if (!part) continue;
+        const ch = k.slice(dot + 1);
+        const v = b.pose[k];
+        if (ch[0] === 'r') part.rotation[ch[1]] = v;
+        else {
+          part.userData.hinge ??= part.position.clone();
+          part.position[ch[1]] = part.userData.hinge[ch[1]] + v;
+        }
+      }
+    };
+    // Swap one Body's view and restore everything a synchronous caller or the next frame could inspect.
+    const swapBody = (b, { setterState = false, prime = true } = {}) => {
+      if (!b?.view) return null;
+      const ov = b.view;
+      const nv = replace(ov);
+      b.view = nv;
+      if (setterState && b.state) nv.setState?.(b.state); // player model clips need the real setter
+      copyLook(ov, nv);
+      applyPose(b);
+      nv.root.updateMatrixWorld(true);
+      // make flash / tint / glow visible immediately, even before the next rendered frame
+      if (prime && nv.id !== 'player') nv.update?.(0);
+      return nv;
+    };
+
+    // ---- characters and pick-ups
+    swapBody(this.player, { setterState: true, prime: false });
+    this.player.view?.update?.(0, this.player.viewInfo(1));
+    // a hound destroyed between steps has already had its root removed and its chunks turned into debris;
+    // do not build a replacement view that nothing would ever remove again
+    this.hounds.forEach((h) => { if (h.alive) swapBody(h); });
+    this.kits.forEach((k) => swapBody(k, { prime: false }));
+
+    // ---- live ammunition follows the new look but keeps settling from the same Body state
+    this.bolts.forEach((b) => swapBody(b, { prime: false }));
+    this.shells.forEach((s) => swapBody(s, { prime: false }));
+    for (const m of this.markers) {
+      swapBody(m.missile, { prime: false });
+      if (m.marker) {
+        m.marker = replace(m.marker);
+        // restore the warning-circle fill right away, matching render()'s formula
+        const fill01 = Number.isFinite(m.fill) ? m.fill : Math.min(1, m.t / Math.max(1e-4, m.warn));
+        const fill = Math.max(0.05, fill01) * 2;
+        m.marker.part?.('fill')?.scale.set(fill, 1, fill);
+        m.marker.root.updateMatrixWorld(true);
+      }
     }
-    if (f.parts.missile_pod.broken) f.view.detachPart('lid');
-    f.sync(1);
-    f.view.root.updateMatrixWorld(true);
+
+    // ---- the Foreman: same parts state, then remove the already broken chunks from the new view
+    const f = this.foreman;
+    {
+      const ov = f.view;
+      f.view = replace(ov);
+      copyLook(ov, f.view);
+      applyPose(f);
+      for (const [name, p] of Object.entries(f.parts)) {
+        if (!p.broken || name === 'core') continue;
+        const gone = f.view.detachPart(name);
+        gone?.parent?.remove(gone); // its continuing debris lives in game.debris and is scene-owned, not here
+      }
+      if (f.parts.missile_pod.broken) f.view.detachPart('lid');
+      f.view.root.updateMatrixWorld(true); // hit spheres read part.matrixWorld
+      f.view.update?.(0);
+    }
+
+    // ---- sweep beam + stomp ring
+    swapBody(this.beam, { prime: false });
+    if (this.ring) this.ring = replace(this.ring);
+
+    // ---- transient effects (sparks, flashes, blasts): keep their animated root transform
+    for (const e of this.effects || []) if (e.v) e.v = replace(e.v);
+
+    // ---- arena geometry
+    if (this.floorView) this.floorView = replace(this.floorView);
     this.levelViews = this.levelViews.map(replace);
-    this.pools = {};
+
+    // Debris needs no rebuild: each chunk was scene.attach()-ed when it broke off, so it is a direct child of
+    // this.scene (not of the removed character root) and updateDebris keeps simulating it. Rebuilding these
+    // nested chunks would risk duplicating sibling pieces; keeping the Object3D gives exact count/transform.
+    this.pools = {}; // recycled views belonged to the old look; every later spawn builds the current one
   }
 
   // ------------------------------------------------------------------ pools
@@ -393,7 +484,8 @@ export class Game {
     if (mode === 'drop') (vel = new THREE.Vector3(fwd.x * 2.5, 1.5, fwd.z * 2.5)), (spin = new THREE.Vector3(0, 0, 0)), (obj.userData.tip = -1);
     else if (mode === 'blast') (vel = new THREE.Vector3((out.x / ol) * 2, 9, (out.z / ol) * 2 - 1)), (spin = rndVec(4));
     else vel = new THREE.Vector3((out.x / ol) * 3, 3, (out.z / ol) * 3), (spin = rndVec(mode === 'small' ? 10 : 2));
-    this.debris.push({ obj, vel, spin, t: 0, life: mode === 'small' ? 1.5 : 10 });
+    // viewId + part record who owns this chunk, so a look swap can rebuild its look without losing it
+    this.debris.push({ obj, vel, spin, t: 0, life: mode === 'small' ? 1.5 : 10, viewId: v.id, part: name });
   }
 
   // ------------------------------------------------------------------ events
