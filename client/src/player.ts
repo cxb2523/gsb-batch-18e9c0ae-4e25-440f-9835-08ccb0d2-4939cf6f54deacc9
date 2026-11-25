@@ -119,6 +119,11 @@ export class Player {
     return track ? track.durationMs / 1000 : 0;
   }
 
+  /** Seconds into the current track (reported in wave feedback). */
+  get currentTimeSeconds(): number {
+    return this.audio.currentTime;
+  }
+
   get sampleRateKhz(): number | null {
     return this.ctx ? Math.round(this.ctx.sampleRate / 1000) : null;
   }

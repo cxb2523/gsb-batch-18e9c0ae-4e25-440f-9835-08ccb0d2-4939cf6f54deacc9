@@ -23,6 +23,7 @@ import {
 } from './api';
 import { EQ_FREQS, EQ_RANGE_DB } from './player';
 import type { PlaybackState, Player, RepeatMode } from './player';
+import { WaveController } from './wave';
 
 const MARQUEE_CHARS = 32;
 const MARQUEE_SEPARATOR = ' *** ';
@@ -31,10 +32,6 @@ const MARQUEE_TICK_MS = 200;
 const NUM_BARS = 19;
 const VIS_W = 76; // canvas is 76x16 device pixels, CSS-scaled 2x (pixelated)
 const VIS_H = 16;
-
-/** Keep at least this many wave tracks queued ahead of the current one, so
- *  "Моя волна" is effectively infinite. */
-const WAVE_RUNWAY = 20;
 
 function el<T extends HTMLElement = HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -102,12 +99,26 @@ export function initUI(player: Player): void {
   let remainingMode = false; // time readout: elapsed vs. -remaining
   let seekDragging = false;
 
-  // "Моя волна" state: when active, the playlist IS the AI wave queue, and it
-  // auto-extends as the listener nears the frontier.
-  let waveActive = false;
-  let waveSessionId: string | null = null;
-  let wavePrefetching = false;
+  // "Моя волна" mode flag for server-side behavior differences (track dedupe
+  // on wave extension). The wave queue lifecycle itself lives in `wave`.
   let yandexMode = false;
+
+  // "Моя волна" — the personalized AI radio. The controller owns the queue
+  // lifecycle: single in-flight extension anchored at the real queue tail,
+  // stale responses discarded on any queue replacement, per-track batch
+  // attribution for feedback, and no extension while paused (see wave.ts).
+  const wave = new WaveController({
+    player,
+    fetchWave: getWave,
+    sendFeedback: sendWaveFeedback,
+    isYandexMode: () => yandexMode,
+    onActiveChange: (active) => {
+      plBadge.classList.toggle('hidden', !active);
+      waveBtn.classList.toggle('lit', active);
+    },
+    onQueueChanged: renderPlaylist,
+    onStatus: setStatus,
+  });
 
   // ---------------------------------------------------------------- status
   function setStatus(text: string, kind: 'info' | 'error' = 'info'): void {
@@ -240,13 +251,14 @@ export function initUI(player: Player): void {
   }
 
   // --------------------------------------------------------------- transport
-  // A manual skip counts as a "skip" signal to the wave model.
+  // A manual skip counts as a "skip" signal to the wave model (no-op when the
+  // wave is off — the controller checks).
   function userNext(): void {
-    if (waveActive) waveFeedback('skip');
+    wave.feedback('skip');
     player.next();
   }
   function userPrev(): void {
-    if (waveActive) waveFeedback('skip');
+    wave.feedback('skip');
     player.prev();
   }
   el('btn-prev').addEventListener('click', userPrev);
@@ -362,6 +374,9 @@ export function initUI(player: Player): void {
     try {
       const res = await submitToken(token);
       applyStatus({ mode: 'yandex', account: res.account });
+      // Mode switch: the demo wave queue/session no longer applies — leave
+      // wave mode so no stale extension or feedback leaks into the new mode.
+      wave.deactivate();
       tokenInput.value = '';
       void populatePlaylists(); // refresh the picker with the connected user's playlists
       void refreshLikedIds(); // load the like state for the heart button
@@ -381,7 +396,7 @@ export function initUI(player: Player): void {
 
   // ------------------------------------------------------------------ search
   async function runSearch(query: string): Promise<void> {
-    setWaveActive(false); // a manual search leaves wave mode
+    wave.deactivate(); // a manual search leaves wave mode
     playlistPicker.value = ''; // the playlist is now search results, not a picked list
     setStatus(query ? `searching "${query}"…` : 'loading playlist…', 'info');
     try {
@@ -460,7 +475,7 @@ export function initUI(player: Player): void {
 
   /** Load one playlist's tracks into the playlist. Does NOT auto-play. */
   async function loadPlaylist(id: string): Promise<void> {
-    setWaveActive(false); // picking a playlist leaves wave mode, like a search does
+    wave.deactivate(); // picking a playlist leaves wave mode, like a search does
     const label = playlistPicker.selectedOptions[0]?.textContent ?? 'playlist';
     setStatus(`loading ${label}…`, 'info');
     try {
@@ -801,75 +816,26 @@ export function initUI(player: Player): void {
   initMediaSession();
 
   // ------------------------------------------------------- "Моя волна" / wave
-  function setWaveActive(active: boolean): void {
-    waveActive = active;
-    if (!active) waveSessionId = null;
-    plBadge.classList.toggle('hidden', !active);
-    waveBtn.classList.toggle('lit', active);
-  }
-
-  function waveFeedback(event: 'trackStarted' | 'trackFinished' | 'skip'): void {
-    const track = player.currentTrack;
-    if (!track) return;
-    void sendWaveFeedback({
-      sessionId: waveSessionId,
-      trackId: track.id,
-      event,
-      totalPlayedSeconds: Math.floor(player.audio.currentTime),
-    });
-  }
-
   async function startWave(autoplay = true): Promise<void> {
     playlistPicker.value = ''; // the playlist is now the wave queue, not a picked list
     setStatus('starting Моя волна…', 'info');
     setMarquee('МОЯ ВОЛНА - TUNING THE AI RADIO…');
     waveBtn.disabled = true;
     try {
-      const res = await getWave();
-      if (res.tracks.length === 0) {
+      const result = await wave.start(autoplay);
+      if (result === 'started') {
+        setStatus(`Моя волна · ${player.tracks.length} tracks queued`, 'info');
+        if (!autoplay) setMarquee('МОЯ ВОЛНА - PRESS PLAY TO START YOUR WAVE');
+      } else if (result === 'empty') {
         setStatus('the wave returned no tracks', 'error');
-        return;
       }
-      waveSessionId = res.sessionId;
-      setWaveActive(true);
-      player.setPlaylist(res.tracks);
-      renderPlaylist();
-      setStatus(`Моя волна · ${res.tracks.length} tracks queued`, 'info');
-      if (autoplay) {
-        player.playIndex(0);
-      } else {
-        setMarquee('МОЯ ВОЛНА - PRESS PLAY TO START YOUR WAVE');
-      }
+      // 'superseded': a newer queue action (search, playlist, retune) already
+      // owns the status line — nothing to report.
     } catch (err) {
       setStatus(`My Wave failed: ${errorMessage(err)}`, 'error');
       setMarquee(`ERROR: MY WAVE - ${errorMessage(err)}`);
     } finally {
       waveBtn.disabled = false;
-    }
-  }
-
-  /** Keep the wave queue at least WAVE_RUNWAY tracks ahead — makes it infinite. */
-  async function prefetchWaveIfNeeded(): Promise<void> {
-    if (!waveActive || wavePrefetching) return;
-    const ahead = player.tracks.length - player.currentIndex - 1;
-    if (ahead >= WAVE_RUNWAY) return; // enough runway queued
-    wavePrefetching = true;
-    try {
-      const res = await getWave(player.frontierId ?? undefined);
-      // In yandex mode drop tracks already queued; in demo mode the catalog is
-      // tiny, so allow repeats — that's what keeps the demo wave endless too.
-      const existing = new Set(player.tracks.map((p) => p.id));
-      const fresh = yandexMode ? res.tracks.filter((t) => !existing.has(t.id)) : res.tracks;
-      if (res.sessionId) waveSessionId = res.sessionId;
-      if (fresh.length > 0) {
-        player.appendTracks(fresh);
-        renderPlaylist();
-      }
-    } catch (err) {
-      // Non-fatal: the current queue keeps playing; surface it quietly.
-      setStatus(`could not extend the wave: ${errorMessage(err)}`, 'error');
-    } finally {
-      wavePrefetching = false;
     }
   }
   waveBtn.addEventListener('click', () => void startWave());
@@ -944,26 +910,16 @@ export function initUI(player: Player): void {
     renderLikeButton();
     updateMediaSession(track);
     if (pipWindow) pipWindow.document.title = `${track.artist} - ${track.title} · ya-namp`;
-    if (waveActive) {
-      waveFeedback('trackStarted');
-      void prefetchWaveIfNeeded();
-    }
+    // Wave: report the start (tagged with the track's own batch). Queue
+    // extension is driven by the controller on the 'playing' state, so a
+    // paused track change never triggers a prefetch.
+    wave.feedback('trackStarted');
   });
-
-  async function continueWave(): Promise<void> {
-    if (player.currentIndex >= player.tracks.length - 2) await prefetchWaveIfNeeded();
-    if (player.currentIndex < player.tracks.length - 1) {
-      player.playIndex(player.currentIndex + 1);
-    } else {
-      setStatus('wave stalled — press Моя волна to retune', 'error');
-    }
-  }
 
   player.on('ended', () => {
     // Wave keeps flowing (endless AI radio) unless the user asked to loop one.
-    if (waveActive && player.repeatMode !== 'one') {
-      waveFeedback('trackFinished');
-      void continueWave();
+    if (wave.isActive && player.repeatMode !== 'one') {
+      void wave.continueAfterEnd();
       return;
     }
     const result = player.handleTrackEnd();
