@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>SIGNAL•FM — Tune the World, Live</title>
+<meta name="description" content="Free, open-source web radio. Stream 50,000+ live radio stations from every country — no account, no ads, no downloads.">
+<meta name="theme-color" content="#050510" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f3f4fa" media="(prefers-color-scheme: light)">
+<meta property="og:title" content="SIGNAL•FM — Tune the World, Live">
+<meta property="og:description" content="Stream thousands of live radio stations from around the world, free.">
+<meta property="og:type" content="website">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon.svg">
+<link rel="manifest" href="manifest.webmanifest">
+<script>
+  // Apply the saved theme before first paint to avoid a flash.
+  try{ var t = JSON.parse(localStorage.getItem('signalfm:settings')||'{}').theme; if(t) document.documentElement.dataset.theme = t; }catch(e){}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Bebas+Neue&family=Space+Mono:wght@400;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <nav>
+    <a class="logo" href="./" aria-label="SIGNAL FM home">SIGNAL<span>•FM</span></a>
+    <div class="nav-right">
+      <div class="nav-stat"><span class="dot-live" id="netDot"></span><span id="navStat">connecting…</span></div>
+      <button class="nav-btn" id="installBtn" hidden title="Install as an app">
+        <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l-5-5m5 5l5-5M5 21h14"/></svg>Install
+      </button>
+      <button class="nav-btn" id="shortcutsBtn" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
+      <button class="nav-btn" id="settingsBtn" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+      </button>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <div class="hero-copy">
+      <div class="eyebrow">Live internet radio · Free &amp; open source</div>
+      <h1 class="hero-title">TUNE THE<br>WORLD</h1>
+      <p class="hero-sub">Search, discover, and stream <b>real live radio stations</b> from every corner of the planet — no logins, no ads, no downloads, just hit play.</p>
+      <div class="hero-cta">
+        <button class="btn btn-primary" id="ctaStart">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+          <span id="ctaStartLabel">Start Listening</span>
+        </button>
+        <button class="btn btn-ghost" id="ctaSurprise">🎲 Surprise Me</button>
+      </div>
+    </div>
+    <div class="dial-wrap" aria-hidden="true">
+      <div class="dial-glow"></div>
+      <div class="dial-ring"></div>
+      <svg class="dial-ticks" viewBox="0 0 300 300"><g id="tickGroup"></g></svg>
+      <div class="dial-needle" id="dialNeedle"></div>
+      <div class="dial-center">
+        <div class="dial-idle" id="dialIdle">
+          <div class="dial-freq" id="heroFreq">99.5</div>
+          <div class="dial-label">ON AIR</div>
+        </div>
+        <div class="dial-station" id="dialStation" hidden>
+          <div class="dial-station-flag" id="dialFlag">📻</div>
+          <div class="dial-station-name" id="dialStationName">Station</div>
+          <div class="dial-station-live" id="dialStatus">TUNED IN</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="stats-strip">
+    <div class="stat-item"><div class="stat-num c1" id="statStations">—</div><div class="stat-cap">Live stations</div></div>
+    <div class="stat-item"><div class="stat-num c2" id="statCountries">—</div><div class="stat-cap">Countries</div></div>
+    <div class="stat-item"><div class="stat-num c3" id="statTags">—</div><div class="stat-cap">Genres &amp; tags</div></div>
+    <div class="stat-item"><div class="stat-num c4" id="statFavs">0</div><div class="stat-cap">Your favorites</div></div>
+  </div>
+
+  <main id="stations">
+    <div class="lcd" id="lcd">
+      <div class="lcd-freq" id="lcdFreq">88.1</div>
+      <div class="lcd-track">
+        <div class="lcd-scroll" id="lcdScroll" hidden><span id="lcdSpan1"></span><span id="lcdSpan2" aria-hidden="true"></span></div>
+        <div class="lcd-static" id="lcdStatic">NO SIGNAL — SELECT A STATION BELOW</div>
+      </div>
+      <div class="lcd-sleep" id="lcdSleep" hidden title="Sleep timer"></div>
+    </div>
+
+    <div class="controls">
+      <div class="search-row">
+        <div class="search-box">
+          <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+          <input id="searchInput" type="search" placeholder="Search stations, genres, cities…" autocomplete="off" aria-label="Search stations">
+          <span class="kbd-hint" id="kbdHint">/</span>
+          <button class="search-clear" id="searchClear" hidden aria-label="Clear search">✕</button>
+        </div>
+        <select class="select" id="countrySelect" aria-label="Jump to a country">
+          <option value="">🌐 Jump to a country…</option>
+        </select>
+        <button class="btn-surprise" id="btnSurprise2">🎲 Random</button>
+      </div>
+      <div class="tab-row" id="tabRow" role="tablist"></div>
+      <div class="chip-row" id="chipRow" aria-label="Genres"></div>
+    </div>
+
+    <div class="list-head">
+      <div class="section-label" id="gridLabel">Browse by country</div>
+      <div class="list-tools" id="listTools" hidden>
+        <select class="select" id="sortSelect" aria-label="Sort stations">
+          <option value="popular">Most popular</option>
+          <option value="trending">Trending now</option>
+          <option value="votes">Most voted</option>
+          <option value="bitrate">Best quality</option>
+          <option value="name">Name A–Z</option>
+        </select>
+      </div>
+    </div>
+    <div class="grid" id="grid" aria-live="polite" aria-busy="true">
+      <div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>
+      <div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>
+    </div>
+    <div id="loadMoreWrap"></div>
+  </main>
+
+  <footer>
+    Station data &amp; streams via <a href="https://www.radio-browser.info" target="_blank" rel="noopener">radio-browser.info</a> — a free, community-maintained directory.<br>
+    SIGNAL•FM is free &amp; open source · <a href="https://github.com/coders61/SIGNALFM" target="_blank" rel="noopener">Star it on GitHub</a> · Press <kbd>?</kbd> for shortcuts
+  </footer>
+</div>
+
+<!-- ================= PLAYER ================= -->
+<div class="player" id="player" role="region" aria-label="Player">
+  <div class="player-inner">
+    <button class="p-art-wrap" id="artBtn" title="Station info" aria-label="Station info">
+      <div class="p-art-ring" id="artRing"></div>
+      <img class="p-art" id="pArt" alt="" src="icons/icon.svg">
+    </button>
+    <div class="player-meta">
+      <div class="p-live-badge" id="liveBadge" style="visibility:hidden;"><span class="p-live-dot"></span>LIVE</div>
+      <div class="name" id="pName">Nothing tuned in</div>
+      <div class="sub" id="pSub" aria-live="polite">Pick a station to start listening</div>
+    </div>
+    <div class="transport">
+      <button class="p-btn hide-sm" id="prevBtn" title="Previous station (P)" aria-label="Previous station" disabled>
+        <svg viewBox="0 0 24 24"><path d="M6 5h2v14H6zM20 5v14L9 12z"/></svg>
+      </button>
+      <button class="play-btn" id="playBtn" title="Play / Pause (Space)" aria-label="Play">
+        <svg id="playIcon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+        <svg id="pauseIcon" viewBox="0 0 24 24" hidden><rect x="6" y="5" width="4" height="14"/><rect x="14" y="5" width="4" height="14"/></svg>
+        <span class="spinner" id="spinIcon" hidden></span>
+      </button>
+      <button class="p-btn" id="nextBtn" title="Next station (N)" aria-label="Next station" disabled>
+        <svg viewBox="0 0 24 24"><path d="M16 5h2v14h-2zM4 5v14l11-7z"/></svg>
+      </button>
+    </div>
+    <canvas id="viz" width="360" height="40" aria-hidden="true"></canvas>
+    <div class="vol-wrap">
+      <button class="p-btn" id="muteBtn" title="Mute (M)" aria-label="Mute">
+        <svg id="volIcon" viewBox="0 0 24 24"><path d="M3 10v4h4l5 5V5L7 10H3zm13.5 2A4.5 4.5 0 0 0 14 8v8a4.5 4.5 0 0 0 2.5-4z"/></svg>
+        <svg id="muteIcon" viewBox="0 0 24 24" hidden><path d="M3 10v4h4l5 5V5L7 10H3zm16.6 2l2.1-2.1-1.4-1.4-2.1 2.1-2.1-2.1-1.4 1.4 2.1 2.1-2.1 2.1 1.4 1.4 2.1-2.1 2.1 2.1 1.4-1.4z"/></svg>
+      </button>
+      <input type="range" id="volSlider" min="0" max="1" step="0.01" value="0.85" aria-label="Volume">
+    </div>
+    <div class="pop-wrap hide-sm">
+      <button class="p-btn text" id="eqBtn" title="Equalizer (E)" aria-haspopup="true" aria-expanded="false">EQ</button>
+      <div class="pop-panel" id="eqPanel">
+        <div class="pop-title">Equalizer <button class="pill-btn" id="eqReset">Reset</button></div>
+        <div class="pop-note" id="eqNote" hidden></div>
+        <div class="eq-sliders" id="eqSliders"></div>
+        <div class="eq-presets" id="eqPresets"></div>
+      </div>
+    </div>
+    <div class="pop-wrap hide-sm">
+      <button class="p-btn stroke" id="sleepBtn" title="Sleep timer (S)" aria-label="Sleep timer" aria-haspopup="true" aria-expanded="false">
+        <svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+      <div class="pop-panel" id="sleepPanel">
+        <div class="pop-title">Sleep timer <span id="sleepLeft" style="color:var(--amber)"></span></div>
+        <div class="sleep-options" id="sleepOptions"></div>
+        <div class="pop-note" style="color:var(--dim)">Fades out gently over the last 30 seconds.</div>
+      </div>
+    </div>
+    <button class="p-btn star-btn" id="pFav" title="Favorite (F)" aria-label="Add to favorites" disabled>☆</button>
+    <button class="p-btn hide-md" id="ejectBtn" title="Stop and clear station" aria-label="Stop">✕</button>
+  </div>
+</div>
+
+<!-- ================= DIALOGS ================= -->
+<dialog id="detailDlg" aria-labelledby="detailName">
+  <div class="dlg-head"><div class="dlg-title">Station</div><button class="icon-btn" data-close aria-label="Close">✕</button></div>
+  <div class="dlg-body" id="detailBody"></div>
+</dialog>
+
+<dialog id="customDlg" aria-labelledby="customTitle">
+  <div class="dlg-head"><div class="dlg-title" id="customTitle">Add a station</div><button class="icon-btn" data-close aria-label="Close">✕</button></div>
+  <form class="dlg-body" id="customForm" novalidate>
+    <label class="field"><span>Stream link <em>*</em></span>
+      <input id="cUrl" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://example.com/live.mp3">
+      <small>Direct audio streams (MP3, AAC, OGG), HLS (.m3u8) and .pls / .m3u playlist links all work.</small>
+    </label>
+    <label class="field"><span>Station name</span>
+      <input id="cName" maxlength="80" autocomplete="off" placeholder="My favorite station">
+    </label>
+    <label class="field"><span>Logo link</span>
+      <input id="cLogo" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://… (optional)">
+    </label>
+    <label class="field"><span>Genres</span>
+      <input id="cTags" maxlength="120" autocomplete="off" placeholder="jazz, chill (optional)">
+    </label>
+    <div class="pop-note" id="cNote" role="status" hidden></div>
+    <div class="detail-actions">
+      <button type="button" class="btn btn-ghost btn-sm" id="cTest">▶ Test it</button>
+      <button type="submit" class="btn btn-primary btn-sm" id="cSave">Save station</button>
+    </div>
+    <div class="desc" style="font-size:12px;color:var(--dim)">Saved in this browser only. Use <b>Export</b> in Settings to back them up.</div>
+  </form>
+</dialog>
+
+<dialog id="settingsDlg" aria-labelledby="settingsTitle">
+  <div class="dlg-head"><div class="dlg-title" id="settingsTitle">Settings</div><button class="icon-btn" data-close aria-label="Close">✕</button></div>
+  <div class="dlg-body">
+    <div class="setting-row">
+      <div><div class="lbl">Theme</div><div class="desc">Auto follows your device.</div></div>
+      <div class="seg" id="themeSeg">
+        <button data-v="auto">Auto</button><button data-v="dark">Dark</button><button data-v="light">Light</button>
+      </div>
+    </div>
+    <div class="setting-row">
+      <div><div class="lbl">Secure streams only</div><div class="desc">Hide stations without HTTPS. They often won't play on secure sites like GitHub Pages.</div></div>
+      <label class="switch"><input type="checkbox" id="optHttps"><span></span></label>
+    </div>
+    <div class="setting-row">
+      <div><div class="lbl">Enhanced audio</div><div class="desc">Enables the equalizer and the real audio visualizer on stations that allow it.</div></div>
+      <label class="switch"><input type="checkbox" id="optEnhanced"><span></span></label>
+    </div>
+    <div class="setting-row">
+      <div><div class="lbl">Auto-reconnect</div><div class="desc">Automatically retry when a stream drops.</div></div>
+      <label class="switch"><input type="checkbox" id="optReconnect"><span></span></label>
+    </div>
+    <div class="divider"></div>
+    <div class="setting-row">
+      <div><div class="lbl">Your library</div><div class="desc" id="libSummary">Saved in this browser only.</div></div>
+    </div>
+    <div class="detail-actions">
+      <button class="btn btn-ghost btn-sm" id="exportBtn">⬇ Export library</button>
+      <button class="btn btn-ghost btn-sm" id="importBtn">⬆ Import library</button>
+      <button class="btn btn-ghost btn-sm" id="clearRecentBtn">Clear history</button>
+      <input type="file" id="importFile" accept="application/json,.json" hidden>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="shortcutsDlg" aria-labelledby="shortcutsTitle">
+  <div class="dlg-head"><div class="dlg-title" id="shortcutsTitle">Keyboard shortcuts</div><button class="icon-btn" data-close aria-label="Close">✕</button></div>
+  <div class="dlg-body">
+    <div class="kbd-list">
+      <span><kbd>Space</kbd> / <kbd>K</kbd></span><span>Play / pause</span>
+      <span><kbd>N</kbd> / <kbd>P</kbd></span><span>Next / previous station</span>
+      <span><kbd>R</kbd></span><span>Random station</span>
+      <span><kbd>M</kbd></span><span>Mute / unmute</span>
+      <span><kbd>↑</kbd> / <kbd>↓</kbd></span><span>Volume up / down (with Shift)</span>
+      <span><kbd>F</kbd></span><span>Favorite current station</span>
+      <span><kbd>I</kbd></span><span>Station info</span>
+      <span><kbd>E</kbd></span><span>Equalizer</span>
+      <span><kbd>S</kbd></span><span>Sleep timer</span>
+      <span><kbd>/</kbd></span><span>Search</span>
+      <span><kbd>A</kbd></span><span>Add your own station</span>
+      <span><kbd>Esc</kbd></span><span>Close panels</span>
+    </div>
+  </div>
+</dialog>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+<script src="js/app.js"></script>
+</body>
+</html>
