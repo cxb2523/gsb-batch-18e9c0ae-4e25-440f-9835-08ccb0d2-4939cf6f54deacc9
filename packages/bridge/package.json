@@ -1,0 +1,67 @@
+{
+  "name": "prismbox",
+  "version": "0.1.0",
+  "description": "Agent-native visual editor for React Three Fiber: drag objects on your real Vite page, edit as one-line diffs, and let a coding agent point at them over MCP.",
+  "license": "MIT",
+  "author": "Guten-Morgen1302",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Guten-Morgen1302/prismbox.git",
+    "directory": "packages/bridge"
+  },
+  "homepage": "https://github.com/Guten-Morgen1302/prismbox#readme",
+  "bugs": {
+    "url": "https://github.com/Guten-Morgen1302/prismbox/issues"
+  },
+  "keywords": [
+    "react-three-fiber",
+    "r3f",
+    "three",
+    "threejs",
+    "visual-editor",
+    "vite",
+    "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "cursor"
+  ],
+  "type": "module",
+  "bin": {
+    "prismbox": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/clean.mjs && tsup && node scripts/copy-studio.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@prismbox/core": "workspace:*",
+    "ws": "^8.23.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@prismbox/studio": "workspace:*",
+    "@react-three/fiber": "^9.8.2",
+    "@types/react": "^19.3.0",
+    "@types/three": "^0.187.0",
+    "@types/ws": "^8.18.2",
+    "@vitejs/plugin-react": "^6.3.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "three": "^0.187.0",
+    "tsx": "^4.23.15",
+    "vite": "^8.3.8"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

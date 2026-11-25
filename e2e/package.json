@@ -1,0 +1,16 @@
+{
+  "name": "@prismbox/e2e",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Real-browser end-to-end test: prismbox running on examples/vite-hero. Not part of pnpm test (needs Chromium); run with pnpm e2e.",
+  "type": "module",
+  "scripts": {
+    "e2e": "node vite-hero.e2e.mjs && node playground.e2e.mjs",
+    "e2e:playground": "node playground.e2e.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "playwright": "1.65.1",
+    "pngjs": "^7.0.0"
+  }
+}

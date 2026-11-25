@@ -1,0 +1,28 @@
+# dependencies and build output
+node_modules/
+dist/
+.turbo/
+coverage/
+*.tsbuildinfo
+
+# environment and secrets (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+.prismbox-tmp-*
+
+# local tooling, planning and scratch (never part of the repo)
+.gstack/
+.claude/settings.local.json
+.vercel/
+.scratch/
+tmp/
+*.log
+.DS_Store
+Thumbs.db
+
+# wrangler local state
+.wrangler/

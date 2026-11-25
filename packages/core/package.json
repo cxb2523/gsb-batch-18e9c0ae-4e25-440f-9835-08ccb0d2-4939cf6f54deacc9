@@ -1,0 +1,60 @@
+{
+  "name": "@prismbox/core",
+  "version": "0.1.0",
+  "description": "Parser, subset classifier and minimal-diff writer for React Three Fiber source files.",
+  "license": "MIT",
+  "author": "Guten-Morgen1302",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Guten-Morgen1302/prismbox.git",
+    "directory": "packages/core"
+  },
+  "homepage": "https://github.com/Guten-Morgen1302/prismbox#readme",
+  "bugs": {
+    "url": "https://github.com/Guten-Morgen1302/prismbox/issues"
+  },
+  "keywords": [
+    "react-three-fiber",
+    "r3f",
+    "three",
+    "threejs",
+    "ast",
+    "codemod",
+    "visual-editor",
+    "magic-string"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@babel/parser": "^7.29.14",
+    "magic-string": "^1.4.5",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@babel/types": "^7.29.14"
+  },
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  }
+}

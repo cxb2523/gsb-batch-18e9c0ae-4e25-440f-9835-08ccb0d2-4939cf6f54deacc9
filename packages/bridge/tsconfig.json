@@ -1,0 +1,23 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
+    "types": [
+      "node"
+    ],
+    "paths": {
+      "@prismbox/core": [
+        "../core/src/index.ts"
+      ]
+    }
+  },
+  "include": [
+    "src",
+    "test",
+    "tsup.config.ts",
+    "vitest.config.ts"
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "name": "prismbox-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Agent-native visual editor for React Three Fiber. Early development.",
+  "license": "MIT",
+  "author": "Guten-Morgen1302",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Guten-Morgen1302/prismbox.git"
+  },
+  "homepage": "https://github.com/Guten-Morgen1302/prismbox#readme",
+  "bugs": {
+    "url": "https://github.com/Guten-Morgen1302/prismbox/issues"
+  },
+  "type": "module",
+  "packageManager": "pnpm@10.27.0",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "typecheck": "pnpm -r --if-present typecheck",
+    "lint": "eslint .",
+    "test": "pnpm -r --if-present test",
+    "build": "pnpm -r --if-present build",
+    "e2e": "pnpm --filter @prismbox/e2e e2e",
+    "demo": "node packages/bridge/dist/cli.js --root examples/vite-hero"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.6",
+    "eslint": "^10.15.0",
+    "tsup": "^9.0.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.73.0",
+    "vitest": "^5.1.1"
+  }
+}

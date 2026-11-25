@@ -1,0 +1,11 @@
+{
+  "templates": [
+    { "id": "liquid-glass-orb", "title": "Liquid-glass orb", "description": "A noise-displaced sphere that refracts and reflects a procedural photo studio.", "accent": "#8fb4ff" },
+    { "id": "glass-card", "title": "Glass card", "description": "A rounded sheet of glass that tilts toward the pointer over drifting light.", "accent": "#7a4dff" },
+    { "id": "glowing-globe", "title": "Glowing globe", "description": "A dotted planet with an atmosphere rim, orbit rings and a starfield.", "accent": "#5ff3ff" },
+    { "id": "gradient-mesh", "title": "Gradient mesh", "description": "A lit, rippling ribbon of colour in the style of a payments landing page.", "accent": "#ff5fa8" },
+    { "id": "iridescent-knot", "title": "Iridescent knot", "description": "Thin-film colour over a chrome torus knot.", "accent": "#b38cff" },
+    { "id": "aurora-ribbon", "title": "Aurora ribbon", "description": "Three layered curtains of light over a starfield.", "accent": "#19ffa0" },
+    { "id": "liquid-chrome-blob", "title": "Liquid chrome blob", "description": "A slowly morphing mirror-metal blob reflecting a procedural photo studio.", "accent": "#7fb8ff" }
+  ]
+}

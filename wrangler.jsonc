@@ -1,0 +1,18 @@
+{
+  // Cloudflare Workers static assets: serves the built Playground (apps/studio/dist).
+  // Cloudflare build settings: build command `pnpm install --frozen-lockfile && pnpm --filter @prismbox/studio build`,
+  // deploy command `npx wrangler deploy` (this file is what it reads). Headers come from apps/studio/public/_headers.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "prismbox-playground",
+  "main": "apps/studio/worker/index.ts",
+  "compatibility_date": "2026-11-01",
+  // The template sources are bundled into the Worker as text for the read-only /mcp endpoint.
+  "rules": [{ "type": "Text", "globs": ["**/*.tsx"], "fallthrough": false }],
+  "assets": {
+    "directory": "./apps/studio/dist",
+    "binding": "ASSETS",
+    // Only /mcp runs the Worker; every other path is served straight from the static assets (headers come from _headers).
+    "run_worker_first": ["/mcp", "/mcp/"],
+    "not_found_handling": "single-page-application"
+  }
+}
