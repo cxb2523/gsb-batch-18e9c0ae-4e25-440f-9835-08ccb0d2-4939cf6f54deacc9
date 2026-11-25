@@ -1,5 +1,21 @@
 # @meersagor/wavesurfer-vue
 
+## Unreleased
+
+### 🐛 Bug Fixes
+
+- **Recorder state machine & event lifecycle** (`useWaveSurferRecorder` / `useWaveSurferRecorderStandalone`): the exposed flags now always mirror the real recorder instead of drifting from it.
+
+#### What was fixed:
+- State is driven by an explicit state machine (`idle → starting → recording ⇄ paused → stopping → idle`) and confirmed by the plugin's own `record-start` / `record-pause` / `record-resume` / `record-end` events. `isRecording`, `isPaused` and `isPauseResume` (the pause/resume button label) no longer lag after pause/stop.
+- `record-progress` and `record-end` are attached **once**, on the first `startRecording()`. Pause, resume and repeated starts reuse the same listeners, so they never stack.
+- `stopRecording()` resolves with the Blob **after** `record-end` arrives; stopping while nothing is recording rejects immediately rather than hanging forever. Added a `stopTimeout` option (default 5000 ms) as a safety net.
+- Stopping while the microphone is still being acquired waits for the start to complete and still returns a Blob.
+- Stop resets `currentTime` to `00:00` and clears `isRecording` / `isPaused`.
+- Listeners are unbound on component unmount (scope dispose), and any in-flight stop is rejected instead of leaking.
+- Start failures (e.g. denied microphone permission) are exposed via a new `error` ref without throwing unhandled rejections.
+- Added `tests/` (Vitest + a controllable mock record plugin) and an interactive `example/` served by `yarn dev`.
+
 ## 2.0.3
 
 ### 🐛 Bug Fixes

@@ -306,7 +306,7 @@ const { waveSurfer, timelinePlugin } = useWaveSurferTimelineStandalone({
 ```vue
 <script lang="ts" setup>
 import { computed, ref } from 'vue'
-import { useWaveSurferRecorder } from '@meersagor/wavesurfer-vue'
+import { useWaveSurferRecorderStandalone } from '@meersagor/wavesurfer-vue'
 
 const showAudioRecordButton = ref<boolean>(true)
 const containerRef = ref<HTMLDivElement | null>(null)
@@ -322,7 +322,7 @@ const options = computed(() => ({
     url: "https://revews-bucket.s3.ap-southeast-1.amazonaws.com/a06mmMU3sgnzuUkH4OiHvyuUgCFdLSnJaDLBao7y.webm",
 }))
 
-const { pauseRecording, startRecording, stopRecording, currentTime, isPauseResume } = useWaveSurferRecorder({
+const { pauseRecording, startRecording, stopRecording, currentTime, isPauseResume, error } = useWaveSurferRecorderStandalone({
     containerRef,
     options: options.value,
     recordPluginOptions:{
@@ -330,12 +330,14 @@ const { pauseRecording, startRecording, stopRecording, currentTime, isPauseResum
     }
 })
 
-const startAudioRecordHandler = () => {
-    startRecording()
-    showAudioRecordButton.value = false
+const startAudioRecordHandler = async () => {
+    await startRecording()
+    // `error` is set when the microphone permission is denied.
+    if (!error.value) showAudioRecordButton.value = false
 }
 
 const stopHandler = async () => {
+    // Resolves only after `record-end`, so the blob is the full recording.
     const blob = await stopRecording()
     console.log('blob =====', blob);
     showAudioRecordButton.value = true
@@ -361,14 +363,34 @@ const stopHandler = async () => {
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `waveSurfer` | `Ref<WaveSurfer \| null>` | WaveSurfer instance |
+| `waveSurfer` | `Ref<WaveSurfer \| null>` | WaveSurfer instance (standalone entry point) |
 | `waveSurferRecorder` | `Ref<RecordPlugin \| null>` | Record plugin instance |
-| `currentTime` | `ComputedRef<string>` | Current recording time in `mm:ss` format |
-| `isPaused` | `ComputedRef<boolean \| undefined>` | Whether recording is paused |
-| `isRecording` | `ComputedRef<boolean \| undefined>` | Whether recording is in progress |
-| `startRecording()` | `() => void` | Start or resume recording |
-| `stopRecording()` | `() => Promise<Blob>` | Stop recording and return blob |
-| `pauseRecording()` | `() => void` | Pause/resume recording |
+| `currentTime` | `ComputedRef<string>` | Current recording time in `mm:ss` format, resets to `00:00` on stop |
+| `isPaused` | `Ref<boolean>` | Whether recording is paused |
+| `isRecording` | `Ref<boolean>` | Whether recording is actively running |
+| `isPauseResume` | `ComputedRef<boolean>` | Button label helper: `true` → "pause", `false` → "resume" |
+| `error` | `Ref<Error \| null>` | Last start failure (e.g. microphone permission denied) |
+| `startRecording()` | `() => Promise<void>` | Start recording; resumes when already paused; no-op while starting/stopping |
+| `stopRecording()` | `() => Promise<Blob>` | Resolve with the Blob once `record-end` fires; rejects immediately if not recording |
+| `pauseRecording()` | `() => void` | Pause when recording, resume when paused |
+| `dispose()` | `() => void` | Unbind listeners and release the mic (also runs on scope dispose) |
+
+The recorder exposes a strict state machine — `idle → starting → recording ⇄ paused → stopping → idle` — and derives every flag from it, so the UI can never drift from the real recorder:
+
+- `record-progress` / `record-end` (plus `record-start` / `record-pause` / `record-resume`) are attached **once**, on the first `startRecording()`, and reused. Pausing, resuming, and repeated starts never stack listeners.
+- `stopRecording()` settles **only** after `record-end`, so the Blob is always the complete recording. If nothing is recording it rejects right away instead of hanging. A `stopTimeout` option (default `5000` ms) rejects if the plugin never emits `record-end`.
+- Calling `stopRecording()` while the microphone is still being acquired waits for the start to settle, stops the recorder, and still resolves with a Blob.
+- On unmount the listeners are unbound and any pending stop is rejected, so nothing leaks.
+
+### Local example & tests
+
+```bash
+yarn dev        # interactive recorder demo (index.html + example/main.ts)
+yarn test       # state-machine tests against a controllable mock plugin
+yarn test:type  # vue-tsc type check
+```
+
+`tests/useWaveSurferRecorder.spec.ts` drives both entry points through start → pause → resume → stop, asserts the returned Blob, checks that stopping without a recording settles immediately, and verifies repeated starts register exactly one set of listeners (`tests/helpers/mockRecordPlugin.ts` provides the deterministic plugin double).
 
 ## 🏗️ Architecture
 
