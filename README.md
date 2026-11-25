@@ -99,6 +99,17 @@ removed on cleanup; caller-provided canvases stay in the DOM and can be reused.
 If unmount happens before initialization resolves, destroy the returned program
 when the promise settles.
 
+### Context loss
+
+When the browser reclaims the WebGL context (a driver reset, or a long
+backgrounded tab), rendering stops immediately. On `webglcontextrestored` the
+shader program, buffers and uniforms are rebuilt automatically and the
+animation resumes from the accumulated timeline — it never restarts at `t=0`.
+A relaunch against the same target while the context is still lost reuses the
+program and stores the new seed, which is uploaded once the context returns; no
+second canvas is created. A program destroyed while lost stays dead: a later
+restore event can no longer reinitialize it or schedule frames.
+
 ### Stacking and Blend
 
 Default canvas style: `z-index: -1`, no `mix-blend-mode`.

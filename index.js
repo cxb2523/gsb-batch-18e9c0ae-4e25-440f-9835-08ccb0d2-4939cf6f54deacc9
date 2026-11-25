@@ -53,6 +53,9 @@ class GradientGL {
   #program
   #uniforms
   #isActive
+  #contextLost = false
+  #destroyed = false
+  #frameToken = 0
   #externalUniforms
   #currentSeed
   #currentUniformValues
@@ -93,26 +96,40 @@ class GradientGL {
   #setupEventHandlers() {
     const { signal } = this.#abort
     this.#canvas.addEventListener('webglcontextlost', e => {
-      if (!this.#isActive) return
+      // A destroyed program no longer owns this canvas lifecycle.
+      if (this.#destroyed || !this.#isActive) return
+      // Tell the browser a restore is wanted; without this the context stays gone.
       e.preventDefault()
+      // Invalidate any in-flight frame loop and mark every GL resource unusable.
+      this.#frameToken++
       this.#isActive = false
+      this.#contextLost = true
       this.#gl = null
       this.#program = null
       this.#uniforms = null
+      this.#lastTime = null
       if (this.#canvas) this.#canvas.width = 0
     }, { signal })
 
     this.#canvas.addEventListener('webglcontextrestored', () => {
-      if (this.#canvas) this.init()
+      // Destroyed programs must never come back to life via a late restore event.
+      if (this.#destroyed || !this.#contextLost) return
+      this.#contextLost = false
+      this.init()
     }, { signal })
   }
 
   init() {
-    if (!this.#canvas) return
+    if (!this.#canvas || this.#destroyed) return
+    // Re-entry (e.g. a duplicate restore event) must not spawn a second frame loop.
+    if (this.#isActive) return
     this.#gl = this.#createGLContext(this.#canvas)
     this.#program = this.#createProgram(this.#vertex, this.#fragment)
     this.#uniforms = this.#getUniformLocations()
     this.#isActive = true
+    // On restore #lastTime stays null so #elapsedTime continues from where it
+    // stopped instead of accumulating the time spent without a context.
+    this.#lastTime = null
 
     this.#setupBuffers()
     this.#setupAttributes()
@@ -222,7 +239,10 @@ class GradientGL {
   }
 
   isMounted(target) {
-    if (!this.#isActive || !this.#gl || !this.#program) return false
+    // A context loss is transient: the program still owns its canvas and must be
+    // reusable while waiting for the browser to restore the context.
+    if (this.#destroyed || !this.#canvas) return false
+    if (!this.#isActive && !this.#contextLost) return false
     if (!this.#canvas?.isConnected) return false
     return isCanvas(target) ? this.#canvas === target : this.#canvas.parentElement === target
   }
@@ -232,7 +252,9 @@ class GradientGL {
       return false
     this.#currentSeed = seed
     this.#externalUniforms = seed[1]
-    this.#updateExternalUniforms(true)
+    // While the context is gone there is no GL to upload to; the restore path
+    // re-runs #updateExternalUniforms(true) with the latest seed.
+    if (this.#isActive && this.#gl && this.#program) this.#updateExternalUniforms(true)
     return true
   }
 
@@ -265,7 +287,11 @@ class GradientGL {
   }
 
   #render() {
+    // Each loop captures the current token; loss/destroy bump it so a stale
+    // scheduled frame can never keep drawing or reschedule itself.
+    const token = this.#frameToken
     const frame = now => {
+      if (token !== this.#frameToken) return
       if (!this.#isActive || !this.#canvas || !this.#gl) return
       if (!this.#canvas.isConnected) return this.destroy()
 
@@ -280,7 +306,12 @@ class GradientGL {
   }
 
   destroy(preserveCanvas) {
+    if (this.#destroyed) return
+    this.#destroyed = true
+    // Expire any frame that was scheduled before teardown.
+    this.#frameToken++
     this.#isActive = false
+    this.#contextLost = false
     this.#observer?.disconnect()
     this.#abort.abort()
     if (this.#program && this.#gl) this.#gl.deleteProgram(this.#program)
