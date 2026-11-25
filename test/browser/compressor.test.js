@@ -61,7 +61,7 @@ describe('Compressor', () => {
     });
   });
 
-  it('should work when the `canvas.toBlob` function does not output any blob object', async () => {
+  it('should fall back to the original image when `canvas.toBlob` outputs no blob object', async () => {
     const image = await loadImageAsBlob(TEST_IMAGE);
 
     return new Promise((resolve) => {
@@ -72,7 +72,11 @@ describe('Compressor', () => {
           };
         },
         success(result) {
-          expect(result).toBe(image);
+          // The bytes come from the original image, but with the EXIF segment
+          // stripped (default `retainExif: false`), so this is a new File.
+          expect(result).toBeInstanceOf(File);
+          expect(result.type).toBe(image.type);
+          expect(result.name).toBe(image.name);
           resolve();
         },
       });

@@ -55,6 +55,10 @@ export default class Compressor {
     };
     this.mimeTypeSet = options && options.mimeType && isImageType(options.mimeType);
     this.aborted = false;
+
+    // Set once `success`/`error` has been delivered (or `fail` starts
+    // throwing), so no late EXIF read/insert callback can settle twice.
+    this.settled = false;
     this.canvasFallback = false;
     this.result = null;
     this.url = null;
@@ -279,35 +283,20 @@ export default class Compressor {
       return;
     }
 
-    const callback = (blob) => {
-      if (!this.aborted) {
-        const done = (result) => this.done({
-          naturalWidth,
-          naturalHeight,
-          result,
-        });
-
-        if (blob && isJPEGImage && options.retainExif && this.exif && this.exif.length > 0) {
-          this.readBlobAsArrayBuffer(blob, (arrayBuffer) => {
-            if (this.aborted) return;
-            const withExif = insertExif(arrayBuffer, this.exif);
-            done(uint8ArrayToBlob(withExif, options.mimeType));
-          });
-        } else if (blob && isJPEGImage && !options.retainExif) {
-          // Strip any EXIF that may be present in the canvas output
-          // (most browsers strip it automatically, but WebKit preserves the
-          // source EXIF—this ensures consistent, privacy-safe output)
-          this.readBlobAsArrayBuffer(blob, (arrayBuffer) => {
-            if (this.aborted) return;
-            done(uint8ArrayToBlob(stripExif(arrayBuffer), options.mimeType));
-          });
-        } else {
-          done(blob);
-        }
+    // Hand the raw canvas output to `done()`; all EXIF retention/stripping is
+    // applied once there, after fallback decisions and based on the final
+    // output type, so every output path shares the same data flow.
+    canvas.toBlob((blob) => {
+      if (this.aborted || this.settled) {
+        return;
       }
-    };
 
-    canvas.toBlob(callback, options.mimeType, options.quality);
+      this.done({
+        naturalWidth,
+        naturalHeight,
+        result: blob,
+      });
+    }, options.mimeType, options.quality);
   }
 
   done({
@@ -317,88 +306,227 @@ export default class Compressor {
   }) {
     const { file, options } = this;
 
-    this.revokeUrl();
-
-    let strictFallback = false;
-
-    if (result) {
-      // Returns original file if the result is greater than it and without size-related options
-      if (
-        options.strict
-        && !options.retainExif
-        && result.size > file.size
-        && options.mimeType === file.type
-        && !(
-          options.width > naturalWidth
-          || options.height > naturalHeight
-          || options.minWidth > naturalWidth
-          || options.minHeight > naturalHeight
-          || options.maxWidth < naturalWidth
-          || options.maxHeight < naturalHeight
-        )
-      ) {
-        result = file;
-        strictFallback = true;
-      } else {
-        let name = file.name || '';
-
-        // Convert the extension to match its type
-        if (name && result.type !== file.type) {
-          name = name.replace(
-            REGEXP_EXTENSION,
-            imageTypeToExtension(result.type),
-          );
-        }
-
-        result = toFile(result, name, result.type);
-      }
-    } else {
-      // Returns original file if the result is null in some cases
-      console.warn('Compressor.js Next: Canvas produced no output—returning the original image');
-      result = file;
-    }
-
-    // When strict returns the original file, it may still contain EXIF—strip it
-    // asynchronously so the output is consistently EXIF-free across all browsers
-    if (strictFallback && file.type === 'image/jpeg') {
-      const succeedStripped = (arrayBuffer) => {
-        const strippedBlob = uint8ArrayToBlob(stripExif(arrayBuffer), file.type);
-
-        this.succeed(toFile(
-          strippedBlob,
-          file.name || '',
-          file.type,
-          file.lastModified ?? Date.now(),
-        ));
-      };
-      const succeedOriginal = (err) => {
-        if (this.aborted) return;
-
-        console.warn(
-          `Compressor.js Next: Failed to strip EXIF from original file—returning original with EXIF intact${file.name ? ` [${file.name}]` : ''}${err?.message ? `: ${err.message}` : ''}`,
-        );
-
-        this.succeed(file);
-      };
-
-      if (file.arrayBuffer) {
-        file.arrayBuffer().then((arrayBuffer) => {
-          if (this.aborted) return;
-
-          succeedStripped(arrayBuffer);
-        }).catch(succeedOriginal);
-      } else {
-        this.readAsArrayBuffer(file, {
-          subject: 'original file',
-          onData: succeedStripped,
-          onError: () => succeedOriginal(),
-        });
-      }
-
+    if (this.aborted || this.settled) {
       return;
     }
 
-    this.succeed(result);
+    this.revokeUrl();
+
+    // Decide only which bytes to deliver: the canvas output or the original
+    // file (strict fallback, or when the canvas produced no output). EXIF
+    // policy is applied afterwards by `output()` for every path alike.
+    let fallbackToOriginal = !result;
+
+    if (
+      result
+
+      // Returns original file if the result is greater than it and without
+      // size-related options. Strict stays disabled while EXIF retention is
+      // requested, matching the documented contract; `output()` still applies
+      // the retain/strip policy uniformly to every fallback path.
+      && options.strict
+      && !options.retainExif
+      && result.size > file.size
+      && options.mimeType === file.type
+      && !(
+        options.width > naturalWidth
+        || options.height > naturalHeight
+        || options.minWidth > naturalWidth
+        || options.minHeight > naturalHeight
+        || options.maxWidth < naturalWidth
+        || options.maxHeight < naturalHeight
+      )
+    ) {
+      fallbackToOriginal = true;
+    }
+
+    if (fallbackToOriginal) {
+      if (!result) {
+        // Returns original file if the result is null in some cases
+        console.warn('Compressor.js Next: Canvas produced no output—returning the original image');
+      }
+
+      this.output(file, {
+        name: file.name || '',
+        type: file.type,
+        lastModified: file.lastModified ?? Date.now(),
+        original: file,
+      });
+      return;
+    }
+
+    let name = file.name || '';
+    const { type } = result;
+
+    // Convert the extension to match its type
+    if (name && type !== file.type) {
+      name = name.replace(
+        REGEXP_EXTENSION,
+        imageTypeToExtension(type),
+      );
+    }
+
+    this.output(result, {
+      name,
+      type,
+    });
+  }
+
+  /**
+   * Apply the single EXIF policy for the final output and deliver it.
+   *
+   * When `retainExif` is `true`, JPEG output carries the original APP1/EXIF
+   * segment: freshly encoded canvas blobs have the extracted segment inserted,
+   * while an original-file fallback already contains it and passes through.
+   *
+   * When `retainExif` is `false`, every JPEG output—including the strict and
+   * no-output fallbacks to the original file—is stripped of APP1/EXIF.
+   *
+   * All asynchronous reads stop once `abort()` was called, and delivery is
+   * guarded against settling more than once.
+   * @param {Blob} blob - The final image bytes.
+   * @param {Object} [meta] - Output metadata.
+   * @param {string} [meta.name] - The output file name.
+   * @param {string} [meta.type] - The output MIME type.
+   * @param {number} [meta.lastModified] - The output modification timestamp.
+   * @param {File} [meta.original] - The source file for fallback paths,
+   *   returned untouched when no byte transformation is required.
+   * @returns {void}
+   */
+  output(blob, {
+    name = '',
+    type = blob.type,
+    lastModified,
+    original = null,
+  } = {}) {
+    const { options } = this;
+    const mimeType = isImageType(type) ? type : options.mimeType;
+
+    // Only JPEG data carries an APP1/EXIF segment.
+    if (mimeType !== 'image/jpeg') {
+      this.succeed(original || toFile(blob, name, mimeType, lastModified));
+      return;
+    }
+
+    if (options.retainExif) {
+      // An original-file fallback already carries its EXIF segment. For
+      // canvas output, insert the segment extracted during initialization.
+      if (original || !this.exif || this.exif.length === 0) {
+        this.succeed(original || toFile(blob, name, mimeType, lastModified));
+        return;
+      }
+
+      this.readBlobAsArrayBuffer(blob, (arrayBuffer) => {
+        if (this.aborted || this.settled) {
+          return;
+        }
+
+        let output;
+
+        try {
+          output = uint8ArrayToBlob(insertExif(arrayBuffer, this.exif), mimeType);
+        } catch (err) {
+          this.fail(err);
+          return;
+        }
+
+        this.succeed(toFile(output, name, mimeType));
+      });
+      return;
+    }
+
+    // `retainExif: false`: ensure no APP1/EXIF survives in any JPEG output,
+    // including fallbacks that return the original file.
+    const strip = (arrayBuffer) => {
+      if (this.aborted || this.settled) {
+        return;
+      }
+
+      let output;
+
+      try {
+        output = uint8ArrayToBlob(stripExif(arrayBuffer), mimeType);
+      } catch (err) {
+        if (original) {
+          this.warnStripExifFailure(err);
+          this.succeed(original);
+        } else {
+          this.fail(err);
+        }
+        return;
+      }
+
+      this.succeed(toFile(output, name, mimeType, lastModified));
+    };
+
+    if (original) {
+      // Preserve the tolerant behavior for the original fallback: if its EXIF
+      // cannot be stripped, warn and return the original instead of failing.
+      this.readOriginalAsArrayBuffer(original, strip, (err) => {
+        if (this.aborted || this.settled) {
+          return;
+        }
+
+        this.warnStripExifFailure(err);
+        this.succeed(original);
+      });
+    } else {
+      this.readBlobAsArrayBuffer(blob, strip);
+    }
+  }
+
+  /**
+   * Warn that stripping EXIF from the original fallback file failed.
+   * @param {Error} [err] - The underlying error, if any.
+   * @returns {void}
+   */
+  warnStripExifFailure(err) {
+    const { file } = this;
+
+    console.warn(
+      `Compressor.js Next: Failed to strip EXIF from original file—returning original with EXIF intact${file.name ? ` [${file.name}]` : ''}${err?.message ? `: ${err.message}` : ''}`,
+    );
+  }
+
+  /**
+   * Read the original fallback file as an array buffer without routing
+   * failures through `fail()`, so callers can fall back gracefully.
+   * @param {Blob} file - The original image file.
+   * @param {Function} onData - Receives the array buffer.
+   * @param {Function} onError - Receives the failure cause.
+   * @returns {void}
+   */
+  readOriginalAsArrayBuffer(file, onData, onError) {
+    if (file.arrayBuffer) {
+      // Use separate fulfillment/rejection handlers so an exception thrown by
+      // `onData` (e.g. a user `success` hook) is not mistaken for a read error
+      // and routed through the tolerant fallback twice.
+      file.arrayBuffer().then((arrayBuffer) => {
+        if (this.aborted || this.settled) {
+          return;
+        }
+
+        try {
+          onData(arrayBuffer);
+        } catch (err) {
+          this.fail(err);
+        }
+      }, (err) => {
+        if (this.aborted || this.settled) {
+          return;
+        }
+
+        onError(err);
+      });
+    } else {
+      this.readAsArrayBuffer(file, {
+        subject: 'original file',
+        onData,
+        onError: () => {
+          onError(new Error('Failed to read the original file with FileReader.'));
+        },
+      });
+    }
   }
 
   /**
@@ -440,7 +568,7 @@ export default class Compressor {
         // Defer to a macrotask so any `abort()` scheduled via `setTimeout()`
         // in a `drew()` hook has a chance to set `this.aborted` first
         setTimeout(() => {
-          if (this.aborted) return;
+          if (this.aborted || this.settled) return;
           this.fail(new Error('Failed to read the compressed image with `Blob.arrayBuffer()`.'));
         }, 0);
       });
@@ -453,6 +581,13 @@ export default class Compressor {
   }
 
   succeed(result) {
+    // Never settle twice (e.g. a late EXIF read resolving after `abort()`
+    // already reported the abort, or after a previous success).
+    if (this.settled) {
+      return;
+    }
+
+    this.settled = true;
     this.result = result;
 
     if (this.options.success) {
@@ -461,6 +596,12 @@ export default class Compressor {
   }
 
   fail(err) {
+    if (this.settled) {
+      return;
+    }
+
+    this.settled = true;
+
     const { options } = this;
 
     this.revokeUrl();
@@ -480,19 +621,27 @@ export default class Compressor {
   }
 
   abort() {
-    if (!this.aborted) {
-      this.aborted = true;
+    if (this.aborted) {
+      return;
+    }
 
-      if (this.reader) {
-        this.reader.abort();
-      } else if (!this.image.complete) {
-        this.image.onload = null;
-        this.image.onerror = null;
-        this.image.onabort = null;
-        this.fail(new Error('Aborted to load the image.'));
-      } else {
-        this.fail(new Error('The compression process has been aborted.'));
-      }
+    this.aborted = true;
+
+    // Completion was already delivered (or failed): record the abort request
+    // but never emit a second terminal notification.
+    if (this.settled) {
+      return;
+    }
+
+    if (this.reader) {
+      this.reader.abort();
+    } else if (!this.image.complete) {
+      this.image.onload = null;
+      this.image.onerror = null;
+      this.image.onabort = null;
+      this.fail(new Error('Aborted to load the image.'));
+    } else {
+      this.fail(new Error('The compression process has been aborted.'));
     }
   }
 
