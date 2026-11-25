@@ -1,3 +1,8 @@
+// These cases use `std::os::unix::fs::symlink`; on Windows symlink creation
+// needs extra privileges and the whole target is Unix-only. Gating the crate
+// keeps `cargo test` compiling out of the box on Windows.
+#![cfg(unix)]
+
 mod common;
 
 use std::time::Duration;
