@@ -95,6 +95,13 @@ export const de: Translations = {
     appleMaps: "Apple Karten",
     waze: "Waze",
   },
+  player: {
+    waitingForDownload: 'Diese Station wird heruntergeladen…',
+    audioUnavailable: 'Diese Audiodatei ist offline nicht verfügbar',
+    cancelDownload: 'Download abbrechen',
+    retryDownload: 'Download erneut versuchen',
+    retrying: 'Wird erneut versucht…',
+  },
   embed: {
     blocked: "Dieser Inhalt ist hier nicht verfügbar.",
   },

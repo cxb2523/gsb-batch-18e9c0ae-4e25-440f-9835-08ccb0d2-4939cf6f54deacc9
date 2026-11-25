@@ -95,6 +95,13 @@ export const es: Translations = {
     appleMaps: "Mapas",
     waze: "Waze",
   },
+  player: {
+    waitingForDownload: 'Descargando esta parada…',
+    audioUnavailable: 'Este audio no está disponible sin conexión',
+    cancelDownload: 'Cancelar descarga',
+    retryDownload: 'Reintentar descarga',
+    retrying: 'Reintentando…',
+  },
   embed: {
     blocked: "Este contenido no está disponible aquí.",
   },

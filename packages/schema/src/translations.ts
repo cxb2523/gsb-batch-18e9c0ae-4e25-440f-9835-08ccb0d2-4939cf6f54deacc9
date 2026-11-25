@@ -92,6 +92,13 @@ export interface Translations {
     appleMaps: string;
     waze: string;
   };
+  player: {
+    waitingForDownload: string;
+    audioUnavailable: string;
+    cancelDownload: string;
+    retryDownload: string;
+    retrying: string;
+  };
   embed: {
     blocked: string;
   };

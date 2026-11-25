@@ -43,6 +43,8 @@ import { useLanguageSelection } from './hooks/useLanguageSelection';
 import { useEagerAssetPreloader } from './hooks/useEagerAssetPreloader';
 import { useDeepLink } from './hooks/useDeepLink';
 import { useAutoResume } from './hooks/useAutoResume';
+import { useOnlineStatus } from './hooks/useOnlineStatus';
+import { usePlayableAudioUrl } from './hooks/usePlayableAudioUrl';
 import { TourProgressTracker } from './components/TourProgressTracker';
 import { ThemeColorSync } from './components/ThemeColorSync';
 import { StatusBarController } from './components/StatusBarController';
@@ -176,6 +178,9 @@ const App: React.FC<AppProps> = ({ frameless = false }) => {
   // Eager asset preloading hook
   const { assetsReady } = useEagerAssetPreloader({ tour });
 
+  // Offline/download coordination: one shared resource state per audio URL.
+  const isOnline = useOnlineStatus();
+
   // ?stop=<id> opens the tour at that stop without playing it, for any stop
   // type. Unlike the /tour/:tourId/:stopId deep link — audio only, and it
   // starts playback — this just shows the card, which is what an editor's preview
@@ -291,11 +296,18 @@ const App: React.FC<AppProps> = ({ frameless = false }) => {
   const playbackRate = showPlaybackSpeed ? chosenSpeed : 1;
   useApplyTextSize(tour?.showTextSize !== false);
 
+  // Resolve the current stop's audio through the shared resource registry:
+  // wait for an in-flight download, fall back online on cancel/failure, and
+  // expose a visible unavailable state when neither path can play.
+  const requestedAudioUrl = isTransitioning && tour?.transitionAudio
+    ? tour.transitionAudio
+    : (currentAudioStop?.audioFile || null);
+  const playable = usePlayableAudioUrl(requestedAudioUrl, isOnline);
+  const playerAudioUrl = playable.audioUrl;
+
   // Audio Player
   const audioPlayer = useAudioPlayer({
-    audioUrl: isTransitioning && tour?.transitionAudio
-      ? tour.transitionAudio
-      : (currentAudioStop?.audioFile || null),
+    audioUrl: playerAudioUrl,
     id: currentStopId || undefined,
     isPlaying,
     onEnded: handleAudioEnded,
@@ -497,6 +509,35 @@ const App: React.FC<AppProps> = ({ frameless = false }) => {
     onDownloadComplete: () => track('offline_download', { tourId: tour?.id, language: tour?.language }),
   });
 
+  // Banner actions for the mini player: cancel an in-flight download of the
+  // current stop, or retry one that failed. Both keep the stop selected.
+  const handleCurrentStatusAction = useCallback(() => {
+    const url = currentAudioStop?.audioFile;
+    if (!url) return;
+    const status = downloadManager.getResourceStatus(url);
+    if (status.state === 'downloading') {
+      void downloadManager.cancelDownload();
+    } else if (status.state === 'failed') {
+      void downloadManager.retryFailed();
+    }
+  }, [currentAudioStop?.audioFile, downloadManager]);
+
+  // What the mini player banner should show for the current stop.
+  const playerStatusKind = playable.isWaitingForDownload
+    ? ('waiting' as const)
+    : playable.isUnavailable
+      ? ('unavailable' as const)
+      : null;
+  const currentUrlStatus = currentAudioStop?.audioFile
+    ? downloadManager.getResourceStatus(currentAudioStop.audioFile)
+    : null;
+  const playerStatusActionKind =
+    playerStatusKind && currentUrlStatus?.state === 'downloading'
+      ? ('cancel' as const)
+      : playerStatusKind && currentUrlStatus?.state === 'failed'
+        ? ('retry' as const)
+        : null;
+
   // Memoize progress
   const tourProgress = useMemo(() => {
     if (!tour) return 0;
@@ -626,6 +667,9 @@ const App: React.FC<AppProps> = ({ frameless = false }) => {
                     isDownloaded={downloadManager.isDownloaded}
                     downloadProgress={downloadManager.downloadProgress.percentage}
                     onDownload={downloadManager.startDownload}
+                    onCancelDownload={() => void downloadManager.cancelDownload()}
+                    onRetryDownload={() => void downloadManager.retryFailed()}
+                    hasFailedDownloads={downloadManager.failedUrls.length > 0}
                     downloadError={downloadManager.error}
                     tourProgress={tourProgress}
                     onResetProgress={handleResetTour}
@@ -689,6 +733,11 @@ const App: React.FC<AppProps> = ({ frameless = false }) => {
                     duration={audioPlayer.duration}
                     onSeek={handleSeek}
                     showPlaybackSpeed={showPlaybackSpeed}
+                    isWaitingForDownload={playable.isWaitingForDownload}
+                    isAudioUnavailable={playable.isUnavailable}
+                    statusKind={playerStatusKind}
+                    statusActionKind={playerStatusActionKind}
+                    onStatusAction={handleCurrentStatusAction}
                   />
                 )}
               </AnimatePresence>

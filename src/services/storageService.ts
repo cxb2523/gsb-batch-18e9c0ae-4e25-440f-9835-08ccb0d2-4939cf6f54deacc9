@@ -187,6 +187,10 @@ export class StorageService {
         for (const url of downloaded.cachedAssets) {
           await cache.delete(url);
         }
+        // Keep the shared resource registry consistent with the now-deleted
+        // cache entries so the player/preloader don't believe they exist.
+        const { resetResourceUrls } = await import('./resourceRegistry');
+        resetResourceUrls(downloaded.cachedAssets);
       } catch (error) {
         console.error('Failed to clear cached assets:', error);
       }
@@ -201,11 +205,15 @@ export class StorageService {
     if ('caches' in window) {
       try {
         const cache = await caches.open('tour-assets');
+        const allUrls: string[] = [];
         for (const download of downloads) {
           for (const url of download.cachedAssets) {
             await cache.delete(url);
+            allUrls.push(url);
           }
         }
+        const { resetResourceUrls } = await import('./resourceRegistry');
+        resetResourceUrls(allUrls);
       } catch (error) {
         console.error('Failed to clear cached assets:', error);
       }

@@ -1,0 +1,27 @@
+{
+  "id": "_offline",
+  "language": "en",
+  "title": "Offline Coordination Fixture",
+  "description": "Hidden test-only tour for the offline download / audio preload / mini player coordination suite. Two audio stops point at local, route-mockable same-origin WAV addresses; never shown in the picker and excluded from production builds.",
+  "totalDuration": "2 minutes",
+  "totalStops": 2,
+  "transcriptAvailable": true,
+  "stops": [
+    {
+      "id": "audio-1",
+      "type": "audio",
+      "title": "First audio stop",
+      "duration": "0:30 mins",
+      "audioFile": "/test-assets/audio/stop-1.wav",
+      "transcription": "First audio stop used by the offline coordination tests."
+    },
+    {
+      "id": "audio-2",
+      "type": "audio",
+      "title": "Second audio stop",
+      "duration": "0:20 mins",
+      "audioFile": "/test-assets/audio/stop-2.wav",
+      "transcription": "Second audio stop used by the offline coordination tests."
+    }
+  ]
+}

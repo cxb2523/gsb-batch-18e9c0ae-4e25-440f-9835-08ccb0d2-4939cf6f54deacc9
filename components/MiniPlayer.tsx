@@ -16,6 +16,7 @@ import { PlaybackSpeedButton } from './player/PlaybackSpeedButton';
 import { RichText } from './RichText';
 import { ProgressRing } from './player/ProgressRing';
 import { iconVariants, iconTransition } from '../src/animations/variants';
+import { useTranslation } from '../src/translations';
 
 const FullscreenPlayerContent = lazy(() => import('../screens/FullscreenPlayer').then(m => ({ default: m.FullscreenPlayerContent })));
 
@@ -55,6 +56,15 @@ interface MiniPlayerProps {
   prevStopImage?: string;
   /** Show the playback speed control (tour setting `showPlaybackSpeed`, default true). */
   showPlaybackSpeed?: boolean;
+  /** Download coordination: show a visible banner while the stop is downloading. */
+  isWaitingForDownload?: boolean;
+  /** Download coordination: visible banner when the stop cannot play offline. */
+  isAudioUnavailable?: boolean;
+  /** Which banner text to render (resolved through i18n inside the player). */
+  statusKind?: 'waiting' | 'unavailable' | null;
+  /** Optional banner action: cancel the in-flight download or retry a failed one. */
+  statusActionKind?: 'cancel' | 'retry' | null;
+  onStatusAction?: () => void;
 }
 
 // Root wrapper — display:contents so children position against the MobileFrame parent
@@ -231,6 +241,28 @@ const EmptyStateText = styled.p`
   margin: 0;
 `;
 
+// Download-coordination banner: visible while a stop is still downloading or
+// when it cannot be played offline (failure/cancel with no connection).
+const StatusBanner = styled.div<{ $unavailable?: boolean }>`
+  ${tw`mx-6 mt-2 mb-1 px-4 py-2 rounded-2xl flex items-center justify-center gap-3 flex-wrap`}
+  background-color: ${({ theme, $unavailable }) =>
+    $unavailable ? `${theme.status.error}18` : `${theme.miniPlayer.textColor}14`};
+  border: 1px solid
+    ${({ theme, $unavailable }) =>
+      $unavailable ? `${theme.status.error}45` : `${theme.colors.border?.light || 'rgba(0,0,0,0.12)'}`};
+`;
+
+const StatusBannerText = styled.span<{ $unavailable?: boolean }>`
+  ${tw`text-xs font-medium text-center`}
+  color: ${({ theme, $unavailable }) =>
+    $unavailable ? theme.status.error : theme.miniPlayer.textColor};
+`;
+
+const StatusBannerButton = styled.button`
+  ${tw`text-xs font-semibold underline underline-offset-2 bg-transparent border-0 p-0`}
+  color: ${({ theme }) => theme.miniPlayer.textColor};
+`;
+
 // Fullscreen overlay — separate layer, slides up from bottom (like Spotify/Apple Music)
 const FullscreenOverlay = styled(motion.div)`
   ${tw`absolute inset-0 z-[80] overflow-hidden`}
@@ -290,7 +322,25 @@ export const MiniPlayer = React.memo<MiniPlayerProps>(({
   nextStopImage,
   prevStopImage,
   showPlaybackSpeed = true,
+  isWaitingForDownload = false,
+  isAudioUnavailable = false,
+  statusKind = null,
+  statusActionKind = null,
+  onStatusAction,
 }) => {
+  const { t } = useTranslation();
+  const statusMessage =
+    statusKind === 'waiting'
+      ? t.player.waitingForDownload
+      : statusKind === 'unavailable'
+        ? t.player.audioUnavailable
+        : null;
+  const statusActionLabel =
+    statusActionKind === 'cancel'
+      ? t.player.cancelDownload
+      : statusActionKind === 'retry'
+        ? t.player.retryDownload
+        : null;
   // Use external state if provided, otherwise fall back to local state
   const [localIsExpanded, setLocalIsExpanded] = useState(true);
   const isExpanded = externalIsExpanded !== undefined ? externalIsExpanded : localIsExpanded;
@@ -632,6 +682,29 @@ export const MiniPlayer = React.memo<MiniPlayerProps>(({
                   transition={{ duration: 0.25, opacity: { duration: 0.15 } }}
                 >
                   <ExpandedInner>
+                    {/* Download coordination: wait or visible offline failure */}
+                    {(isWaitingForDownload || isAudioUnavailable) && statusMessage && (
+                      <StatusBanner
+                        data-testid="player-status-banner"
+                        $unavailable={isAudioUnavailable}
+                      >
+                        <StatusBannerText $unavailable={isAudioUnavailable}>
+                          {statusMessage}
+                        </StatusBannerText>
+                        {statusActionLabel && onStatusAction && (
+                          <StatusBannerButton
+                            data-testid="player-status-action"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onStatusAction();
+                            }}
+                            onPointerDownCapture={(e) => e.stopPropagation()}
+                          >
+                            {statusActionLabel}
+                          </StatusBannerButton>
+                        )}
+                      </StatusBanner>
+                    )}
                     {/* Controls Row */}
                     <ControlsRow>
                       {showPlaybackSpeed && <SpeedButtonInRow />}
@@ -733,6 +806,28 @@ export const MiniPlayer = React.memo<MiniPlayerProps>(({
                     exit: { duration: 0.1, ease: "easeOut" }
                   }}
                 >
+                  {(isWaitingForDownload || isAudioUnavailable) && statusMessage && (
+                    <StatusBanner
+                      data-testid="player-status-banner"
+                      $unavailable={isAudioUnavailable}
+                    >
+                      <StatusBannerText $unavailable={isAudioUnavailable}>
+                        {statusMessage}
+                      </StatusBannerText>
+                      {statusActionLabel && onStatusAction && (
+                        <StatusBannerButton
+                          data-testid="player-status-action"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onStatusAction();
+                          }}
+                          onPointerDownCapture={(e) => e.stopPropagation()}
+                        >
+                          {statusActionLabel}
+                        </StatusBannerButton>
+                      )}
+                    </StatusBanner>
+                  )}
                   <MinimizedInner>
                     <MinimizedTitleSection
                       onClick={(e) => {
@@ -832,6 +927,10 @@ export const MiniPlayer = React.memo<MiniPlayerProps>(({
     prevProps.currentTime === nextProps.currentTime &&
     prevProps.duration === nextProps.duration &&
     prevProps.tourTitle === nextProps.tourTitle &&
-    prevProps.showPlaybackSpeed === nextProps.showPlaybackSpeed
+    prevProps.showPlaybackSpeed === nextProps.showPlaybackSpeed &&
+    prevProps.isWaitingForDownload === nextProps.isWaitingForDownload &&
+    prevProps.isAudioUnavailable === nextProps.isAudioUnavailable &&
+    prevProps.statusKind === nextProps.statusKind &&
+    prevProps.statusActionKind === nextProps.statusActionKind
   );
 });

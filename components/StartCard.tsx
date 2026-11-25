@@ -23,6 +23,9 @@ interface StartCardProps {
   isDownloaded?: boolean;
   downloadProgress?: number;
   onDownload?: () => void;
+  onCancelDownload?: () => void;
+  onRetryDownload?: () => void;
+  hasFailedDownloads?: boolean;
   downloadError?: string | null;
   tourProgress?: number;
   onResetProgress?: () => void;
@@ -208,6 +211,9 @@ export const StartCard = React.memo<StartCardProps>(({
   isDownloaded = false,
   downloadProgress = 0,
   onDownload,
+  onCancelDownload,
+  onRetryDownload,
+  hasFailedDownloads = false,
   downloadError = null,
   tourProgress = 0,
   onResetProgress,
@@ -370,6 +376,17 @@ export const StartCard = React.memo<StartCardProps>(({
               <CloudSlashIcon size={18} weight="bold" />
               {t.startCard.availableOffline}
             </OfflineStatus>
+          ) : hasFailedDownloads && onRetryDownload ? (
+            <DownloadButton
+              onClick={(e) => {
+                e.stopPropagation();
+                triggerHaptic();
+                onRetryDownload();
+              }}
+            >
+              <CloudArrowDownIcon size={20} weight="bold" />
+              {t.errors.retry}
+            </DownloadButton>
           ) : onDownload && (
             <DownloadButton
               onClick={(e) => {
@@ -383,6 +400,21 @@ export const StartCard = React.memo<StartCardProps>(({
             </DownloadButton>
           )}
         </>
+      )}
+
+      {/* While a download runs, offer an explicit cancel that releases the
+          partial cache instead of leaving orphaned bytes behind. */}
+      {offlineMode === 'optional' && isDownloading && onCancelDownload && (
+        <DownloadButton
+          onClick={(e) => {
+            e.stopPropagation();
+            triggerHaptic();
+            onCancelDownload();
+          }}
+        >
+          <CloudSlashIcon size={20} weight="bold" />
+          {t.player.cancelDownload}
+        </DownloadButton>
       )}
 
       {/* Offline status for offline-only mode when downloaded */}
@@ -404,6 +436,7 @@ export const StartCard = React.memo<StartCardProps>(({
     prevProps.isDownloaded === nextProps.isDownloaded &&
     prevProps.downloadProgress === nextProps.downloadProgress &&
     prevProps.tourProgress === nextProps.tourProgress &&
-    prevProps.downloadError === nextProps.downloadError
+    prevProps.downloadError === nextProps.downloadError &&
+    prevProps.hasFailedDownloads === nextProps.hasFailedDownloads
   );
 });

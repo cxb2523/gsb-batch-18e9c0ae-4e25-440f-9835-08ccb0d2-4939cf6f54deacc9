@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { TourData } from '../types';
 import { UseAudioPlayerReturn } from './useAudioPlayer';
+import { getResourceStatus, subscribe } from '../src/services/resourceRegistry';
 
 export interface UseAudioPlaybackSyncProps {
   audioPlayer: UseAudioPlayerReturn;
@@ -112,10 +113,11 @@ export const useAudioPlaybackSync = ({
 
     const audioUrl = openingStop.audioFile;
     const audio = audioPlayer.audioElement;
+    const absoluteUrl = new URL(audioUrl, window.location.href).href;
 
     // Already loaded (e.g. useAudioPlayer already set this exact stop) — don't
     // reload it, that would reset playback position/buffering for no reason.
-    if (audio.src === new URL(audioUrl, window.location.href).href) {
+    if (audio.src === absoluteUrl) {
       hasPreloadedSingletonRef.current = true;
       return;
     }
@@ -123,19 +125,42 @@ export const useAudioPlaybackSync = ({
     // Only preload if not already playing something
     if (audio.src && !audio.paused) return;
 
-    audio.src = audioUrl;
-    audio.load();
-
-    const handleCanPlay = () => {
+    const wireSingleton = () => {
       hasPreloadedSingletonRef.current = true;
-      audio.removeEventListener('canplay', handleCanPlay);
+      // Assigning src is enough for the element to be "preloaded with a
+      // source". When the bytes are in the shared cache this resolves locally;
+      // useAudioPlayer drives the actual playback.
+      if (audio.src !== absoluteUrl) {
+        audio.src = audioUrl;
+      }
     };
 
-    audio.addEventListener('canplay', handleCanPlay);
+    const registryState = getResourceStatus(absoluteUrl).state;
 
-    return () => {
-      audio.removeEventListener('canplay', handleCanPlay);
-    };
+    // A download for this exact URL is in flight: don't open a competing media
+    // request. Wire the singleton only once it settles (cache hit) so the
+    // player waits instead of double-fetching.
+    if (registryState === 'downloading') {
+      const unsubscribe = subscribe((changedUrl, status) => {
+        if (changedUrl !== absoluteUrl) return;
+        if (status.state === 'cached' || status.state === 'failed' || status.state === 'idle') {
+          unsubscribe();
+          if (!hasPreloadedSingletonRef.current) wireSingleton();
+        }
+      }, absoluteUrl);
+      return unsubscribe;
+    }
+
+    // cached (local) or idle/failed (normal online streaming warmup).
+    wireSingleton();
+    if (registryState !== 'cached') {
+      audio.load();
+      const handleCanPlay = () => {
+        audio.removeEventListener('canplay', handleCanPlay);
+      };
+      audio.addEventListener('canplay', handleCanPlay);
+      return () => audio.removeEventListener('canplay', handleCanPlay);
+    }
   }, [tour, assetsReady, audioPlayer.audioElement, currentStopId]);
 
   // ---------------------------------------------------------------------------

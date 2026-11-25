@@ -1,5 +1,9 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { AudioStop } from '../types';
+import {
+  getResourceStatus,
+  ensureDownload,
+} from '../src/services/resourceRegistry';
 
 const DEBUG_PRELOAD = import.meta.env.VITE_DEBUG_AUDIO === 'true' || import.meta.env.DEV;
 
@@ -33,6 +37,98 @@ const checkPerformance = (effectName: string) => {
   }
 };
 
+/**
+ * Shared preload logic used by both the eager (pre-hook) loader and the
+ * in-tour hook. The ResourceRegistry is consulted first so a URL that is
+ * cached or already downloading is never fetched a second time:
+ *
+ * - cached       → create the media element against the cached URL (no fetch)
+ * - downloading  → wait for the shared download, then create the element
+ * - failed       → let the media element retry over the network
+ * - idle         → register the preload as the URL's single in-flight fetch via
+ *                  `ensureDownload`; a download manager starting for the same
+ *                  address joins this promise instead of opening a second
+ *                  request, and the bytes land in the shared cache either way.
+ *
+ * A module-level map additionally de-duplicates two callers racing for the
+ * same URL before any registry state exists.
+ */
+const inflightPreloads = new Map<string, Promise<void>>();
+
+export const preloadAudioUrl = (url: string): Promise<void> => {
+  const existing = inflightPreloads.get(url);
+  if (existing) {
+    debugLog('♻️ Joining in-flight preload:', url);
+    return existing;
+  }
+
+  const task = (async () => {
+    const status = getResourceStatus(url);
+    let registrySatisfied = false;
+
+    if (status.state === 'cached') {
+      debugLog('♻️ Preload reuses cached asset:', url);
+      registrySatisfied = true;
+    } else {
+      // idle / downloading / failed → go through the registry so the network
+      // fetch happens at most once per address and its result fills the shared
+      // cache. On failure (e.g. offline), fall through to a media-element load
+      // below, which surfaces the failure to the player instead of throwing.
+      try {
+        await ensureDownload(url);
+        debugLog('✅ Preload populated/joined shared cache:', url);
+        registrySatisfied = true;
+      } catch (err) {
+        debugLog('⚠️ Registry download unavailable, media element will retry online:', url, err);
+      }
+    }
+
+    // When the bytes are already in the shared cache, creating another
+    // HTMLAudioElement would just re-request the same address (the old
+    // duplicate-fetch bug). The player's singleton loads the cached URL itself
+    // when playback starts, so nothing else is needed here.
+    if (registrySatisfied) {
+      return;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      debugLog('⏳ Preloading audio element (online fallback):', url);
+      const audio = new Audio();
+      audio.preload = 'auto';
+
+      const handleCanPlayThrough = () => {
+        debugLog('✅ Audio preloaded:', url);
+        cleanup();
+        // Release the element; the player's singleton loads the same URL from
+        // the HTTP/cache layer when playback starts.
+        audio.src = '';
+        resolve();
+      };
+
+      const handleError = (e: Event) => {
+        debugLog('❌ Audio preload failed:', url, e);
+        cleanup();
+        reject(e);
+      };
+
+      const cleanup = () => {
+        audio.removeEventListener('canplaythrough', handleCanPlayThrough);
+        audio.removeEventListener('error', handleError);
+      };
+
+      audio.addEventListener('canplaythrough', handleCanPlayThrough, { once: true });
+      audio.addEventListener('error', handleError, { once: true });
+
+      audio.src = url;
+      audio.load();
+    });
+  })();
+
+  inflightPreloads.set(url, task);
+  task.finally(() => inflightPreloads.delete(url));
+  return task;
+};
+
 // Standalone preload functions for eager loading (before hook initialization)
 // These are stateless and can be called directly from App.tsx
 export const eagerPreloadImage = (url: string): Promise<void> => {
@@ -51,36 +147,7 @@ export const eagerPreloadImage = (url: string): Promise<void> => {
   });
 };
 
-export const eagerPreloadAudio = (url: string): Promise<void> => {
-  return new Promise((resolve, reject) => {
-    debugLog('[EAGER] ⏳ Preloading audio:', url);
-    const audio = new Audio();
-    audio.preload = 'auto';
-
-    const handleCanPlayThrough = () => {
-      debugLog('[EAGER] ✅ Audio preloaded:', url);
-      cleanup();
-      resolve();
-    };
-
-    const handleError = (e: Event) => {
-      debugLog('[EAGER] ❌ Audio preload failed:', url, e);
-      cleanup();
-      reject(e);
-    };
-
-    const cleanup = () => {
-      audio.removeEventListener('canplaythrough', handleCanPlayThrough);
-      audio.removeEventListener('error', handleError);
-    };
-
-    audio.addEventListener('canplaythrough', handleCanPlayThrough, { once: true });
-    audio.addEventListener('error', handleError, { once: true });
-
-    audio.src = url;
-    audio.load();
-  });
-};
+export const eagerPreloadAudio = (url: string): Promise<void> => preloadAudioUrl(url);
 
 interface UseAudioPreloaderOptions {
   audioPlaylist: AudioStop[];
@@ -139,37 +206,62 @@ export const useAudioPreloader = ({
         return;
       }
 
-      debugLog('⏳ Preloading:', url);
-      const audio = new Audio();
-      audio.preload = 'auto';
-      
-      const entry: PreloadedAudio = { url, audio, loaded: false };
-      preloadedRef.current.set(url, entry);
+      const startMediaLoad = () => {
+        debugLog('⏳ Preloading:', url);
+        const audio = new Audio();
+        audio.preload = 'auto';
 
-      const handleCanPlayThrough = () => {
-        entry.loaded = true;
-        debugLog('✅ Preloaded:', url);
-        cleanup();
-        resolve(audio);
+        const entry: PreloadedAudio = { url, audio, loaded: false };
+        preloadedRef.current.set(url, entry);
+
+        const handleCanPlayThrough = () => {
+          entry.loaded = true;
+          debugLog('✅ Preloaded:', url);
+          cleanup();
+          resolve(audio);
+        };
+
+        const handleError = (e: Event) => {
+          debugLog('❌ Preload failed:', url, e);
+          preloadedRef.current.delete(url);
+          cleanup();
+          reject(e);
+        };
+
+        const cleanup = () => {
+          audio.removeEventListener('canplaythrough', handleCanPlayThrough);
+          audio.removeEventListener('error', handleError);
+        };
+
+        audio.addEventListener('canplaythrough', handleCanPlayThrough, { once: true });
+        audio.addEventListener('error', handleError, { once: true });
+
+        audio.src = url;
+        audio.load();
       };
 
-      const handleError = (e: Event) => {
-        debugLog('❌ Preload failed:', url, e);
-        preloadedRef.current.delete(url);
-        cleanup();
-        reject(e);
-      };
-
-      const cleanup = () => {
-        audio.removeEventListener('canplaythrough', handleCanPlayThrough);
-        audio.removeEventListener('error', handleError);
-      };
-
-      audio.addEventListener('canplaythrough', handleCanPlayThrough, { once: true });
-      audio.addEventListener('error', handleError, { once: true });
-      
-      audio.src = url;
-      audio.load();
+      // Registry coordination: never open a second request for an address the
+      // download manager already owns.
+      const status = getResourceStatus(url);
+      if (status.state === 'cached') {
+        // The service worker/Cache layer serves this instantly; the media
+        // element still needs creating, but no network fetch is made.
+        debugLog('♻️ Reusing cached asset for preload:', url);
+        startMediaLoad();
+      } else if (status.state === 'downloading') {
+        debugLog('⏳ Preload joins in-flight download:', url);
+        ensureDownload(url)
+          .then(() => startMediaLoad())
+          .catch((err) => {
+            // Cancelled or failed: fall back to a direct online load instead
+            // of swallowing the stop.
+            debugLog('⚠️ Download unavailable, preloading online:', url, err);
+            startMediaLoad();
+          });
+      } else {
+        // idle / failed → normal streaming preload (or online retry).
+        startMediaLoad();
+      }
     });
   }, []);
 

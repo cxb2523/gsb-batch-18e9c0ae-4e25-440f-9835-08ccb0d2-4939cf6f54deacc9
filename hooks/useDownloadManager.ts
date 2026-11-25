@@ -1,7 +1,15 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { TourData } from '../types';
 import { storageService } from '../src/services/storageService';
 import { extractTourAssetUrls } from '../src/services/tourAssets';
+import {
+  ensureDownload,
+  cancelDownload as cancelResourceDownload,
+  getResourceStatus,
+  hydrateResourceRegistry,
+  subscribe,
+  type ResourceStatus,
+} from '../src/services/resourceRegistry';
 
 interface DownloadProgress {
   downloaded: number;
@@ -14,16 +22,29 @@ interface UseDownloadManagerReturn {
   isDownloaded: boolean;
   downloadProgress: DownloadProgress;
   startDownload: () => Promise<void>;
+  /** Abort every in-flight asset of this tour and release partial data. */
+  cancelDownload: () => Promise<void>;
+  /** Re-attempt only the URLs that previously failed. */
+  retryFailed: () => Promise<void>;
   error: string | null;
+  failedUrls: string[];
+  /** Imperative per-URL state query: 'idle' | 'downloading' | 'cached' | 'failed'. */
+  getResourceStatus: (url: string) => ResourceStatus;
 }
 
 interface UseDownloadManagerOptions {
   onDownloadComplete?: () => void;
 }
 
+const CONCURRENT_DOWNLOADS = 4;
+
 /**
- * Hook to manage offline tour downloads
- * Extracts all assets from tour data and caches them for offline use
+ * Hook to manage offline tour downloads.
+ *
+ * All per-URL state lives in the shared ResourceRegistry, so the download
+ * manager, the audio preloader and the mini player observe the exact same
+ * lifecycle for any audio address: one cache entry per URL, visible
+ * progress/failure/cancellation, and no duplicate fetches.
  */
 export const useDownloadManager = (
   tour: TourData | null,
@@ -32,6 +53,7 @@ export const useDownloadManager = (
   const { onDownloadComplete } = options || {};
   const [isDownloading, setIsDownloading] = useState(false);
   const [isDownloaded, setIsDownloaded] = useState(false);
+  const [failedUrls, setFailedUrls] = useState<string[]>([]);
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgress>({
     downloaded: 0,
     total: 0,
@@ -39,81 +61,84 @@ export const useDownloadManager = (
   });
   const [error, setError] = useState<string | null>(null);
 
-  // Check if tour is already downloaded (per language)
+  const cancelledRef = useRef(false);
+  const runningRef = useRef(false);
+  const onDownloadCompleteRef = useRef(onDownloadComplete);
   useEffect(() => {
-    const checkDownloadStatus = async () => {
-      if (!tour) return;
-
-      try {
-        const downloaded = await storageService.isTourDownloaded(tour.id, tour.language);
-        setIsDownloaded(downloaded);
-      } catch (err) {
-        console.error('Failed to check download status:', err);
-      }
-    };
-
-    checkDownloadStatus();
-  }, [tour]);
+    onDownloadCompleteRef.current = onDownloadComplete;
+  }, [onDownloadComplete]);
 
   /** Every file the tour needs offline (see src/services/tourAssets.ts). */
-  const extractAssetUrls = useCallback((tourData: TourData): string[] => extractTourAssetUrls(tourData), []);
+  const extractAssetUrls = useCallback(
+    (tourData: TourData): string[] => extractTourAssetUrls(tourData),
+    []
+  );
 
   /**
-   * Download and cache a single asset
+   * Recompute the aggregate view (progress, failed URLs, completion) from the
+   * registry's per-URL states. The registry is the source of truth, so this
+   * works for downloads started in a previous component instance too.
    */
-  const downloadAsset = async (url: string, cache: Cache): Promise<boolean> => {
-    try {
-      console.log(`📥 Starting download for: ${url}`);
-
-      // Check if already cached
-      const cached = await cache.match(url);
-      if (cached) {
-        console.log(`✅ Asset already cached: ${url}`);
-        return true;
-      }
-
-      // Fetch and cache the asset
-      // Use cors mode explicitly to ensure we don't get opaque responses which break RangeRequests
-      const response = await fetch(url, { mode: 'cors' });
-
-      console.log(`🌐 Fetch status for ${url}: ${response.status} ${response.statusText}, type: ${response.type}`);
-
-      if (!response.ok) {
-        console.warn(`❌ Failed to fetch asset: ${url} (${response.status})`);
-        return false;
-      }
-
-      if (response.type === 'opaque') {
-        console.warn(`⚠️ Opaque response received for ${url}. Range requests will fail! Check CORS headers.`);
-      }
-
-      // Clone the response before caching (response can only be read once)
-      await cache.put(url, response.clone());
-
-      // Verify it was actually cached
-      const verifyCache = await cache.match(url);
-      if (verifyCache) {
-        console.log(`✅ Successfully cached and verified: ${url}`);
-        return true;
-      } else {
-        console.error(`❌ Cache put appeared to succeed but item not found in cache: ${url}`);
-        return false;
-      }
-    } catch (err) {
-      console.error(`❌ Error downloading asset ${url}:`, err);
-      return false;
-    }
-  };
-
-  /**
-   * Start downloading all tour assets
-   */
-  const startDownload = useCallback(async () => {
-    if (!tour || isDownloading || isDownloaded) {
+  const recompute = useCallback((tourData: TourData) => {
+    const assetUrls = extractAssetUrls(tourData);
+    if (assetUrls.length === 0) {
+      setDownloadProgress({ downloaded: 0, total: 0, percentage: 0 });
+      setIsDownloaded(false);
+      setFailedUrls([]);
       return;
     }
 
-    // Check if Cache API is available (requires HTTPS or localhost)
+    let cachedCount = 0;
+    let inFlightFraction = 0;
+    const failed: string[] = [];
+    let anyDownloading = false;
+
+    for (const url of assetUrls) {
+      const status = getResourceStatus(url);
+      if (status.state === 'cached') {
+        cachedCount++;
+      } else if (status.state === 'failed') {
+        failed.push(url);
+      } else if (status.state === 'downloading') {
+        anyDownloading = true;
+        inFlightFraction += (status.progress ?? 0) / 100;
+      }
+    }
+
+    const doneEquivalent = cachedCount + inFlightFraction;
+    setDownloadProgress({
+      downloaded: cachedCount,
+      total: assetUrls.length,
+      percentage: Math.round((doneEquivalent / assetUrls.length) * 100),
+    });
+    setFailedUrls(failed);
+    setIsDownloading(anyDownloading);
+    setIsDownloaded(cachedCount === assetUrls.length);
+  }, [extractAssetUrls]);
+
+  // Hydrate the registry from Cache Storage, then reconcile this tour's view
+  // and keep it updated on every registry change.
+  useEffect(() => {
+    if (!tour) return;
+    let disposed = false;
+
+    hydrateResourceRegistry().then(() => {
+      if (!disposed) recompute(tour);
+    });
+
+    const unsubscribe = subscribe(() => {
+      if (!disposed) recompute(tour);
+    });
+
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, [tour, recompute]);
+
+  const runDownload = useCallback(async (urls: string[]) => {
+    if (!tour || runningRef.current) return;
+
     if (!('caches' in window)) {
       const errorMsg = 'Cache API not available. Offline downloads require HTTPS or localhost.';
       console.error('❌', errorMsg);
@@ -121,98 +146,118 @@ export const useDownloadManager = (
       return;
     }
 
+    runningRef.current = true;
+    cancelledRef.current = false;
     setIsDownloading(true);
     setError(null);
+    recompute(tour);
 
     try {
-      // Extract all asset URLs
-      const assetUrls = extractAssetUrls(tour);
+      // Skip URLs already cached — that is the "same address keeps one copy"
+      // guarantee; retrying after a partial failure only re-fetches the rest.
+      const pending = urls.filter((url) => getResourceStatus(url).state !== 'cached');
 
-      if (assetUrls.length === 0) {
-        console.warn('No assets to download');
-        setIsDownloading(false);
+      for (let i = 0; i < pending.length; i += CONCURRENT_DOWNLOADS) {
+        if (cancelledRef.current) break;
+        const batch = pending.slice(i, i + CONCURRENT_DOWNLOADS);
+
+        await Promise.all(
+          batch.map(async (url) => {
+            try {
+              await ensureDownload(url);
+            } catch (err) {
+              // Cancellation and genuine failure both land in the registry's
+              // state (idle / failed); recompute() reads it. Nothing to do here
+              // except let the batch settle.
+              if (!cancelledRef.current) {
+                console.warn('❌ Asset download failed:', url, err);
+              }
+            }
+          })
+        );
+      }
+
+      if (cancelledRef.current) {
+        // User cancelled: registry has already removed every partial entry.
         return;
       }
 
-      // Initialize progress
-      setDownloadProgress({
-        downloaded: 0,
-        total: assetUrls.length,
-        percentage: 0,
-      });
-
-      // Open cache
+      // Persist the set that really made it to the cache, plus its size, so
+      // storage cleanup (removeTourDownload) knows what to delete later.
+      const assetUrls = extractAssetUrls(tour);
+      const cachedUrls = assetUrls.filter((url) => getResourceStatus(url).state === 'cached');
       const cache = await caches.open('tour-assets');
-
-      // Download assets in parallel batches for better performance
-      const CONCURRENT_DOWNLOADS = 4;
-      let downloadedCount = 0;
-      const successfullyDownloaded: string[] = [];
-
-      // Process in batches of CONCURRENT_DOWNLOADS
-      for (let i = 0; i < assetUrls.length; i += CONCURRENT_DOWNLOADS) {
-        const batch = assetUrls.slice(i, i + CONCURRENT_DOWNLOADS);
-
-        const results = await Promise.all(
-          batch.map(async (url) => {
-            const success = await downloadAsset(url, cache);
-            return { url, success };
-          })
-        );
-
-        // Process batch results
-        for (const { url, success } of results) {
-          if (success) {
-            successfullyDownloaded.push(url);
-          }
-          downloadedCount++;
-        }
-
-        // Update progress after each batch
-        setDownloadProgress({
-          downloaded: downloadedCount,
-          total: assetUrls.length,
-          percentage: Math.round((downloadedCount / assetUrls.length) * 100),
-        });
-      }
-
-      // Calculate total size in parallel
       const sizes = await Promise.all(
-        successfullyDownloaded.map(async (url) => {
+        cachedUrls.map(async (url) => {
           const cached = await cache.match(url);
           return cached ? (await cached.blob()).size : 0;
         })
       );
       const totalSize = sizes.reduce((a, b) => a + b, 0);
+      await storageService.markTourDownloaded(tour.id, cachedUrls, totalSize, tour.language);
 
-      // Mark tour as downloaded in IndexedDB (per language)
-      await storageService.markTourDownloaded(
-        tour.id,
-        successfullyDownloaded,
-        totalSize,
-        tour.language
-      );
-
-      setIsDownloaded(true);
-
-      // Call completion callback if provided
-      if (onDownloadComplete) {
-        onDownloadComplete();
+      const failed = assetUrls.filter((url) => getResourceStatus(url).state === 'failed');
+      if (failed.length > 0) {
+        setError(`Download failed for ${failed.length} of ${assetUrls.length} files. Retry to try again.`);
+      } else if (onDownloadCompleteRef.current) {
+        onDownloadCompleteRef.current();
       }
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : 'Unknown error';
       setError(`Download failed: ${errorMessage}`);
       console.error('Download error:', err);
     } finally {
-      setIsDownloading(false);
+      runningRef.current = false;
+      recompute(tour);
     }
-  }, [tour, isDownloading, isDownloaded, extractAssetUrls, onDownloadComplete]);
+  }, [tour, recompute, extractAssetUrls]);
+
+  const startDownload = useCallback(async () => {
+    if (!tour) return;
+    // Already fully cached, or a run is in flight (possibly from a remounted
+    // hook instance) — never start a second competing download.
+    const assetUrls = extractAssetUrls(tour);
+    if (runningRef.current || assetUrls.every((url) => getResourceStatus(url).state === 'cached')) {
+      return;
+    }
+    await runDownload(assetUrls);
+  }, [tour, extractAssetUrls, runDownload]);
+
+  const cancelDownload = useCallback(async () => {
+    if (!tour) return;
+    cancelledRef.current = true;
+
+    // Abort every asset of this tour that is still in flight. The registry
+    // deletes the partial cache entries as each abort settles.
+    const assetUrls = extractAssetUrls(tour);
+    await Promise.all(assetUrls.map((url) => cancelResourceDownload(url)));
+
+    setError(null);
+    recompute(tour);
+  }, [tour, extractAssetUrls, recompute]);
+
+  const retryFailed = useCallback(async () => {
+    if (!tour || runningRef.current) return;
+    // Retry everything that is not safely cached: explicit `failed` URLs plus
+    // any `idle` URLs a previous interrupted run never reached. `runDownload`
+    // itself filters out cached URLs, so this converges on a full download.
+    const pending = extractAssetUrls(tour).filter(
+      (url) => getResourceStatus(url).state !== 'cached'
+    );
+    if (pending.length === 0) return;
+    setError(null);
+    await runDownload(pending);
+  }, [tour, extractAssetUrls, runDownload]);
 
   return {
     isDownloading,
     isDownloaded,
     downloadProgress,
     startDownload,
+    cancelDownload,
+    retryFailed,
     error,
+    failedUrls,
+    getResourceStatus,
   };
 };

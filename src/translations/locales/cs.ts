@@ -95,6 +95,13 @@ export const cs: Translations = {
     appleMaps: "Apple Maps",
     waze: "Waze",
   },
+  player: {
+    waitingForDownload: 'Stahování této zastávky…',
+    audioUnavailable: 'Tento zvuk není offline k dispozici',
+    cancelDownload: 'Zrušit stahování',
+    retryDownload: 'Zkusit stahování znovu',
+    retrying: 'Opakování…',
+  },
   embed: {
     blocked: "Tento obsah zde není dostupný.",
   },
