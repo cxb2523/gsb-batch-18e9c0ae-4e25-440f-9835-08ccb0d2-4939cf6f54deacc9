@@ -33,24 +33,31 @@
   const hostCmd = (action, extra) => fetch("api/headhost", {method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({action, settings: {sens: st.sens, res: st.res}, ...(extra || {})})}).then(r => r.json()).catch(() => ({ok: false}));
 
-  const filter = new HF.Filter(st.sens);
-  let run = null;                 // the running tracker: {stream, lm, stop}
+  // `filter` is rebuilt for every session (a source switch included), so a new source always starts from the current
+  // sensitivity settings and never inherits the old session's centring baseline.
+  let filter = new HF.Filter(st.sens);
+  const freshStats = () => ({fps: 0, ms: 0, frames: 0, t0: 0, face: false, lastFace: 0, sent: 0, err: 0});
+  let run = null;                 // the one live session: local {stream,…} or remote {remote, poll,…}; null when off
   let lm = null, lmProc = null;   // the face model, once loaded
-  let stats = {fps: 0, ms: 0, frames: 0, t0: 0, face: false, lastFace: 0, sent: 0, err: 0};
+  let stats = freshStats();
   let last = {raw: null, out: null, rel: null};
   let sweep = null;
   const say = (text, bad) => { const e = $("hStatus"); if (e) { e.textContent = text; e.classList.toggle("bad", !!bad); } };
 
   // ---------------------------------------------------------------- sending to the game
+  // The queue is deliberately "newest pose only". A stop calls discardPendingSends(): an unsent pose waiting behind an
+  // in-flight request belongs to the dead session and must never be sent by that request's completion.
   let inFlight = false, pending = null;
   function send(out) {
     pending = out;
     if (inFlight) return;                                       // never queue: the newest pose is sent when the last request is done
     inFlight = true;
     const body = JSON.stringify({...pending, on: true}); pending = null;
-    fetch("api/head", {method: "POST", headers: {"Content-Type": "application/json"}, body}).then(r => { if (!r.ok) stats.err++; else stats.sent++; })
-      .catch(() => { stats.err++; }).finally(() => { inFlight = false; if (pending) send(pending); });
+    const st0 = stats;                                          // a late answer counts against the session that sent it, not the next one
+    fetch("api/head", {method: "POST", headers: {"Content-Type": "application/json"}, body}).then(r => { if (!r.ok) st0.err++; else st0.sent++; })
+      .catch(() => { st0.err++; }).finally(() => { inFlight = false; if (pending) send(pending); });
   }
+  function discardPendingSends() { pending = null; }
 
   // ---------------------------------------------------------------- the camera and the face model
   async function listCameras(ask) {
@@ -93,90 +100,179 @@
     return lm;
   }
 
-  async function startRemote() {
+  // ---------------------------------------------------------------- one clean session hand-off
+  // At most one session (`run`) exists. Every loop, poll callback and camera event checks that exact object, so once
+  // stop() has dropped `run` and marked the session stopped, no continuation of the old source can send a pose, paint a
+  // preview or touch the new session's stats.
+  function freshFilter() { filter = new HF.Filter(st.sens); return filter; }
+
+  function clearPreview() {
+    const v = $("hVideo");
+    if (v) { try { v.pause(); } catch {} try { v.srcObject = null; } catch {} }
+    const c = $("hCanvas");
+    if (c) { try { const g = c.getContext("2d"); g.clearRect(0, 0, c.width, c.height); } catch {} }
+    const img = $("hRemote");
+    if (img) { try { img.removeAttribute("src"); } catch {} }       // drop the last picture; .remote removal below hides the element
+    const box = $("hPrev");
+    if (box) { box.classList.remove("remote"); delete box.dataset.ar; box.style.removeProperty("--cam-ar"); }
+  }
+  function resetVitals() { stats = freshStats(); last = {raw: null, out: null, rel: null}; }
+  function paintStoppedChrome() {
     const btn = $("hStart");
-    const r = await hostCmd("start", {camera: st.res.device.slice(3)});
-    if (!r.ok) { say(r.error || "BeamDeck on the computer does not answer.", true); return; }
-    run = {remote: true, stop: false, still: 0};
-    stats = {fps: 0, ms: 0, frames: 0, t0: performance.now(), face: false, lastFace: 0, sent: 0, err: 0};
-    btn.textContent = "Stop tracking"; document.body.classList.add("headon"); paintHud();
-    say(r.online ? "Starting the computer's camera…" : "Opening the tracker on the computer (a small window there)…");
+    if (btn) { btn.disabled = false; btn.textContent = "Start tracking"; }
+    document.body.classList.remove("headon");
+    paintHud();
+  }
+  function commitRunningChrome() {
+    const btn = $("hStart");
+    if (btn) { btn.disabled = false; btn.textContent = "Stop tracking"; }
+    document.body.classList.add("headon");
+    paintHud();
+  }
+  function ensureRemoteImg() {
     let img = $("hRemote");
     if (!img) { img = document.createElement("img"); img.id = "hRemote"; img.alt = "The computer's camera"; $("hPrev").appendChild(img); }
     $("hPrev").classList.add("remote");
-    run.poll = setInterval(async () => {
-      if (!run || !run.remote) return;
-      let v;
-      try { v = await (await fetch("api/headhost", {cache: "no-store"})).json(); } catch { return; }
-      const s = v.status;
-      if (!s) { if (!v.starting) say("The tracker on the computer is not answering. Is BeamDeck running there?", true); return; }
-      stats.fps = s.fps; stats.ms = s.ms; stats.face = s.face; stats.err = s.err;
-      last.raw = s.raw; last.out = s.out; last.rel = s.rel;
-      if (s.preview && st.res.show) img.src = s.preview;
-      if (!s.running || !s.face) say(s.message || "Waiting for the computer's camera…", !!s.bad);
-      else if ($("hStatus").classList.contains("bad")) say("Tracking");
-    }, 500);
+    return img;
+  }
+  function cancelFrame(ses) {
+    if (ses.frameHandle == null) return;
+    try {
+      if (ses.vfc) { const v = $("hVideo"); if (v && v.cancelVideoFrameCallback) v.cancelVideoFrameCallback(ses.frameHandle); }
+      else if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(ses.frameHandle);
+    } catch {}
+    ses.frameHandle = null;
+  }
+
+  // Fully tears down the current session synchronously (network stop commands are best-effort after the local state is
+  // gone). opts.poseReset=false skips the "view eases home" api/head ping for a start that never got going.
+  function stop(msg, opts) {
+    opts = opts || {};
+    const old = run;
+    run = null;
+    discardPendingSends();                                        // unsent old-session poses are thrown away
+    if (old) {
+      old.stop = true;
+      if (old.poll != null) clearInterval(old.poll);              // the remote path must stop polling api/headhost at once
+      cancelFrame(old);
+      if (old.stream) { try { old.stream.getTracks().forEach(t => { try { t.stop(); } catch {} }); } catch {} }
+    }
+    clearPreview();
+    resetVitals();
+    paintStoppedChrome();
+    if (!opts.silent) {
+      if (old && old.remote) { hostCmd("stop"); }
+      else if (opts.poseReset !== false) {
+        fetch("api/head", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({on: true})}).catch(() => {});   // a centred pose, then silence
+      }
+    }
+    if (msg) say(msg, !!opts.bad);
+  }
+
+  async function startRemote() {
+    if (run) return;
+    const ses = {remote: true, stop: false, starting: true, seenRunning: false, startedAt: performance.now(), poll: null};
+    run = ses;                                                    // claimed synchronously: a switch can cancel this start
+    const btn = $("hStart"); btn.disabled = true; btn.textContent = "Starting…";
+    say("Asking the computer's camera to start…");
+    let r;
+    try { r = await hostCmd("start", {camera: st.res.device.slice(3)}); }
+    catch { r = {ok: false}; }
+    if (run !== ses) return;                                      // switched away while the command was in flight
+    if (!r || !r.ok) { stop((r && r.error) || "BeamDeck on the computer does not answer.", {bad: true, poseReset: false}); return; }
+    freshFilter();                                                // current sensitivity, no centring baseline from the old session
+    stats = freshStats(); stats.t0 = performance.now();
+    ensureRemoteImg();
+    ses.starting = false;
+    commitRunningChrome();                                        // the helper accepted the command: the session is live
+    ses.poll = setInterval(() => { remotePoll(ses).catch(() => {}); }, 500);
+    remotePoll(ses).catch(() => {});                              // don't wait half a second for the first status
+    say(r.online ? "Starting the computer's camera…" : "Opening the tracker on the computer (a small window there)…");
+  }
+
+  // One poll of the computer's status. A running:true->false edge, or any bad:true report, ends the session. A
+  // running:false seen straight after the start command can still be the host's pre-start status while its model loads,
+  // so that case is tolerated briefly before it is treated as a stop.
+  const REMOTE_START_GRACE_MS = 800;
+  async function remotePoll(ses) {
+    if (ses.stop || run !== ses) return;
+    let v;
+    try { v = await (await fetch("api/headhost", {cache: "no-store"})).json(); } catch { return; }
+    if (ses.stop || run !== ses) return;
+    const s = v && v.status;
+    if (!s) { if (!v || !v.starting) say("The tracker on the computer is not answering. Is BeamDeck running there?", true); return; }
+    if (s.running === true) ses.seenRunning = true;
+    const stopped = s.running === false && (ses.seenRunning || performance.now() - ses.startedAt > REMOTE_START_GRACE_MS);
+    if (s.bad === true || stopped) {
+      stop(s.message || (s.bad ? "The computer's camera reported an error." : "The computer's camera stopped."), {bad: s.bad === true});
+      return;
+    }
+    if (s.running !== true) { say(s.message || "Starting the computer's camera…"); return; }
+    stats.fps = s.fps || 0; stats.ms = s.ms || 0; stats.face = !!s.face; stats.err = s.err || 0;
+    if (Number.isFinite(s.frames)) stats.frames = s.frames;
+    last.raw = s.raw || null; last.out = s.out || null; last.rel = s.rel || null;
+    const img = $("hRemote");
+    if (s.preview && st.res.show && img) img.src = s.preview;
+    if (!s.face) say(s.message || "Waiting for the computer's camera…", !!s.bad);
+    else if ($("hStatus").classList.contains("bad")) say("Tracking");
   }
 
   async function start() {
     if (run) return;
     if (isHost(st.res.device)) return startRemote();
-    const btn = $("hStart"); btn.disabled = true;
+    const btn = $("hStart");
+    const ses = {remote: false, stop: false, starting: true, stream: null, frameHandle: null, vfc: false, lastT: 0, still: 0, prev: null};
+    run = ses;                                                    // claimed synchronously, so restart() can stop this attempt
+    btn.disabled = true; btn.textContent = "Starting…";
+    let stream;
     try {
       const size = st.res.size, fps = st.res.fps;
       say("Starting the camera…");
       const want = id => ({video: {deviceId: id ? {exact: id} : undefined, width: {ideal: size}, height: {ideal: Math.round(size * 3 / 4)}, frameRate: {ideal: fps, max: fps}}});
-      let stream;
       try { stream = await navigator.mediaDevices.getUserMedia(want(st.res.device)); }
       catch (e) { if (e.name !== "OverconstrainedError" || !st.res.device) throw e; st.res.device = ""; stream = await navigator.mediaDevices.getUserMedia(want("")); }   // the saved camera is gone: the default one
+      if (run !== ses) { stream.getTracks().forEach(t => t.stop()); return; }   // switched away while the camera prompt was up
       const video = $("hVideo");
       video.srcObject = stream; await video.play();
+      if (run !== ses) { stream.getTracks().forEach(t => t.stop()); return; }
       const model = await ensureModel();
-      filter.reset(); stats = {fps: 0, ms: 0, frames: 0, t0: performance.now(), face: false, lastFace: 0, sent: 0, err: 0};
-      run = {stream, stop: false, lastT: 0, still: 0, prev: null};
-      stream.getVideoTracks()[0].addEventListener("ended", () => stop("The camera stopped."));
-      loop(model);
-      btn.textContent = "Stop tracking"; document.body.classList.add("headon"); paintHud();
+      if (run !== ses) { stream.getTracks().forEach(t => t.stop()); return; }
+      ses.stream = stream;
+      freshFilter();                                              // rebuild with the current settings; the centre starts unset
+      stats = freshStats(); stats.t0 = performance.now();
+      stream.getVideoTracks()[0].addEventListener("ended", () => { if (run === ses && !ses.stop) stop("The camera stopped.", {bad: true}); });
+      ses.starting = false;
+      commitRunningChrome();
+      loop(model, ses);
       say("Looking for your face… sit as you do when you drive, then it centres on you.");
       listCameras(false);
     } catch (e) {
-      say("Could not start: " + (e.message || e.name), true);
-      if (run) stop(); else { const v = $("hVideo"); if (v.srcObject) { v.srcObject.getTracks().forEach(t => t.stop()); v.srcObject = null; } }
-    } finally { btn.disabled = false; }
-  }
-
-  function stop(msg) {
-    if (run && run.remote) {
-      clearInterval(run.poll); hostCmd("stop");
-      run = null; $("hPrev").classList.remove("remote");
-      const btn = $("hStart"); if (btn) btn.textContent = "Start tracking";
-      document.body.classList.remove("headon"); say(msg || "Tracking is off."); paintHud();
-      return;
+      try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch {}
+      if (run === ses) stop("Could not start: " + (e.message || e.name), {bad: true, poseReset: false});
+    } finally {
+      if (run === ses) btn.disabled = false;
     }
-    if (run) { run.stop = true; run.stream.getTracks().forEach(t => t.stop()); }
-    run = null;
-    const v = $("hVideo"); if (v) v.srcObject = null;
-    fetch("api/head", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({on: true})}).catch(() => {});   // a centred pose, then silence: the view eases back to the centre
-    const btn = $("hStart"); if (btn) btn.textContent = "Start tracking";
-    document.body.classList.remove("headon");
-    say(msg || "Tracking is off.");
-    paintHud();
   }
 
   // one frame at a time, never faster than asked, and slower still while the head is still (this is where the processor and graphics
   // chip get their rest)
-  function loop(model) {
+  function loop(model, ses) {
     const video = $("hVideo");
-    const next = cb => video.requestVideoFrameCallback ? video.requestVideoFrameCallback(cb) : requestAnimationFrame(cb);
+    const next = cb => {
+      if (video.requestVideoFrameCallback) { ses.vfc = true; ses.frameHandle = video.requestVideoFrameCallback(cb); }
+      else { ses.vfc = false; ses.frameHandle = requestAnimationFrame(cb); }
+    };
     const frame = () => {
-      if (!run || run.stop) return;
+      ses.frameHandle = null;
+      if (ses.stop || run !== ses) return;                         // stopped, cancelled by handle, or superseded by a newer source
       const now = performance.now();
-      const every = 1000 / (st.res.eco && run.still > 45 ? 10 : st.res.fps);
-      if (now - run.lastT >= every - 3 && video.readyState >= 2) {
-        run.lastT = now;
+      const every = 1000 / (st.res.eco && ses.still > 45 ? 10 : st.res.fps);
+      if (now - ses.lastT >= every - 3 && video.readyState >= 2) {
+        ses.lastT = now;
         const t0 = performance.now();
         let res;
         try { res = model.detectForVideo(video, now); } catch (e) { say("The face model stopped: " + (e.message || e), true); stop(); return; }
+        if (ses.stop || run !== ses) return;
         const ms = performance.now() - t0;
         stats.ms += (ms - stats.ms) * 0.1; stats.frames++;
         const m = res && res.facialTransformationMatrixes && res.facialTransformationMatrixes[0];
@@ -188,10 +284,10 @@
           if (r) {
             last.out = r.out; last.rel = r.rel;
             send(r.out);
-            const mv = run.prev ? Math.abs(r.rel.yaw - run.prev.yaw) + Math.abs(r.rel.pitch - run.prev.pitch) + Math.abs(r.rel.x - run.prev.x) + Math.abs(r.rel.y - run.prev.y) : 9;
-            run.still = mv < 0.6 ? run.still + 1 : 0; run.prev = r.rel;
+            const mv = ses.prev ? Math.abs(r.rel.yaw - ses.prev.yaw) + Math.abs(r.rel.pitch - ses.prev.pitch) + Math.abs(r.rel.x - ses.prev.x) + Math.abs(r.rel.y - ses.prev.y) : 9;
+            ses.still = mv < 0.6 ? ses.still + 1 : 0; ses.prev = r.rel;
           }
-        } else if (stats.face && now - stats.lastFace > 300) { stats.face = false; filter.lost(); last.out = null; run.still = 0; }
+        } else if (stats.face && now - stats.lastFace > 300) { stats.face = false; filter.lost(); last.out = null; ses.still = 0; }
       }
       next(frame);
     };
@@ -271,7 +367,9 @@
     $("hShow").onchange = () => { r.show = $("hShow").checked; save(); paintPreview(); };
     $("hCam").onchange = () => { r.device = $("hCam").value; save(); if (run) restart(); };
   }
-  async function restart() { stop("Restarting…"); await start(); }
+  // A source switch: tear the old session down to nothing first (stop() does all its work synchronously), then start the
+  // newly picked source. start() claims `run` before its first await, so a second switch cannot race this one.
+  function restart(msg) { stop(msg || "Restarting…"); return start(); }
 
   // ---------------------------------------------------------------- what the page shows while it runs (kept light: a few times a second)
   const bar = (v, lim) => `<i style="left:${50 + Math.max(-1, Math.min(1, v / lim)) * 50}%"></i>`;
@@ -287,21 +385,23 @@
       const rel = last.rel && last.rel[a] || 0, out = last.out && last.out[a] || 0;
       return `<div class="hrow"><span>${l}</span><div class="hbar"><b></b>${bar(rel, hl)}</div><em>head ${rel.toFixed(0)}°</em><div class="hbar view"><b></b>${bar(out, ol)}</div><em>view ${out.toFixed(0)}°</em></div>`;
     }).join("");
-    if (run) {
+    if (run && !run.starting) {
       const msg = stats.face ? `Tracking${run.remote ? " on the computer" : ""}: ${stats.fps} frames a second, ${stats.ms.toFixed(0)} ms each${st.res.eco && run.still > 45 ? " (resting while you are still)" : ""}${stats.err ? ", " + stats.err + " failed sends" : ""}`
                              : "No face in view: sit where the camera can see you";
       if (!$("hStatus").classList.contains("bad")) say(msg);
     }
   }
+  function activeSession() { return !!(run && !run.starting); }
   function paintPreview() {
     const wrap = $("hPrev"); if (!wrap) return;
-    wrap.classList.toggle("off", !st.res.show || !run);
+    wrap.classList.toggle("off", !st.res.show || !activeSession());
   }
   function paintHud() {                      // the recentre button over the cockpit map, while tracking
-    const b = $("fHeadBtn"); if (b) b.style.display = run ? "" : "none";
+    const on = activeSession();
+    const b = $("fHeadBtn"); if (b) b.style.display = on ? "" : "none";
     const hb = $("headBtn"), cb = $("headCenterBtn");
-    if (hb) hb.classList.toggle("live", !!run);
-    if (cb) cb.style.display = run ? "" : "none";
+    if (hb) hb.classList.toggle("live", on);
+    if (cb) cb.style.display = on ? "" : "none";
     paintPreview();
   }
   function drawFace() {
@@ -351,11 +451,27 @@
     paintSettings(); paintPreview(); checkGame();
   };
   function recenter() {
-    if (!run) return;
-    if (run.remote) { hostCmd("recenter"); say("Centred on where you are now."); return; }
-    if (filter.recenter(last.raw)) { say("Centred on where you are now."); setTimeout(() => { if (run) say("Tracking"); }, 1500); }
+    if (!run || run.starting) return;
+    const ses = run;
+    if (ses.remote) { hostCmd("recenter"); say("Centred on where you are now."); return; }
+    if (filter.recenter(last.raw)) { say("Centred on where you are now."); setTimeout(() => { if (run === ses && stats.face) say("Tracking"); }, 1500); }
   }
-  window.headTracker = {start, stop, recenter, isRunning: () => !!run, state: () => ({stats, last, sens: st.sens, res: st.res}), set: (path, v) => { setPath(st.sens, path, v); filter.setSettings(st.sens); paintSettings(); }};
+  window.headTracker = {
+    start, stop, recenter,
+    isRunning: activeSession,
+    isStarting: () => !!run && !!run.starting,
+    state: () => ({stats, last, sens: st.sens, res: st.res, inFlight, pending: pending != null,
+                   running: activeSession(), remote: !!(run && run.remote)}),
+    set: (path, v) => { setPath(st.sens, path, v); filter.setSettings(st.sens); paintSettings(); },
+    // inspection seam for the local fake-environment tests (tools/test_head_switch.py): not part of the product UI
+    __diag: () => ({
+      active: activeSession(), starting: !!run && !!run.starting, remote: !!run && run.remote,
+      hasRun: !!run, inFlight, pending: pending != null,
+      filterCenter: filter.center ? {...filter.center} : null, filterGain: st.sens.yaw.gain,
+      filterYawGain: filter.s.yaw.gain,
+      poll: !!(run && run.poll),
+    }),
+  };
   window.addEventListener("pagehide", () => { if (run) stop(); });
   paintHud();
   if ($("head") && $("head").classList.contains("on")) window.headOnShow();      // opened by a link before this file had loaded
