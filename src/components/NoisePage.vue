@@ -49,14 +49,14 @@
             return-object
             label="Profiles"
             class="mx-3 mb-5"
-            :disabled="playDisabled"
+            :disabled="playDisabled || isRecording || recordingFinishing"
             @change="loadProfile(true)"
           />
         </v-row>
 
         <v-btn
           class="mx-3 my-3"
-          :disabled="profileItems.length < 2 || playDisabled"
+          :disabled="profileItems.length < 2 || playDisabled || isRecording || recordingFinishing"
           @click="deleteProfile"
         >
           Delete Profile
@@ -64,6 +64,7 @@
 
         <v-btn
           class="mx-3 my-3"
+          :disabled="isRecording || recordingFinishing"
           @click="updateProfile"
         >
           {{ unsavedWork ? 'Save Profile*' : 'Save Profile' }}
@@ -131,7 +132,7 @@
             <v-btn
               v-bind="attrs"
               class="mx-3 my-3"
-              :disabled="playDisabled"
+              :disabled="playDisabled || isRecording || recordingFinishing"
               v-on="on"
             >
               More...
@@ -326,7 +327,8 @@
                 </v-btn>
                 <v-btn
                   text
-                  :disabled="!isRecordingValid"
+                  :disabled="!isRecordingValid || isRecording || recordingFinishing"
+                  :loading="recordingStarting"
                   @click="startRecording"
                 >
                   Record
@@ -352,12 +354,14 @@
               <v-spacer />
               <v-btn
                 text
+                :disabled="recordingFinishing"
                 @click="cancelRecording"
               >
                 Cancel
               </v-btn>
               <v-btn
                 text
+                :disabled="recordingFinishing"
                 @click="stopRecording"
               >
                 Stop and Save

@@ -25,6 +25,26 @@ npm run build
 npm run lint
 ```
 
+### Runs the audio graph tests
+```
+npm test
+```
+
+These exercise the playback/recording graph lifecycle in
+`src/components/noise.js` against a stubbed Tone.js: no AudioContext, speakers
+or microphone are needed.
+
+### Runs the browser verification
+```
+npm run test:browser
+```
+
+This drives the real component in headless Chrome/Edge with the real Tone.js
+build and MediaRecorder (audio is generated, so no microphone or external
+service is used). Set `CHROME_PATH` if the browser is in a non-standard
+location. Each test builds its own component instance, so a failure in one does
+not hide the others.
+
 ### Directory Summary
 
 Here are some of the more important files and directories:

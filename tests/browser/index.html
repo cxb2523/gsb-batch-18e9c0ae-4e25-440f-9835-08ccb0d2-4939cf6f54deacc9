@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Noisedash recording graph harness</title>
+  <script>
+    // Shared observability for the harness: every Tone node the component
+    // creates is registered here by tests/browser/tone-shim.mjs, and the
+    // interval registry lets the checks assert timers are cleared.
+    window.__log = []
+    window.__done = false
+    window.__results = []
+    window.__tracking = {
+      nodes: [],
+      intervals: new Set(),
+      downloads: []
+    }
+
+    const realSetInterval = window.setInterval.bind(window)
+    const realClearInterval = window.clearInterval.bind(window)
+    window.setInterval = (fn, delay, ...rest) => {
+      const id = realSetInterval(fn, delay, ...rest)
+      window.__tracking.intervals.add(id)
+      return id
+    }
+    window.clearInterval = (id) => {
+      window.__tracking.intervals.delete(id)
+      return realClearInterval(id)
+    }
+
+    const realCreateElement = document.createElement.bind(document)
+    document.createElement = function (tag) {
+      const element = realCreateElement(tag)
+      if (String(tag).toLowerCase() === 'a') {
+        element.click = function () {
+          if (element.download) {
+            window.__tracking.downloads.push(element.download)
+          }
+        }
+      }
+      return element
+    }
+
+    window.addEventListener('error', event => {
+      window.__log.push('[window.error] ' + (event.error && event.error.stack ? event.error.stack : event.message))
+      window.__done = true
+    })
+    window.addEventListener('unhandledrejection', event => {
+      window.__log.push('[unhandledrejection] ' + (event.reason && event.reason.stack ? event.reason.stack : String(event.reason)))
+      window.__done = true
+    })
+  </script>
+</head>
+<body>
+  <p>Recording graph harness running…</p>
+  <!-- Real Tone.js (UMD build) so the component runs against the library the
+       app actually ships, without an AudioContext stub. -->
+  <script src="/node_modules/tone/build/Tone.js"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "tone": "/tests/browser/tone-shim.mjs"
+      }
+    }
+  </script>
+  <script type="module" src="/tests/browser/page.mjs"></script>
+</body>
+</html>

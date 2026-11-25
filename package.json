@@ -6,7 +6,9 @@
   "scripts": {
     "serve": "vue-cli-service serve",
     "build": "vue-cli-service build",
-    "lint": "vue-cli-service lint",
+    "lint": "vue-cli-service lint --ext .js,.jsx,.vue,.mjs",
+    "test": "node tests/recording-graph.test.mjs",
+    "test:browser": "node tests/browser/driver.mjs",
     "server": "node server/bin/www.js",
     "server-prod": "NODE_ENV=production node server/bin/www.js"
   },
