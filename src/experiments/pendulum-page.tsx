@@ -52,11 +52,22 @@ export default function PendulumExperimentPage() {
 
   const handlePlayPause = () => setIsPlaying((p) => !p);
   const handleReset = () => {
+    // Same controlled restart path as a parameter change (handled inside
+    // the scene). It must NOT change play/pause: resetting while paused
+    // keeps the simulation paused.
     setResetTrigger((n) => n + 1);
-    setIsPlaying(true);
     setSimulationSpeed(1);
     setTimeElapsed(0);
   };
+
+  // The controller's elapsed time mirrors the simulation time actually
+  // accumulated inside the scene. It freezes while paused and continues
+  // from the same value on resume; the scene emits a fresh snapshot
+  // immediately after every restart, so this resets to 0 at once.
+  const handleDataChange = useCallback((next: PendulumData) => {
+    setData(next);
+    setTimeElapsed(next.elapsedTime);
+  }, []);
 
   // === PARAMETER CONTROLS ===
   const parameterControls = (
@@ -133,7 +144,10 @@ export default function PendulumExperimentPage() {
       <DataGrid
         data={{
           period: { value: data.period, unit: "s", color: "#a855f7", decimals: 3 },
-          measured: { value: data.periodMeasured || data.period, unit: "s", color: "#c084fc", decimals: 3 },
+          // No fallback to the theoretical period: until one complete
+          // zero-crossing interval has been measured there is simply no
+          // measured value yet (rendered as "—"), never a stale one.
+          measured: { value: data.periodMeasured > 0 ? data.periodMeasured : null, unit: "s", color: "#c084fc", decimals: 3 },
           angle: { value: data.angleDeg, unit: "°", color: "#06d6a0", decimals: 1 },
           angVel: { value: data.angularVelocity, unit: "rad/s", color: "#f59e0b" },
           vel: { value: data.tangentialVelocity, unit: "m/s", color: "#22c55e" },
@@ -167,7 +181,7 @@ export default function PendulumExperimentPage() {
         dataPanel={null}
       >
         <PendulumSceneComponent
-          onDataChange={setData}
+          onDataChange={handleDataChange}
           length={length}
           gravity={gravity}
           mass={mass}

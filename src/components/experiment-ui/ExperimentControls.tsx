@@ -89,12 +89,15 @@ export function ControlSlider({ label, value, unit, min, max, step, color = "#a8
 }
 
 export interface DataGridProps {
-  data: Record<string, { value: number; unit: string; color?: string; decimals?: number }>;
+  data: Record<string, { value: number | null; unit: string; color?: string; decimals?: number }>;
   columns?: 1 | 2 | 3;
 }
 
 /**
  * Grid layout for data display
+ *
+ * A `null` value means "not measured yet" and is rendered as an em dash
+ * instead of a misleading zero or a stale number.
  */
 export function DataGrid({ data, columns = 1 }: DataGridProps) {
   // Use a lookup object to avoid dynamic Tailwind classes
@@ -118,7 +121,9 @@ export function DataGrid({ data, columns = 1 }: DataGridProps) {
             className="text-xs font-mono font-medium"
             style={{ color: item.color || "#333" }}
           >
-            {item.value.toFixed(item.decimals ?? 2)} {item.unit}
+            {item.value === null
+              ? "—"
+              : `${item.value.toFixed(item.decimals ?? 2)} ${item.unit}`}
           </span>
         </div>
       ))}

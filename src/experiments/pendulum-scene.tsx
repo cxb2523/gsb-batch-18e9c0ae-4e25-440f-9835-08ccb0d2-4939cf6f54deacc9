@@ -1,9 +1,16 @@
 "use client";
 
-import { useRef, useMemo, useEffect, useCallback, useState } from "react";
+import { useRef, useMemo, useEffect, useState } from "react";
 import { useFrame } from "@react-three/fiber";
 import { Line, Html, Text } from "@react-three/drei";
 import * as THREE from "three";
+import {
+  PendulumSim,
+  pendulumKE,
+  pendulumPE,
+  type PendulumData,
+  type PendulumParams,
+} from "@/experiments/pendulum-simulation";
 
 // ============================================
 // INTERFACES
@@ -25,66 +32,7 @@ interface PendulumSceneProps {
   resetTrigger?: number;
 }
 
-export interface PendulumData {
-  period: number;
-  periodMeasured: number;
-  frequency: number;
-  angularFrequency: number;
-  kineticEnergy: number;
-  potentialEnergy: number;
-  totalEnergy: number;
-  angle: number;
-  angleDeg: number;
-  angularVelocity: number;
-  tangentialVelocity: number;
-  elapsedTime: number;
-  oscillations: number;
-  phaseAngle: number;
-  phaseVelocity: number;
-}
-
-// ============================================
-// PHYSICS HELPERS
-// ============================================
-
-/** Large-angle period correction: T = T₀ × (1 + θ₀²/16 + 11θ₀⁴/3072) */
-function correctedPeriod(L: number, g: number, theta0: number): number {
-  const T0 = 2 * Math.PI * Math.sqrt(L / g);
-  const correction = 1 + (theta0 * theta0) / 16 + (11 * theta0 * theta0 * theta0 * theta0) / 3072;
-  return T0 * correction;
-}
-
-function pendulumPE(m: number, g: number, L: number, theta: number): number {
-  return m * g * L * (1 - Math.cos(theta));
-}
-
-function pendulumKE(m: number, L: number, omega: number): number {
-  return 0.5 * m * L * L * omega * omega;
-}
-
-// ============================================
-// RK4 INTEGRATOR
-// ============================================
-
-function rk4Step(
-  theta: number, omega: number,
-  g: number, L: number, b: number, dt: number
-): [number, number] {
-  const f = (th: number, om: number): [number, number] => {
-    const dTheta = om;
-    const dOmega = -(g / L) * Math.sin(th) - b * om;
-    return [dTheta, dOmega];
-  };
-
-  const [k1a, k1b] = f(theta, omega);
-  const [k2a, k2b] = f(theta + k1a * dt * 0.5, omega + k1b * dt * 0.5);
-  const [k3a, k3b] = f(theta + k2a * dt * 0.5, omega + k2b * dt * 0.5);
-  const [k4a, k4b] = f(theta + k3a * dt, omega + k3b * dt);
-
-  const newTheta = theta + (dt / 6) * (k1a + 2 * k2a + 2 * k3a + k4a);
-  const newOmega = omega + (dt / 6) * (k1b + 2 * k2b + 2 * k3b + k4b);
-  return [newTheta, newOmega];
-}
+export type { PendulumData };
 
 // ============================================
 // 3D ENERGY BARS COMPONENT
@@ -248,63 +196,84 @@ export function PendulumSceneComponent({
   const netArrowRef = useRef<THREE.Group>(null);
   const angleArcRef = useRef<any>(null);
 
-  // Physics state (refs for per-frame - no React state updates)
-  const stateRef = useRef({
-    theta: initialAngle,
-    omega: 0,
-    time: 0,
-    lastTheta: initialAngle,
-    oscillations: 0,
-    lastCrossTime: 0,
-    measuredPeriod: 0,
-  });
+  // All mutable physics / measurement / trail state lives in the controller.
+  const params: PendulumParams = useMemo(
+    () => ({ length, gravity, mass, damping, initialAngle }),
+    [length, gravity, mass, damping, initialAngle]
+  );
+  const simRef = useRef<PendulumSim | null>(null);
+  if (simRef.current === null) {
+    simRef.current = new PendulumSim(params);
+  }
+  const sim = simRef.current;
 
   // Frame counter for throttling React state updates
   const frameCountRef = useRef(0);
-  const lastEnergyDataRef = useRef({ ke: 0, pe: 0, total: 0 });
-
-  // Trail
-  const MAX_TRAIL = 1500;
-  const trailBuf = useMemo(() => ({
-    positions: new Float32Array(MAX_TRAIL * 3),
-    colors: new Float32Array(MAX_TRAIL * 3),
-    ages: new Float32Array(MAX_TRAIL),
-    idx: 0,
-  }), []);
-  const trailGeo = useMemo(() => {
-    const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.BufferAttribute(trailBuf.positions, 3));
-    g.setAttribute("color", new THREE.BufferAttribute(trailBuf.colors, 3));
-    g.setAttribute("age", new THREE.BufferAttribute(trailBuf.ages, 1));
-    return g;
-  }, []);
 
   // Bob radius scales with mass (visual hint)
   const bobRadius = 0.5 + mass * 0.08;
 
-  // Calculate initial total energy for energy bars max reference
-  const initialTotalEnergy = mass * gravity * length * (1 - Math.cos(initialAngle));
+  // Trail geometry shares its buffers with the simulation controller.
+  const trailGeo = useMemo(() => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(sim.trail.positions, 3));
+    g.setAttribute("color", new THREE.BufferAttribute(sim.trail.colors, 3));
+    g.setAttribute("age", new THREE.BufferAttribute(sim.trail.ages, 1));
+    g.setDrawRange(0, 0);
+    return g;
+    // sim is created once and stable for the lifetime of the component.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  // Reset
+  // Keep latest callback / playing / speed in refs so the frame loop
+  // always reads current values without re-subscribing.
+  const onDataChangeRef = useRef(onDataChange);
+  onDataChangeRef.current = onDataChange;
+  const isPlayingRef = useRef(isPlaying);
+  isPlayingRef.current = isPlaying;
+  const speedRef = useRef(simulationSpeed);
+  speedRef.current = simulationSpeed;
+
+  /**
+   * Push a fresh snapshot to React state immediately. Used on mount and
+   * after every controlled restart so the data panel never shows values
+   * left over from a previous run before the next throttled sample.
+   */
+  const emitSnapshot = (source: PendulumSim) => {
+    const snapshot = source.getSnapshot();
+    setEnergyData({
+      ke: snapshot.kineticEnergy,
+      pe: snapshot.potentialEnergy,
+      total: snapshot.totalEnergy,
+    });
+    onDataChangeRef.current?.(snapshot);
+  };
+
+  // Emit the initial snapshot on mount so the panel is populated straight
+  // away (the controller starts at rest at the initial angle).
   useEffect(() => {
-    if (resetTrigger !== undefined && resetTrigger > 0) {
-      stateRef.current = {
-        theta: initialAngle,
-        omega: 0,
-        time: 0,
-        lastTheta: initialAngle,
-        oscillations: 0,
-        lastCrossTime: 0,
-        measuredPeriod: 0,
-      };
-      frameCountRef.current = 0;
-      trailBuf.idx = 0;
-      trailBuf.positions.fill(0);
-      trailBuf.colors.fill(0);
-      trailBuf.ages.fill(0);
-      setEnergyData({ ke: 0, pe: mass * gravity * length * (1 - Math.cos(initialAngle)), total: mass * gravity * length * (1 - Math.cos(initialAngle)) });
-    }
-  }, [resetTrigger, initialAngle, mass, gravity, length, trailBuf]);
+    frameCountRef.current = 0;
+    emitSnapshot(sim);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /**
+   * Controlled restart path.
+   *
+   * Both a reset-button press and any physics-parameter change route
+   * through here. The motion restarts from the (new) initial angle with
+   * zero angular velocity and zero time; measurements and the trail
+   * buffer are cleared and the trail restarts at index 0. Play/pause and
+   * speed are deliberately NOT touched here — the scene cannot turn a
+   * paused simulation into a playing one.
+   */
+  useEffect(() => {
+    sim.restart(params);
+    frameCountRef.current = 0;
+    trailGeo.setDrawRange(0, 0);
+    emitSnapshot(sim);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resetTrigger, params]);
 
   // Cleanup
   useEffect(() => {
@@ -314,38 +283,15 @@ export function PendulumSceneComponent({
   // Frame loop
   useFrame((_, delta) => {
     const rawDt = Math.min(delta, 0.02);
-    const dt = rawDt * simulationSpeed;
-    const s = stateRef.current;
     frameCountRef.current++;
 
-    if (isPlaying && dt > 0) {
-      // Sub-step for stability at high speed
-      const steps = Math.max(1, Math.ceil(dt / 0.004));
-      const subDt = dt / steps;
-      for (let i = 0; i < steps; i++) {
-        const [newTheta, newOmega] = rk4Step(s.theta, s.omega, gravity, length, damping, subDt);
-        s.lastTheta = s.theta;
-        s.theta = newTheta;
-        s.omega = newOmega;
-      }
-      s.time += dt;
+    // Advances physics + sim time only while playing. Pausing freezes
+    // every state value; speed changes only affect subsequent advances.
+    sim.advance(rawDt, speedRef.current, isPlayingRef.current);
 
-      // Count oscillations (zero-crossing detection)
-      if (s.lastTheta < 0 && s.theta >= 0) {
-        s.oscillations++;
-        if (s.lastCrossTime > 0) {
-          s.measuredPeriod = s.time - s.lastCrossTime;
-        }
-        s.lastCrossTime = s.time;
-      }
-    }
-
-    const theta = s.theta;
-    const omega = s.omega;
-
-    // Bob position
-    const bx = Math.sin(theta) * length;
-    const by = -Math.cos(theta) * length;
+    const theta = sim.theta;
+    const omega = sim.omega;
+    const [bx, by] = sim.bobPosition;
 
     // Update bob
     if (bobRef.current) {
@@ -363,35 +309,8 @@ export function PendulumSceneComponent({
     }
 
     // Enhanced trail with age-based fading
-    if (showTrail && isPlaying && trailRef.current) {
-      const idx = trailBuf.idx % MAX_TRAIL;
-      trailBuf.positions[idx * 3] = bx;
-      trailBuf.positions[idx * 3 + 1] = by;
-      trailBuf.positions[idx * 3 + 2] = 0;
-      trailBuf.ages[idx] = 1.0; // Full opacity at start
-
-      const speed = Math.abs(omega);
-      const t = Math.min(speed / 3, 1);
-
-      // Color gradient based on velocity (blue = slow, green = medium, red = fast)
-      if (t < 0.5) {
-        trailBuf.colors[idx * 3] = 0.2 + t * 0.4;     // R
-        trailBuf.colors[idx * 3 + 1] = 0.5 + t * 0.4; // G
-        trailBuf.colors[idx * 3 + 2] = 1.0 - t * 0.3; // B
-      } else {
-        trailBuf.colors[idx * 3] = 0.4 + (t - 0.5) * 0.6;     // R
-        trailBuf.colors[idx * 3 + 1] = 0.7 - (t - 0.5) * 0.4; // G
-        trailBuf.colors[idx * 3 + 2] = 0.85 - (t - 0.5) * 0.5; // B
-      }
-      trailBuf.idx++;
-
-      // Age the trail points
-      for (let i = 0; i < MAX_TRAIL; i++) {
-        if (trailBuf.ages[i] > 0) {
-          trailBuf.ages[i] -= rawDt * 0.8; // Fade over ~1.25 seconds
-          if (trailBuf.ages[i] < 0) trailBuf.ages[i] = 0;
-        }
-      }
+    if (showTrail && isPlayingRef.current && trailRef.current) {
+      sim.addTrailPoint(rawDt);
 
       const pos = trailRef.current.geometry.attributes.position as THREE.BufferAttribute;
       const col = trailRef.current.geometry.attributes.color as THREE.BufferAttribute;
@@ -399,7 +318,11 @@ export function PendulumSceneComponent({
       pos.needsUpdate = true;
       col.needsUpdate = true;
       age.needsUpdate = true;
-      trailRef.current.geometry.setDrawRange(0, Math.min(trailBuf.idx, MAX_TRAIL));
+      trailRef.current.geometry.setDrawRange(0, sim.trailDrawCount);
+    } else if (trailRef.current) {
+      // Keep the draw range in sync even when the trail is hidden or
+      // paused (e.g. immediately after a restart while paused).
+      trailRef.current.geometry.setDrawRange(0, sim.trailDrawCount);
     }
 
     // Force vectors
@@ -473,31 +396,12 @@ export function PendulumSceneComponent({
     const pe = pendulumPE(mass, gravity, length, theta);
     const total = ke + pe;
 
-    // Store latest energy data for 3D bars
-    lastEnergyDataRef.current = { ke, pe, total };
-
     // Update React state every 8 frames (at 60fps = ~7.5 updates per second)
     if (frameCountRef.current % 8 === 0) {
       setEnergyData({ ke, pe, total });
 
-      // Throttled data callback
-      onDataChange?.({
-        period: correctedPeriod(length, gravity, Math.abs(initialAngle)),
-        periodMeasured: s.measuredPeriod,
-        frequency: 1 / correctedPeriod(length, gravity, Math.abs(initialAngle)),
-        angularFrequency: Math.sqrt(gravity / length),
-        kineticEnergy: ke,
-        potentialEnergy: pe,
-        totalEnergy: total,
-        angle: theta,
-        angleDeg: (theta * 180) / Math.PI,
-        angularVelocity: omega,
-        tangentialVelocity: omega * length,
-        elapsedTime: s.time,
-        oscillations: s.oscillations,
-        phaseAngle: theta,
-        phaseVelocity: omega,
-      });
+      // Throttled data callback (snapshot uses the controller's live state)
+      onDataChangeRef.current?.(sim.getSnapshot());
     }
   });
 
