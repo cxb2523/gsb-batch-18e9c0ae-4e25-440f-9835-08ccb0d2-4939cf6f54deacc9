@@ -5,7 +5,7 @@ import globals from "globals";
 export default defineConfig([
 	js.configs.recommended,
 	{
-		files: ["**/*.js"],
+		files: ["*.js"],
 		languageOptions: {
 			ecmaVersion: 2021,
 			sourceType: "script",
@@ -16,6 +16,16 @@ export default defineConfig([
 		},
 		rules: {
 			"no-unused-vars": ["error", { "args": "none" }]
+		}
+	},
+	{
+		files: ["tests/**/*.js"],
+		languageOptions: {
+			ecmaVersion: 2021,
+			sourceType: "commonjs",
+			globals: {
+				...globals.node
+			}
 		}
 	}
 ]);

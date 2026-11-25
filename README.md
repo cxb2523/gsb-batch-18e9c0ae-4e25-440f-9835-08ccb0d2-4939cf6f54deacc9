@@ -81,15 +81,15 @@ Absolute minimum config (will only play the default video file):
 |---|---|---| 
 |`video`|`/modules/MMM-Videoplayer/video/mov_bbb.mp4`|The video file to play (may be a URL to a video file as well).|
 |`videolist`|none|`Example: ['/modules/MMM-Videoplayer/video/video01.mp4', '/modules/MMM-Videoplayer/video/video02.mp4',... ]` List of video files to play (may be URLs to different video files as well).|
-|`loop`|`true`|Loop the video or not. If the videolist is set, it will loop through all videos.<br>Possible values: **true** or **false**|
-|`random`|`false`|If set to true, all videos in the list vill be played until all videos has been played in radom order.<br>Possible values: **true** or **false**|
+|`loop`|`true`|Loop the video or not. If the videolist is set, it will loop through all videos. With `false`, playback stops on the last video and does not repeat it.<br>Possible values: **true** or **false**|
+|`random`|`false`|If set to true, all videos in the list will be played once per round in random order. A new random order is drawn when a round ends, so no video repeats within a round.<br>Possible values: **true** or **false**|
 |`hideonstart`|false|If set to true, the player will hide it self when a clip is loaded (and just started playing (the clip will be paused when the module is hidden)). Then when the player is shown again it will continue play the clip and hide itself again when the next clip is loaded (and just starts playing) and so on.<br>Possible values: **true** or **false**|
 |`showcontrols`|false|Show the controls or not.<br>Possible values: **true** or **false**|
 |`preload`|auto|Preload the video or not see the html-[video](https://www.w3schools.com/tags/tag_video.asp)-tag for more information<br>Possible values: **auto**, **metadata** or **none**|
 |`autoplay`|`true`|If set to true, sound (muted by default) has to be muted as well, otherwise the video will not auto play.<br>Possible values: **true** or **false**|
 |`muted`|`true`|Mute the sound. If auto play is true, this needs to be true as well, otherwise the video will not auto play.<br>Possible values: **true** or **false**|
-|`pauseonhide`|`true`|If true the module will pause the video when hidden.<br>Possible values: **true** or **false**|
-|`resumeonshow`|`true`|If true the module will resume the video when shown.<br>Possible values: **true** or **false**|
+|`pauseonhide`|`true`|If true the module will pause the video when hidden. A pause caused this way is remembered separately from a user pause.<br>Possible values: **true** or **false**|
+|`resumeonshow`|`true`|If true the module will resume a video that was paused because the module was hidden. A video paused with `TOGGLE` or the controls is not resumed automatically.<br>Possible values: **true** or **false**|
 |`notification`|`VIDEOPLAYER1`|Unique notification string for this player. "payload" can be "TOGGLE" to start or stop the player, "REPLAY" to restart current video or "NEXT" to play the next video in the list when sending notifications.|
 
 ### CSS Tricks
@@ -142,3 +142,36 @@ If you set the size to your screen size, the video player will not really fill t
 ### Notes
 
 Even if the player is hidden, you can still start and stop the video by sending notifications to it.
+
+When the module is hidden the player never plays audio. A `TOGGLE`, `NEXT` or
+`REPLAY` sent while hidden is applied to the player state right away, and the
+next time the module is shown it continues according to how it was paused:
+
+- Paused because the module was hidden → resumes when shown (`resumeonshow: true` required).
+- Paused by you with `TOGGLE` or the native controls → stays paused when shown.
+
+### Testing
+
+The module ships with a dependency-free test suite that runs the state machine
+against a fake `<video>` element in plain Node.js (no browser or MagicMirror²
+instance required):
+
+```bash
+npm test
+```
+
+You can also run the file directly:
+
+```bash
+node tests/videoplayer.test.js
+```
+
+The tests cover hidden/shown resume behaviour, user pauses, `TOGGLE`/`NEXT`/
+`REPLAY` while hidden, sequential and random list playback with `loop` on and
+off, single-video lists, and configuration fallbacks.
+
+Linting (optional, needs `npm install` once):
+
+```bash
+npm run lint
+```
