@@ -139,6 +139,7 @@ export default class AnalyserAudio {
 
         this.#isActive = this.#config.audioOnly ? mediaType === 'audio' : true;
         this.#player.dom.getElement(this.#apiKey).classList.toggle('has-audio-analyser', this.#isActive);
+        this.reset(); // a new track means stale analysis data must not leak into the next one
         if (!this.#isActive) this.stopLoop();
 
     };
@@ -165,6 +166,25 @@ export default class AnalyserAudio {
 
         this.#audio.analysers.forEach((analyser, index) => {
             this.#audio.splitter.connect(analyser, index);
+        });
+
+    }
+
+    /**
+     * Resets the analysis state so no data from a previous track leaks into the next one.
+     * Clears the frequency and waveform buffers and resets the smoothing state of the analysers.
+     * Subclasses can override this method to additionally reset their own render state (e.g. clearing the canvas),
+     * but must call `super.reset()` then.
+     */
+    reset() {
+
+        this.#audio.frequencyData.forEach(data => data.fill(0));
+        this.#audio.waveformData.forEach(data => data.fill(128)); // 128 is the "silence" midpoint of time-domain data
+
+        // Re-applying the smoothing constant drops the smoothed spectrum accumulated from the previous track.
+        this.#audio.analysers.forEach(analyser => {
+            analyser.smoothingTimeConstant = 0;
+            analyser.smoothingTimeConstant = this.#config.smoothingTime;
         });
 
     }
@@ -219,6 +239,7 @@ export default class AnalyserAudio {
      */
     destroy() {
 
+        this.#isActive = false;
         clearTimeout(this.#stopDelayId);
         this.#renderLoop.destroy();
         this.#audio.splitter.disconnect();

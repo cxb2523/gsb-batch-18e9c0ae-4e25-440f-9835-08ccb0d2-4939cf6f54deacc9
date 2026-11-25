@@ -66,13 +66,34 @@ export default class VisualizerBar extends AnalyserAudio {
      * Flag indicating if the visualizer should use a worker.
      * @type {boolean}
      */
-    #useWorker;
+    #useWorker = false;
 
     /**
      * Optional worker which renders the canvas offscreen.
      * @type {module:src/visualizer/bar/VisualizerBarWorker}
      */
     #worker;
+
+    /**
+     * Flag indicating if the render path (worker or main thread) has finished initializing.
+     * Rendering and resizing are skipped until this is true.
+     * @type {boolean}
+     */
+    #isReady = false;
+
+    /**
+     * Flag indicating if this component has been destroyed.
+     * Guards the async worker init and all render callbacks against use-after-destroy.
+     * @type {boolean}
+     */
+    #destroyed = false;
+
+    /**
+     * The most recently rendered (reduced) frequency data, kept so the canvas can be
+     * repainted after a resize (resizing a canvas clears its contents).
+     * @type {number[]|null}
+     */
+    #lastData = null;
 
     /**
      * Creates an instance of the VisualizerBar component.
@@ -119,17 +140,33 @@ export default class VisualizerBar extends AnalyserAudio {
     /**
      * Initializes the worker for offloading rendering, if supported.
      * If workers are not supported, sets up local canvas rendering.
+     * Since the support detection is asynchronous, the component may have been
+     * destroyed in the meantime - in this case, initialization is aborted silently.
      */
     async #initWorker() {
 
-        const { canvas } = this.#dom;
-        this.#useWorker = await supportsWorkerModules();
-        this.#useWorker = this.#useWorker && canvas.transferControlToOffscreen;
+        const { canvas } = this.#dom,
+              workerSupported = await supportsWorkerModules();
 
-        if (this.#useWorker) {
+        if (this.#destroyed) return; // destroyed while the async detection was pending
+
+        if (workerSupported && typeof canvas.transferControlToOffscreen === 'function') {
+
             const offscreen = canvas.transferControlToOffscreen();
-            this.#worker = new BarWorker();
-            this.#worker.postMessage({ type: 'init', offscreenCanvas: offscreen, config: this.#config }, [offscreen]);
+
+            try {
+                this.#worker = new BarWorker();
+                this.#worker.postMessage({ type: 'init', offscreenCanvas: offscreen, config: this.#config }, [offscreen]);
+                this.#useWorker = true;
+            } catch (error) {
+                // The canvas control has already been transferred to the offscreen canvas, so falling back
+                // to main-thread rendering is not possible anymore - disable rendering instead of drawing twice.
+                // eslint-disable-next-line no-console
+                console.warn('[VisualizerBar] Worker initialization failed, rendering is disabled.', error);
+                this.#worker = null;
+                return;
+            }
+
         } else {
             this.#canvas = {
                 ele: canvas,
@@ -137,7 +174,9 @@ export default class VisualizerBar extends AnalyserAudio {
             };
         }
 
+        this.#isReady = true;
         this.#resize();
+
     }
 
     /**
@@ -158,22 +197,57 @@ export default class VisualizerBar extends AnalyserAudio {
      */
     analyseLoop() {
 
+        if (!this.#isReady || this.#destroyed) return;
+
         const { frequencyData } = super.analyseLoop(),
               reduced = AnalyserAudio.reduceFrequencies(frequencyData[0], this.#config.bands);
 
-        if (this.#useWorker) this.#worker.postMessage({ type: 'render', frequencyData: reduced }, {});
-        else render(reduced, this.#canvas, this.#canvas.ctx, this.#config);
+        this.#lastData = reduced;
+        this.#renderFrame(reduced);
+
+    }
+
+    /**
+     * Resets the render state when a new track starts.
+     * Clears the canvas (on the worker or main thread) so no bars from the previous track remain visible.
+     * @override
+     */
+    reset() {
+
+        super.reset();
+        this.#lastData = null;
+
+        if (!this.#isReady || this.#destroyed) return;
+
+        if (this.#useWorker) this.#worker.postMessage({ type: 'clear' });
+        else if (this.#canvas) this.#canvas.ctx.clearRect(0, 0, this.#canvas.ele.width, this.#canvas.ele.height);
+
+    }
+
+    /**
+     * Renders a single frame, either by posting the data to the worker or by drawing directly on the canvas.
+     * @param {number[]} frequencyData  The reduced frequency data to render.
+     */
+    #renderFrame(frequencyData) {
+
+        if (this.#useWorker) this.#worker.postMessage({ type: 'render', frequencyData }, {});
+        else if (this.#canvas) render(frequencyData, this.#canvas, this.#canvas.ctx, this.#config);
 
     }
 
     /**
      * Resizes the canvas based on UI changes.
+     * Since resizing a canvas clears its contents, a repaint with the most recent data is triggered afterwards.
+     * Safely skipped if the render path is not initialized yet or the container has no audio analyser state.
      * @listens module:src/ui/UI#ui/resize
      */
     #resize = () => {
 
-        // TODO: maybe a bit too brittle, refactor later with own state?
-        if (!this.#canvas && !this.#worker || !this.#player.dom.getElement(this.#apiKey).classList.contains('has-audio-analyser')) return;
+        if (this.#destroyed || !this.#isReady) return;
+
+        const playerEle = this.#player.dom.getElement(this.#apiKey);
+
+        if (!playerEle || !playerEle.classList.contains('has-audio-analyser')) return;
 
         const ele = this.#dom.canvas,
               deviceRatio = window.devicePixelRatio ?? 1,
@@ -185,16 +259,28 @@ export default class VisualizerBar extends AnalyserAudio {
             ele.height = this.#canvas.height = height * deviceRatio;
         }
 
+        // resizing clears the canvas, so repaint the current frame
+        this.#renderFrame(this.#lastData ?? new Array(this.#config.bands).fill(0));
+
     };
 
     /**
      * Cleans up all events, subscriptions, and DOM nodes created by this component.
+     * Terminates the worker and guarantees no render callbacks occur afterwards.
      */
     destroy() {
 
-        this.#dom.destroy();
-        this.#dom = this.#apiKey = null;
+        this.#destroyed = true;
+        this.#isReady = false;
+
+        if (this.#worker) {
+            this.#worker.terminate();
+            this.#worker = null;
+        }
+
         this.#player.unsubscribe(this.#subscriptions);
+        this.#dom.destroy();
+        this.#dom = this.#player = this.#apiKey = this.#canvas = this.#lastData = null;
         super.destroy();
 
     }

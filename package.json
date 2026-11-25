@@ -116,6 +116,7 @@
         "vite-plugin-rate-limiter": "^1.1.1"
     },
     "scripts": {
+        "test": "node --import ./test/helpers/register.mjs --test \"test/**/*.test.mjs\"",
         "dev": "vite --config ./scripts/build/vite.config.js",
         "debug": "vite --debug --config ./scripts/build/vite.config.js",
         "clean": "node -e \"if (require('fs').existsSync('./dist')) require('fs').rmSync('./dist', { recursive: true, force: true })\"",
