@@ -992,7 +992,7 @@ export class LocomotionController {
           // Bajando una escalera, el pie de atrás despega antes (menos tiempo apoyado). De espaldas a la pared, más tiempo
           // con los dos pies apoyados: el peso pasa de uno a otro despacio.
           const stairDuty = duty + (Math.min(STAIR_DOWN_DUTY, duty) - duty) * this.stairDescent;
-          this.gait.duty[event.side] = stairDuty + (Math.max(LEDGE_DUTY, stairDuty) - stairDuty) * smoothstep(this.ledgeBlend);
+          this.gait.setDuty(event.side, stairDuty + (Math.max(LEDGE_DUTY, stairDuty) - stairDuty) * smoothstep(this.ledgeBlend));
         } else {
           this.beginSwing(foot, dt);
         }
@@ -1487,7 +1487,10 @@ export class LocomotionController {
     swing.startRotation.copy(foot.rotation);
 
     const angularSpeed = Math.abs(this.body.state.turnRate);
-    const swingTime = this.gait.swingDuration(this.speed, angularSpeed, this.gait.duty[foot.side]);
+    // La duración del swing es la que el GaitController fijó al despegar (duty del pie + cadencia de ese
+    // instante), no la que saldría de la velocidad de este frame: frenar o girar con el pie en el aire no
+    // puede acortar ni alargar su swing, ni cambiar su estado.
+    const swingTime = this.gait.footSwingDuration(foot.side);
     // El despegue ocurrió entre el frame anterior y este: ya pasó parte del swing.
     const sinceLiftoff = this.gait.swingProgress(foot.side) * swingTime;
     // `foot.position` es aún la del frame anterior, y el despegue ocurrió entre ese frame y este:
@@ -1755,7 +1758,10 @@ export class LocomotionController {
     swing.previousEndRotation.copy(swing.endRotation);
     const wasGoingUp = swing.end.y > swing.start.y;
     const angularSpeed = Math.abs(this.body.state.turnRate);
-    const swingTime = this.gait.swingDuration(this.speed, angularSpeed, this.gait.duty[foot.side]);
+    // La duración del swing es la que el GaitController fijó al despegar (duty del pie + cadencia de ese
+    // instante), no la que saldría de la velocidad de este frame: frenar o girar con el pie en el aire no
+    // puede acortar ni alargar su swing, ni cambiar su estado.
+    const swingTime = this.gait.footSwingDuration(foot.side);
     this.planSwingLanding(foot, (1 - swing.t) * swingTime, angularSpeed);
     intent.replanned = true;
     swing.retargetFrom = swing.t;
@@ -2453,17 +2459,17 @@ export class LocomotionController {
     // decidiría al azar qué pie sale primero (distinto, p. ej., con otro tamaño). Empate → izquierdo.
     const lead: Side = ahead > TIE_TOLERANCE * this.config.stepLength ? 'right' : 'left';
     const trail: Side = lead === 'left' ? 'right' : 'left';
-    gait.duty[lead] = duty;
+    gait.setDuty(lead, duty);
     const plant = Math.min(cfg.plantFraction, duty * 0.25);
     // Apoyo del de atrás tal que su LIFT empiece justo ahora (fase 0,5 + plant): d = 0,5 + plant + lift,
     // con lift = min(liftFraction, d · tope).
     const start = 0.5 + plant;
     const share = gait.maxLiftShare();
     const trailDuty = cfg.liftFraction <= share * (start + cfg.liftFraction) ? start + cfg.liftFraction : start / (1 - share);
-    gait.duty[trail] = Math.max(duty, trailDuty);
+    gait.setDuty(trail, Math.max(duty, trailDuty));
     // El de delante no despega antes que el de atrás: corriendo deprisa su apoyo (runDutyFactor) es más corto que lo
     // que le queda al de atrás para despegar, y despegaban en el orden equivocado (el mismo pie dos veces seguidas).
-    gait.duty[lead] = Math.max(duty, plant + gait.duty[trail] - start + LANDING_LIFT_GAP);
+    gait.setDuty(lead, Math.max(duty, plant + gait.duty[trail] - start + LANDING_LIFT_GAP));
     gait.phase = fract(plant - gait.offsets[lead]);
   }
 

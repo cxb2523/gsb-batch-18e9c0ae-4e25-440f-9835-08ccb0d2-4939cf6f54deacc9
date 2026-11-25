@@ -31,6 +31,13 @@ const SIDES: readonly Side[] = ['left', 'right'];
  * `runSpeed`, the `run*` ones) with the pace `pace` (0 → 1). Each foot fixes its β when it lands and keeps it during its cycle, so that a change of β
  * doesn't make it change state abruptly (for example, "landing" in the air).
  *
+ * Each foot's step timing is fixed at take-off: it keeps the duty factor it landed with and the cadence
+ * (including the extra cadence a turn asks for) in effect then, and the swing duration derived from both is
+ * the one the footstep planner uses to project its landing. Speed or turn changes while the foot is in the
+ * air never alter that foot — they only reach feet still on the ground, before their next take-off. This
+ * keeps the gait phase, the per-foot duty and the footstep plan on one shared set of numbers, with no state
+ * changes or re-planning mid-swing.
+ *
  * Modes:
  *  - walk: the phase advances (walking or running).
  *  - idle: the phase stops (only in double support) and both feet are PLANTED.
@@ -53,6 +60,18 @@ export class GaitController {
   pace = 0;
   /** Duty factor of each foot, fixed at its last landing. */
   readonly duty: Record<Side, number> = { left: 0, right: 0 };
+  /**
+   * Target cycle frequency (cycles/s) of each foot's current step: the cadence asked for at the moment the
+   * foot took off (including the extra frequency a turn requests), locked together with the duty factor the
+   * foot landed with. While the foot is in the air neither changes, whatever the current speed or turn rate
+   * do: its swing duration and the point the planner projects stay fixed, so a foot never changes state or
+   * re-plans mid-swing. A change of cadence reaches a foot only while it is planted, i.e. before take-off.
+   * Note this is the *target* cadence used to time the step; the shared phase clock (`frequency`) is still
+   * smoothed, so the visible motion never jumps when a turn or a speed change ends.
+   */
+  readonly stepFrequency: Record<Side, number> = { left: 0, right: 0 };
+  /** Swing duration (s) locked for each foot's current swing; 0 while the foot is on the ground. */
+  readonly lockedSwingDuration: Record<Side, number> = { left: 0, right: 0 };
   readonly offsets: Record<Side, number> = { left: 0, right: 0.5 };
   readonly config: LocomotionConfig;
 
@@ -71,6 +90,10 @@ export class GaitController {
     this.pace = 0;
     this.duty.left = this.config.dutyFactor;
     this.duty.right = this.config.dutyFactor;
+    this.stepFrequency.left = 0;
+    this.stepFrequency.right = 0;
+    this.lockedSwingDuration.left = 0;
+    this.lockedSwingDuration.right = 0;
     this.phase = (this.config.dutyFactor - 0.5) / 2; // centro del primer doble apoyo
   }
 
@@ -109,6 +132,19 @@ export class GaitController {
   /** Duty factor of a foot landing at this speed. */
   dutyAt(speed: number): number {
     return this.dutyFor(this.runFactor(speed), this.paceFactor(speed));
+  }
+
+  /**
+   * Sets the duty factor of a planted foot (stairs, ledges, landing from a jump adjust it). The foot is on
+   * the ground, so it has no locked swing: the adjustment is coherent with the cadence, which will be locked
+   * together with this duty at the next take-off. Refuses to change the duty of a foot in the air, whose
+   * duty is fixed for the whole swing.
+   */
+  setDuty(side: Side, duty: number): void {
+    if (this.mode !== 'idle' && this.footPhase(side) >= this.duty[side]) return;
+    this.duty[side] = duty;
+    this.stepFrequency[side] = 0;
+    this.lockedSwingDuration[side] = 0;
   }
 
   /** Phase of the foot, 0 → 1 (0 = landing). */
@@ -207,9 +243,25 @@ export class GaitController {
     return Math.max(f, speed / maxStep, turnLimit, this.minFrequency);
   }
 
-  /** Swing duration (s) of a foot with duty factor `duty`. */
+  /** Swing duration (s) of a foot with duty factor `duty` at the cadence of `speed`/`angularSpeed`. */
   swingDuration(speed: number, angularSpeed: number, duty: number): number {
     return (1 - duty) / this.cycleFrequency(speed, angularSpeed);
+  }
+
+  /**
+   * Swing duration (s) of the swing `side` is currently following: the one locked at its take-off, from the
+   * duty it landed with and the target cadence at that moment. It is exactly the duration the footstep
+   * planner used to project this step's landing, and it stays constant for the whole swing, so braking,
+   * accelerating or starting a turn while the foot is in the air never changes how long it stays there (and
+   * therefore never changes its state or its plan). 0 while the foot is planted.
+   */
+  footSwingDuration(side: Side): number {
+    return this.lockedSwingDuration[side];
+  }
+
+  /** Target cycle frequency (cycles/s) locked for `side`'s current step, at its take-off (0 while planted). */
+  footStepFrequency(side: Side): number {
+    return this.stepFrequency[side];
   }
 
   /** Stance duration (s) a foot landing at this speed would have. */
@@ -272,7 +324,9 @@ export class GaitController {
     }
 
     // La cadencia cambia de forma continua: al terminar un giro (que la sube para no girar demasiado
-    // por paso) no cae de golpe, lo que daba un tirón a los pies en el aire y a las caderas.
+    // por paso) no cae de golpe, lo que daba un tirón a los pies en el aire y a las caderas. Este reloj de
+    // fase global se suaviza siempre; lo que se bloquea por pie (ver más abajo) es la duración de su swing,
+    // calculada con la cadencia objetivo del instante del despegue, no este reloj suavizado.
     const target = this.cycleFrequency(speed, angularSpeed);
     const maxChange = MAX_FREQUENCY_RATE * dt;
     this.frequency = this.frequency > 0 ? this.frequency + Math.min(Math.max(target - this.frequency, -maxChange), maxChange) : target;
@@ -283,11 +337,23 @@ export class GaitController {
       const p0 = before[side];
       const p1 = this.footPhase(side);
       const b = this.duty[side];
-      if (p0 < b && p1 >= b) this.events.push({ side, type: 'liftoff' });
+      if (p0 < b && p1 >= b) {
+        this.events.push({ side, type: 'liftoff' });
+        // El pie se va al aire con el duty que fijó al aterrizar y la cadencia objetivo de este instante
+        // (que ya incluye la subida que el giro pedía, pues el giro actuó mientras el pie estaba apoyado).
+        // Es la misma cadencia con la que el planificador proyecta el aterrizaje, y la misma que se usaba
+        // antes del cambio: la novedad es que se guarda y ya no se recalcula con la velocidad de cada frame.
+        // De aquí al próximo aterrizaje, ni el duty ni la duración del swing de este pie cambian, aunque la
+        // velocidad o el giro varíen: el pie no cambia de estado ni re-proyecta su paso en el aire.
+        this.stepFrequency[side] = target;
+        this.lockedSwingDuration[side] = (1 - b) / target;
+      }
       if (p1 < p0) {
         // Dio la vuelta (1 → 0): aterriza y fija su duty factor para este ciclo.
         this.events.push({ side, type: 'touchdown' });
         this.duty[side] = this.dutyFor(this.blend, this.pace);
+        this.stepFrequency[side] = 0;
+        this.lockedSwingDuration[side] = 0;
       }
     }
     return this.events;
