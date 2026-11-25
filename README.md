@@ -117,8 +117,14 @@ src/layout.ts        projects → buildings, services → racks, walking routes
 src/scene/           three.js scene (react-three-fiber): buildings, racks, agents, effects
 src/hud/             overlay UI: top bar, menus, KPIs, inspector, pipeline
 src/sound.ts         UI sounds, synthesised with Web Audio
+tests/               unit tests for the layout and the scene agents
 templates/dokploy/   Dokploy template
 ```
+
+A compose stack or a replicated service is split into one **container node** per container, each
+on its own rack slot. The main container keeps the service id and is the node every deploy cart
+drives to; helper containers get `<serviceId>::<container>` ids, and the technician attends any
+node that is in error with an open alert.
 
 ### Releasing
 

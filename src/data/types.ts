@@ -128,3 +128,14 @@ export interface SourceStatus {
 }
 
 export const isActiveDeploy = (d: Deployment) => d.status === 'queued' || d.status === 'running';
+
+/**
+ * A service with several containers (a compose stack, or replicas) is split into one node per
+ * container. The main container's node keeps the service id (deploys, and therefore carts, hang
+ * off it); every other node gets `<serviceId>::<containerKey>`.
+ */
+export const CONTAINER_NODE_SEP = '::';
+export const containerNodeId = (serviceId: string, key: string) => `${serviceId}${CONTAINER_NODE_SEP}${key}`;
+export const isContainerNodeId = (id: string) => id.includes(CONTAINER_NODE_SEP);
+/** The service a node belongs to: its own id for the main container, the prefix for a helper. */
+export const serviceIdOfNode = (nodeId: string) => nodeId.split(CONTAINER_NODE_SEP)[0];

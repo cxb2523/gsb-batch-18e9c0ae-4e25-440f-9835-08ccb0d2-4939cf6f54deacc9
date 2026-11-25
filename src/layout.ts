@@ -9,7 +9,7 @@
  *
  * Frame: x → right, z → toward the camera, y up.
  */
-import { isDb, type Environment, type Project, type Service } from './data/types';
+import { isContainerNodeId, isDb, serviceIdOfNode, type Environment, type Project, type Service } from './data/types';
 
 export type V3 = [number, number, number];
 
@@ -59,7 +59,12 @@ export interface BuildingLayout {
 }
 
 export interface Slot {
+  /** Node id: the service id for a service's main container, `<serviceId>::<container>` otherwise. */
   serviceId: string;
+  /** The service this node belongs to (the same string as `serviceId` for a main container). */
+  baseServiceId: string;
+  /** True for the one node that keeps the service id; every other node is a helper container. */
+  main: boolean;
   projectId: string;
   environmentId: string;
   /** Rack / tank centre on the floor. */
@@ -158,6 +163,8 @@ export function computeLayout({ projects, environments, services }: Structure): 
           const x = bx + b.rackStartX + PITCH / 2 + k * PITCH;
           slots[svc.id] = {
             serviceId: svc.id,
+            baseServiceId: serviceIdOfNode(svc.id),
+            main: !isContainerNodeId(svc.id),
             projectId: b.project.id,
             environmentId: env.id,
             pos: [x, 0, rackZ],
@@ -214,6 +221,30 @@ const shift = (pts: V3[], dx: number): V3[] => pts.map(([x, y, z]) => [x + dx, y
 function buildingOf(layout: Layout, serviceId: string) {
   const slot = layout.slots[serviceId];
   return slot && layout.buildings.find((b) => b.projectId === slot.projectId);
+}
+
+/**
+ * The node that keeps the service id (its main container): the one deploys, and therefore carts,
+ * belong to. Helpers are `<serviceId>::<container>` and must never be a cart's destination; asking
+ * for one resolves to the service's main node, never back to the helper.
+ */
+export function mainNodeId(layout: Layout, serviceId: string): string | null {
+  const base = serviceIdOfNode(serviceId);
+  const direct = layout.slots[base];
+  if (direct?.main) return base;
+  // Defensive: a service's main node is normally keyed by its own id, but a partial world could
+  // list only some containers. Prefer the main one among the service's nodes; never a helper.
+  for (const id of Object.keys(layout.slots)) {
+    const slot = layout.slots[id];
+    if (slot.main && slot.baseServiceId === base) return id;
+  }
+  return null;
+}
+
+/** All rack slots of one service, main node first. */
+export function nodeIdsOfService(layout: Layout, serviceId: string): string[] {
+  const ids = Object.keys(layout.slots).filter((id) => layout.slots[id].baseServiceId === serviceId);
+  return ids.sort((a, b) => Number(layout.slots[b].main) - Number(layout.slots[a].main));
 }
 
 /** door (outside, on the street) → door (inside) → spine → corridor → in front of the rack. */

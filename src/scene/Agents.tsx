@@ -1,79 +1,42 @@
 /**
  * Deploy carts and the technician. All motion runs in useFrame on refs; the store only hears
  * when a cart is gone.
+ *
+ * Container identity: a service with several containers is several nodes, each in its own rack.
+ * Deploy carts only ever drive to the service's main node (the one that keeps the service id),
+ * never to a helper container. The technician handles any node that is in error with an open
+ * alert, oldest incident first. Layout rebuilds (projects / environments / services added or
+ * removed) discard the old route coordinates: carts re-plan onto the new rack, the technician
+ * re-plans to its current target or goes home.
  */
 import { RoundedBox } from '@react-three/drei';
 import { useFrame } from '@react-three/fiber';
 import { memo, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import * as THREE from 'three';
 import { STAGES } from '../data/types';
-import { cartRoute, routeBetween, routeFromHome, routeHome, type Layout, type V3 } from '../layout';
+import { routeFromHome, type Layout, type V3 } from '../layout';
 import { useStore } from '../store';
 import { Label } from './Label';
+import {
+  cartLeaves,
+  planAfterRecovery,
+  planCart,
+  planTechnician,
+  standSpot,
+  technicianQueue,
+  type TechPhase,
+  type TechPlan,
+} from './agents.logic';
+import { dampAngle, Walker } from './walker';
 
 const CART_SPEED = 3.2;
 const TECH_SPEED = 2.3;
 const TECH_DX = 0.42;
 const FACE_RACK = Math.PI; // racks face +z, so agents look toward -z
 
-// ---- path following -----------------------------------------------------------------
-
-class Walker {
-  readonly pos: THREE.Vector3;
-  heading = 0;
-  private readonly pts: THREE.Vector3[];
-  private i = 1;
-  private traveled = 0;
-  readonly total: number;
-
-  constructor(points: V3[]) {
-    this.pts = points.map((p) => new THREE.Vector3(...p));
-    this.pos = this.pts[0].clone();
-    this.total = this.pts.reduce((acc, p, k) => (k ? acc + p.distanceTo(this.pts[k - 1]) : 0), 0);
-    if (this.pts.length > 1) this.heading = headingTo(this.pts[0], this.pts[1]);
-  }
-
-  /** Advances along the path; returns true once the last point is reached. */
-  step(dist: number) {
-    while (dist > 1e-6 && this.i < this.pts.length) {
-      const target = this.pts[this.i];
-      const d = this.pos.distanceTo(target);
-      if (d > 1e-6) this.heading = headingTo(this.pos, target);
-      if (d <= dist) {
-        this.pos.copy(target);
-        this.traveled += d;
-        dist -= d;
-        this.i++;
-      } else {
-        this.pos.lerp(target, dist / d);
-        this.traveled += dist;
-        dist = 0;
-      }
-    }
-    return this.done;
-  }
-
-  get done() {
-    return this.i >= this.pts.length;
-  }
-  get remaining() {
-    return Math.max(0, this.total - this.traveled);
-  }
-}
-
-const headingTo = (a: THREE.Vector3, b: THREE.Vector3) => Math.atan2(b.x - a.x, b.z - a.z);
-
-function dampAngle(current: number, target: number, lambda: number, dt: number) {
-  const diff = Math.atan2(Math.sin(target - current), Math.cos(target - current));
-  return current + diff * (1 - Math.exp(-lambda * dt));
-}
-
 // ---- carts ----------------------------------------------------------------------------
 
-/**
- * Deploy carts, plus the technician: he walks to nodes in error and leaves when Dokploy reports
- * them healthy again.
- */
+/** Deploy carts; see the file header for the main-container / node identity rules. */
 export function Agents({ layout }: { layout: Layout }) {
   const carts = useStore((s) => s.carts);
   return (
@@ -95,27 +58,80 @@ const Cart = memo(function Cart({ deploymentId, layout }: { deploymentId: string
   const still = useStore((s) => s.reducedMotion);
   const [phase, setPhase] = useState<CartPhase>('out');
 
-  // Route is fixed at spawn; later data changes don't reroute a cart that is already rolling.
-  const [route] = useState(() => (dep ? cartRoute(layout, dep.serviceId, dep.cart % 2 ? -0.34 : 0.04) : null));
-  const sim = useRef({ walker: route ? new Walker(route) : null, phase: 'out' as CartPhase | 'gone', age: 0, docked: 0 });
+  const lane = dep ? (dep.cart % 2 ? -0.34 : 0.04) : 0.04;
+  // Route is state (so render and frames agree); it changes only on spawn and layout rebuilds.
+  const [route, setRoute] = useState<V3[] | null>(() => (dep ? planCart(layout, dep.serviceId, lane).route : null));
+  const routeRef = useRef(route);
+  routeRef.current = route;
+  const sim = useRef({
+    walker: route ? new Walker(route) : null,
+    phase: 'out' as CartPhase | 'gone',
+    age: 0,
+    docked: 0,
+    lastPos: route ? new THREE.Vector3(...route[0]) : null as THREE.Vector3 | null,
+  });
 
   const group = useRef<THREE.Group>(null);
   const chassis = useRef<THREE.Group>(null);
   const terminal = !dep || dep.status === 'success' || dep.status === 'failed';
   const terminalRef = useRef(terminal);
   terminalRef.current = terminal;
+  const depRef = useRef(dep);
+  depRef.current = dep;
+  const laneRef = useRef(lane);
+  laneRef.current = lane;
+  const spawned = useRef(false);
 
-  // No place to drive to (unknown service): no animation, drop the cart once the deploy ends.
+  // Layout rebuilt (service / environment / project added or removed): never keep the old
+  // coordinates. Re-plan to the service's main node in the new layout and snap onto its route.
   useEffect(() => {
-    if (!route && terminal) useStore.getState().cartGone(deploymentId);
-  }, [route, terminal, deploymentId]);
+    // Skipped on mount: the spawn route above is already against this layout.
+    if (!spawned.current) {
+      spawned.current = true;
+      return;
+    }
+    const st = sim.current;
+    if (st.phase === 'gone') return;
+    const d = depRef.current;
+    const next = d ? planCart(layout, d.serviceId, laneRef.current).route : null;
+    setRoute(next);
+    routeRef.current = next;
+    if (!next) {
+      // The service has no node in this layout: park the cart (it leaves once the deploy ends).
+      st.walker = null;
+      if (terminalRef.current) {
+        st.phase = 'gone';
+        useStore.getState().cartGone(deploymentId);
+      }
+      return;
+    }
+    // Resume from where the cart is now; when docked, head for the new main rack's spot.
+    const from = st.lastPos?.clone() ?? st.walker?.pos.clone();
+    const at = st.phase === 'docked' ? new THREE.Vector3(...next[next.length - 1]) : from;
+    st.walker = st.phase === 'back' ? new Walker(next.slice().reverse(), at) : new Walker(next, at);
+  }, [layout, deploymentId]);
+
+  // Nowhere to drive at all: leave as soon as the deploy ends instead of hanging around.
+  useEffect(() => {
+    if (!cartLeaves(routeRef.current, terminal)) return;
+    const st = sim.current;
+    if (st.phase === 'gone') return;
+    st.phase = 'gone';
+    useStore.getState().cartGone(deploymentId);
+  }, [terminal, deploymentId]);
 
   useFrame((_, rawDt) => {
     const st = sim.current;
     const g = group.current;
-    if (!g || !st.walker || st.phase === 'gone') return;
+    if (!g || st.phase === 'gone') return;
     const dt = Math.min(rawDt, 0.1);
     st.age += dt;
+
+    if (!st.walker) {
+      // No destination yet: stay hidden (the effects above leave once the deploy ends).
+      g.scale.setScalar(0.001);
+      return;
+    }
 
     let moving = false;
     if (st.phase === 'out') {
@@ -126,9 +142,9 @@ const Cart = memo(function Cart({ deploymentId, layout }: { deploymentId: string
       }
     } else if (st.phase === 'docked') {
       st.docked += dt;
-      if (terminalRef.current && st.docked > 0.8 && route) {
+      if (terminalRef.current && st.docked > 0.8 && routeRef.current) {
         st.phase = 'back';
-        st.walker = new Walker(route.slice().reverse());
+        st.walker = new Walker(routeRef.current.slice().reverse());
         setPhase('back');
       }
     } else if (st.walker.step(CART_SPEED * dt)) {
@@ -140,6 +156,7 @@ const Cart = memo(function Cart({ deploymentId, layout }: { deploymentId: string
     }
 
     g.position.copy(st.walker.pos);
+    st.lastPos = st.walker.pos.clone();
     const heading = st.phase === 'docked' ? FACE_RACK : st.walker.heading;
     g.rotation.y = st.age < 0.05 ? heading : dampAngle(g.rotation.y, heading, 12, dt);
     const appear = Math.min(1, st.age / 0.35);
@@ -148,7 +165,7 @@ const Cart = memo(function Cart({ deploymentId, layout }: { deploymentId: string
     if (chassis.current) chassis.current.position.y = moving && !still ? Math.abs(Math.sin(st.age * 16)) * 0.02 : 0;
   });
 
-  if (!route || !dep) return null;
+  if (!dep) return null;
 
   const stage = dep.stages.findIndex((s) => s === 'running' || s === 'failed');
   const label =
@@ -169,7 +186,7 @@ const Cart = memo(function Cart({ deploymentId, layout }: { deploymentId: string
   const failed = dep.status === 'failed';
 
   return (
-    <group ref={group} scale={0.001} position={route[0]}>
+    <group ref={group} scale={0.001} position={route ? route[0] : layout.home}>
       <group ref={chassis}>
         <RoundedBox args={[0.56, 0.2, 0.74]} radius={0.06} smoothness={3} position-y={0.2} castShadow>
           <meshStandardMaterial color="#1a2436" roughness={0.35} metalness={0.6} />
@@ -222,21 +239,14 @@ const Cart = memo(function Cart({ deploymentId, layout }: { deploymentId: string
 
 // ---- technician ---------------------------------------------------------------------
 
-type TechPhase = 'idle' | 'walk' | 'work' | 'home';
-
 function Technician({ layout }: { layout: Layout }) {
   const alerts = useStore((s) => s.alerts);
   const services = useStore((s) => s.services);
   const still = useStore((s) => s.reducedMotion);
 
-  // Services that need a hand: open critical alert + still in error. Oldest incident first.
-  const queue = useMemo(() => {
-    const ids = Object.values(alerts)
-      .filter((a) => !a.resolvedAt && a.severity === 'critical' && services[a.serviceId]?.status === 'error')
-      .sort((a, b) => a.createdAt - b.createdAt)
-      .map((a) => a.serviceId);
-    return [...new Set(ids)].filter((id) => layout.slots[id]);
-  }, [alerts, services, layout]);
+  // Nodes that need a hand: an open alert on a node that is still in error. Oldest incident
+  // first, one entry per node, and only while the node still has a rack in the layout.
+  const queue = useMemo(() => technicianQueue(alerts, services, layout), [alerts, services, layout]);
   const queueRef = useRef(queue);
   queueRef.current = queue;
 
@@ -246,6 +256,8 @@ function Technician({ layout }: { layout: Layout }) {
     walker: null as Walker | null,
     target: null as string | null,
     at: null as string | null,
+    pos: layout.home as V3,
+    lastPos: layout.home as V3,
     t: 0,
   });
 
@@ -256,61 +268,76 @@ function Technician({ layout }: { layout: Layout }) {
   const armL = useRef<THREE.Group>(null);
   const armR = useRef<THREE.Group>(null);
 
+  const applyPlan = (plan: TechPlan, resumeAt?: THREE.Vector3) => {
+    const st = sim.current;
+    st.phase = plan.phase;
+    st.target = plan.target;
+    st.at = plan.at;
+    st.walker = plan.path ? new Walker(plan.path, resumeAt) : null;
+    if (plan.pos) st.pos = plan.pos;
+    setMode(plan.phase);
+  };
+
+  const settleHome = () =>
+    applyPlan({ phase: 'idle', target: null, at: null, path: null, pos: layout.home });
+
+  // Layout rebuilt: drop every old route. Keep working at a rack that still needs it (its new
+  // spot), walk to the node we were after (or the oldest open incident) through the new layout,
+  // else go back home. Resume from the current spot so nothing jumps across the new floor.
+  useEffect(() => {
+    const st = sim.current;
+    const from = new THREE.Vector3(...st.lastPos);
+    applyPlan(planTechnician(layout, queueRef.current, { phase: st.phase, target: st.target, at: st.at }, TECH_DX), from);
+    // `applyPlan` only touches refs and setMode; the layout is the trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layout]);
+
   useFrame((_, rawDt) => {
     const st = sim.current;
     const g = root.current;
     if (!g) return;
     const dt = Math.min(rawDt, 0.1);
     st.t += dt;
+    const q = queueRef.current;
 
     const go = (phase: TechPhase, path: V3[] | null, target: string | null) => {
       if (!path) return false;
-      st.phase = phase;
-      st.walker = new Walker(path);
-      st.target = target;
-      setMode(phase);
+      applyPlan({ phase, target, at: null, path, pos: null });
       return true;
     };
-    const next = () => {
-      const from = st.at!;
-      const job = queueRef.current.find((id) => id !== from);
-      if (!(job && go('walk', routeBetween(layout, from, job, TECH_DX), job))) {
-        go('home', routeHome(layout, from, TECH_DX), null);
-      }
-    };
+    const next = () => applyPlan(planAfterRecovery(layout, q, st.at, TECH_DX));
 
     switch (st.phase) {
       case 'idle': {
-        const job = queueRef.current[0];
+        const job = q[0];
         if (job) go('walk', routeFromHome(layout, job, TECH_DX), job);
         break;
       }
       case 'walk':
-        if (st.walker!.step(TECH_SPEED * dt)) {
+        if (st.walker && st.walker.step(TECH_SPEED * dt)) {
           st.at = st.target;
-          if (st.at && queueRef.current.includes(st.at)) {
-            st.phase = 'work';
-            setMode('work');
+          // Arrived, but it recovered (or its alert resolved) on the way: never investigate a node
+          // that is no longer in the queue -- take the next incident, or go home.
+          if (st.at && q.includes(st.at) && layout.slots[st.at]) {
+            // Stand at the node's (possibly moved) front spot, with the routes' lateral shift.
+            applyPlan({ phase: 'work', target: st.at, at: st.at, path: null, pos: standSpot(layout, st.at, TECH_DX) });
           } else next();
         }
         break;
       case 'work':
-        if (!queueRef.current.includes(st.at!)) next(); // Dokploy says it's healthy again
+        // Recovered, removed, or its alert resolved: leave and take the next incident (or go home).
+        if (!st.at || !q.includes(st.at) || !layout.slots[st.at]) next();
         break;
       case 'home':
-        if (st.walker!.step(TECH_SPEED * dt)) {
-          st.phase = 'idle';
-          st.at = null;
-          st.walker = null;
-          setMode('idle');
-        }
+        if (st.walker && st.walker.step(TECH_SPEED * dt)) settleHome();
         break;
     }
 
     // pose
     const walking = st.phase === 'walk' || st.phase === 'home';
-    if (st.walker) g.position.copy(st.walker.pos);
-    else g.position.set(...layout.home);
+    if (walking && st.walker) g.position.copy(st.walker.pos);
+    else g.position.set(...st.pos);
+    st.lastPos = [g.position.x, g.position.y, g.position.z];
     const heading = st.phase === 'work' ? FACE_RACK : st.walker ? st.walker.heading : 0;
     g.rotation.y = dampAngle(g.rotation.y, heading, 10, dt);
 

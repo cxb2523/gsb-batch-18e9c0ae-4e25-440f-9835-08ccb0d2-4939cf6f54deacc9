@@ -14,7 +14,16 @@
  * publishes only what changed.
  */
 import { diffWorld } from '../diff';
-import type { Alert, Deployment, Server, Service, ServiceStatus, SourceStatus, World } from '../types';
+import {
+  containerNodeId,
+  type Alert,
+  type Deployment,
+  type Server,
+  type Service,
+  type ServiceStatus,
+  type SourceStatus,
+  type World,
+} from '../types';
 import {
   UpstreamError,
   belongsTo,
@@ -61,9 +70,6 @@ const milli = (v: number) => Math.round(v * 1000) / 1000;
 const NET_WINDOW_MS = 5 * 60_000;
 
 type NetSample = { at: number; rx: number; tx: number };
-
-/** Id of the node for one container of a service; see `compose()`. */
-export const containerNodeId = (serviceId: string, key: string) => `${serviceId}::${key}`;
 
 /** Swarm tasks are named `app.1.<task id>`; drop the task id so the node survives redeploys. */
 const containerKey = (name: string) => name.replace(/^(.+\.\d+)\.[a-z0-9]{10,}$/, '$1');

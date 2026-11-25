@@ -8,6 +8,7 @@ import { create } from 'zustand';
 import { SAMPLE_SECONDS, type DataSource } from './data/source';
 import {
   isActiveDeploy,
+  isContainerNodeId,
   type Alert,
   type Deployment,
   type Environment,
@@ -392,7 +393,7 @@ function diffEvents(s: State, next: WorldSlice, p: WorldPatch): ActivityEvent[] 
     const prev = s.services[svc.id];
     if (!prev) {
       // Container nodes (`<service>::<container>`) appear once stats arrive; not news.
-      if (!svc.id.includes('::')) out.push(ev({ kind: 'new-node', at: now, tone: 'info', text: `New node ${svc.name}`, detail: where(svc.id), serviceId: svc.id }));
+      if (!isContainerNodeId(svc.id)) out.push(ev({ kind: 'new-node', at: now, tone: 'info', text: `New node ${svc.name}`, detail: where(svc.id), serviceId: svc.id }));
       continue;
     }
     if (prev.status !== svc.status) {
