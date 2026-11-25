@@ -65,8 +65,28 @@ export type Side = "near" | "far";
  */
 export type SwingKind = "forehand" | "backhand" | "overhead" | "serve";
 
-/** What the host tells a phone happened, so it can show it. */
-export type FeedbackKind = "hit" | "miss" | "point";
+/**
+ * The authoritative fate of one swing, as ruled by the host (or by the
+ * phone's local gate for `refused` before anything is sent):
+ *
+ * - `hit` — the swing met/stuck the ball; a new `Stroke` exists.
+ * - `whiff` — it was in the adjudicable window but met nothing (the sim's
+ *   `whiffs` counter advanced). The phone shows 落空, never a hit.
+ * - `refused` — the swing does not count. Locally this is the cooldown gate
+ *   rejecting a peak (never reported); over the wire the host uses it when a
+ *   reported swing cannot be accepted at all (e.g. no addressable player).
+ *
+ * The phone presents from this verdict instead of guessing the outcome from
+ * its own detector (`llm-knowledge/architecture.md`, "the swing, end to end").
+ */
+export type SwingVerdict = "hit" | "whiff" | "refused";
+
+/**
+ * What the host tells a phone happened. The three `SwingVerdict` values rule
+ * one swing; `miss` and `point` are point-level results (lost/won the point),
+ * kept separate so a whiff mid-rally does not read as "POINT LOST".
+ */
+export type FeedbackKind = SwingVerdict | "miss" | "point";
 
 /**
  * Where the match is. Owned by the host — the server relays it and stores
@@ -188,10 +208,30 @@ export type HostBoundMessage =
 	| { t: "aim"; playerId: PlayerId; aim: Aim }
 	| { t: "swing"; playerId: PlayerId; swing: Swing };
 
-const FEEDBACK_KINDS: readonly FeedbackKind[] = ["hit", "miss", "point"];
+const FEEDBACK_KINDS: readonly FeedbackKind[] = [
+	"hit",
+	"whiff",
+	"refused",
+	"miss",
+	"point",
+];
 
 const isFeedbackKind = (x: unknown): x is FeedbackKind =>
 	FEEDBACK_KINDS.includes(x as FeedbackKind);
+
+/**
+ * The currently connected player holding `side`, or `null` when that seat is
+ * empty or dropped. This is the addressing half of "the verdict goes back to
+ * the phone that swung": the host rules by `Side`, the wire routes by
+ * `playerId`, and looking the id up here — rather than broadcasting — is what
+ * keeps two simultaneous swings from crossing phones.
+ */
+export function playerIdForSide(
+	players: readonly LobbyPlayer[],
+	side: Side,
+): PlayerId | null {
+	return players.find((p) => p.side === side && p.connected)?.playerId ?? null;
+}
 
 const MATCH_PHASES: readonly MatchPhase[] = [
 	"lobby",

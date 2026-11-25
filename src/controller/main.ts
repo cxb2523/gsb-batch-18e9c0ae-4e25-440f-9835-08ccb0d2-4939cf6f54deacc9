@@ -14,9 +14,10 @@ import type {
 	Side,
 	SwingKind,
 } from "../shared/protocol.ts";
-import { createSwingGate } from "../shared/swing/gate.ts";
+import { admitPeak, createSwingGate } from "../shared/swing/gate.ts";
 import { createSwingStream } from "../shared/swing/stream.ts";
 import { toSample } from "../shared/swing/trace.ts";
+import { dispatchFeedback } from "./feedback.ts";
 import { fillIcons } from "./icons.ts";
 import { requestMotionPermission } from "./motion.ts";
 import { createRacket, type Racket } from "./racket.ts";
@@ -199,6 +200,8 @@ function announce(): void {
 /** The screen is the feedback channel. */
 const FLASH: Record<FeedbackKind, string> = {
 	hit: "#dcff4a",
+	whiff: "#ffae2e",
+	refused: "#ff5a5f",
 	miss: "#ff5a5f",
 	point: "#34d86a",
 };
@@ -211,9 +214,9 @@ function flash(kind: FeedbackKind): void {
 			requestAnimationFrame(() => document.body.classList.remove("flash"));
 		});
 	}
-	if (kind === "hit") racket?.hit(shownPower);
-	else if (kind === "point") racket?.point();
-	else racket?.miss();
+	// The racket presents the host's verdict only: hit / whiff / refused /
+	// point / miss. It never invents a hit from its own detected swing.
+	dispatchFeedback(racket, kind, shownPower);
 }
 
 /** How the readout names each stroke, with the way it sends the ball on
@@ -289,8 +292,10 @@ function onMotion(event: DeviceMotionEvent): void {
 	if (g?.x != null && g.y != null) racket?.tilt(g.x / 9.81, -g.y / 9.81);
 	const swing = stream.push(sample);
 	if (swing === null) return;
-	if (!inRally()) cooldown.reset();
-	else if (!cooldown.admit(swing.at, swing.power)) {
+	// The one gate decision. A refused peak is shown on the racket and never
+	// reported; an admitted one is shown charging and sent with its lag, and
+	// the host's hit/whiff/refused verdict resolves the presentation.
+	if (!admitPeak(cooldown, swing.at, swing.power, inRally())) {
 		racket?.refused();
 		return;
 	}
@@ -324,6 +329,10 @@ function startPlaying(): void {
 			document.documentElement.style.setProperty("--side", SIDE_COLOR[side]);
 			racket?.setSide(SIDE_COLOR[side]);
 			document.body.classList.remove("gated");
+			// Every `assigned` is a fresh (or resumed) socket. A reconnect must
+			// not carry the old cooldown: rule it fully charged so the first
+			// swing after coming back is always admitted.
+			cooldown.reset();
 			// Sent HERE, not right after createSession: the socket is not open
 			// yet at that point and `send` would drop it silently. Being
 			// assigned a side is the first moment there is a session to be

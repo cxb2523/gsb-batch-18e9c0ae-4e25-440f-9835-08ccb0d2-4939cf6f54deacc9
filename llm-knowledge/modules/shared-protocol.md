@@ -142,8 +142,13 @@ be added in both or it silently vanishes. The host builds it in
   **no v1 code consumes them**. Shot direction comes from timing's sign
   instead — [[0008-timing-not-aim-for-shot-direction]]. Do not wire `aim` into
   the sim on the assumption that it was simply forgotten.
-- **`feedback` is not authoritative for anything.** It drives the flash on the
-  phone. The host has already decided what happened.
+- **`feedback` rules the phone's swing presentation.** `FeedbackKind` is
+  `hit | whiff | refused | miss | point`; the first three are the
+  `SwingVerdict` chain. The host→server leg carries `playerId` and the relay
+  forwards only `kind` to that one socket (routing by id is what keeps two
+  simultaneous phones apart). It remains presentation-only: the sim state, not
+  this message, is the game's truth. `playerIdForSide(players, side)` is the
+  pure host-side address lookup.
 - **`Swing.lag` is a duration, not a timestamp, and that is the whole reason
   it is allowed.** Both ends of it are read from the same phone's clock
   milliseconds apart, so the skew that makes `Swing.at` useless across devices

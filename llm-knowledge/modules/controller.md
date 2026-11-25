@@ -6,6 +6,7 @@ status: current
 code:
   - `src/controller/main.ts`
   - `src/controller/session.ts`
+  - `src/controller/feedback.ts`
   - `src/controller/wake-lock.ts`
   - `src/controller/motion.ts`
   - `src/controller/index.html`
@@ -73,12 +74,30 @@ enable tap → requestMotionPermission()          motion.ts
                     stream.push(sample)           shared/swing/stream.ts
                          │ Swing | null        (stream.level → the live glow)
                          ▼
-                    cooldown.admit(at, power)    shared/swing/gate.ts, only while
-                         │ refused → racket.refused()   score.ball === "play"
-                         ▼
+                    cooldown.admit(at, power)    shared/swing/gate.ts via
+                         │ refused → racket.refused()   `admitPeak(active)`
+                         ▼                        (active only while ball "play")
                     showSwing(power)             the ring: last swing's power
                     session.send({t:"swing"})    every phase; the host decides
+                         │
+                         ▼  host rules hit / whiff / refused (sim/verdict.ts),
+                    session.onFeedback           routed by playerId
+                         ▼
+                    dispatchFeedback()           controller/feedback.ts (pure)
+                      hit → racket.hit · whiff → racket.whiff ("WHIFF")
+                      refused → racket.refused · point / miss unchanged
 ```
+
+**One verdict chain (2026-11-26).** The phone no longer guesses the outcome:
+a gate-admitted peak is shown *charging* immediately and reported with `lag`,
+but the hit / whiff / refused presentation is driven by the host's feedback.
+`shared/sim/verdict.ts` reads `hit` (new `Stroke`) and `whiff` (moved `whiffs`
+counter) off consecutive sim states; the host addresses each with
+`playerIdForSide`, and the relay delivers to that one socket. The local gate's
+`refused` is never sent. Every `assigned` — including a resumed socket after a
+drop — calls `cooldown.reset()` in `onSide`, so reconnect is treated as fully
+charged. Pure seams `admitPeak` and `dispatchFeedback`, plus
+`controller/swing-chain.test.ts`, cover acceptance A1–A5 without a browser.
 
 `{t:"ready"}` is sent from inside `onSide`, not right after `createSession`
 returns — the socket is not open yet at that point and `Session.send`'s

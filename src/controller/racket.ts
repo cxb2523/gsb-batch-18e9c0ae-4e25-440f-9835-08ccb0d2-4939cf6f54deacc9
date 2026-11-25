@@ -114,6 +114,8 @@ export interface Racket {
 	hit(power: number): void;
 	point(): void;
 	miss(): void;
+	/** A swing the host ruled a whiff: 落空, not a hit and not yet point lost. */
+	whiff(): void;
 	/** The move being read right now, for the readout; `null` for none. */
 	reading(text: string | null): void;
 	/** Gravity across the screen, -1..1 each way, for the parallax. */
@@ -854,6 +856,13 @@ export function createRacket(canvas: HTMLCanvasElement): Racket {
 		miss() {
 			stamp = { text: "POINT LOST", sub: "", color: "#ff5a5f", age: 0 };
 			slack = 1;
+		},
+		whiff() {
+			// The host is authoritative: this swing met air. Distinct from
+			// `miss()` — no point has necessarily been lost yet — and from
+			// `hit()`: no power number, no felt burst, no success ripple.
+			stamp = { text: "WHIFF", sub: "", color: "#ffae2e", age: 0 };
+			slack = Math.max(slack, 0.45);
 		},
 		reading(text) {
 			readout = text;

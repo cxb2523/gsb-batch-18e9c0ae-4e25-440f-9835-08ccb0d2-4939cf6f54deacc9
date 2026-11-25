@@ -7,6 +7,7 @@ import {
 	isHostMessage,
 	parseControllerMessage,
 	parseHostMessage,
+	playerIdForSide,
 } from "./protocol.ts";
 
 describe("isControllerMessage", () => {
@@ -91,6 +92,8 @@ describe("isHostMessage", () => {
 		const valid: HostMessage[] = [
 			{ t: "host-hello", v: 1 },
 			{ t: "feedback", playerId: "p_abc", kind: "hit" },
+			{ t: "feedback", playerId: "p_abc", kind: "whiff" },
+			{ t: "feedback", playerId: "p_abc", kind: "refused" },
 			{ t: "feedback", playerId: "p_abc", kind: "point" },
 		];
 		for (const message of valid) {
@@ -224,5 +227,75 @@ describe("backoffMs", () => {
 
 	it("never returns a negative or zero delay", () => {
 		for (let i = 0; i < 30; i++) expect(backoffMs(i)).toBeGreaterThan(0);
+	});
+});
+
+// The authoritative swing verdict chain (task 41090): the host answers every
+// reported swing with hit / whiff / refused, addressed by playerId. These are
+// wire-level checks so a new kind cannot silently fail the trust guard.
+describe("swing verdict feedback", () => {
+	it.each(["hit", "whiff", "refused"] as const)(
+		"accepts a %s feedback addressed to a player",
+		(kind) => {
+			const msg = { t: "feedback", playerId: "p1", kind };
+			expect(isHostMessage(msg)).toBe(true);
+			if (isHostMessage(msg) && msg.t === "feedback") {
+				expect(msg.playerId).toBe("p1");
+				expect(msg.kind).toBe(kind);
+			}
+		},
+	);
+
+	it("rejects a verdict without a playerId — it could not be routed safely", () => {
+		expect(isHostMessage({ t: "feedback", kind: "whiff" })).toBe(false);
+		expect(isHostMessage({ t: "feedback", playerId: "p", kind: "bogus" })).toBe(
+			false,
+		);
+	});
+
+	it("round-trips a whiff verdict over JSON", () => {
+		const raw = JSON.stringify({
+			t: "feedback",
+			playerId: "p_far",
+			kind: "whiff",
+		});
+		expect(parseHostMessage(raw)).toEqual({
+			t: "feedback",
+			playerId: "p_far",
+			kind: "whiff",
+		});
+	});
+});
+
+describe("playerIdForSide — verdict routing", () => {
+	const players = [
+		{ playerId: "p_near", side: "near" as const, ready: true, connected: true },
+		{ playerId: "p_far", side: "far" as const, ready: true, connected: true },
+	];
+
+	it("finds the id of each side, so two simultaneous swings do not cross", () => {
+		expect(playerIdForSide(players, "near")).toBe("p_near");
+		expect(playerIdForSide(players, "far")).toBe("p_far");
+	});
+
+	it("does not route to a disconnected seat", () => {
+		const roster = players.map((p) =>
+			p.side === "far" ? { ...p, connected: false } : p,
+		);
+		expect(playerIdForSide(roster, "far")).toBeNull();
+		expect(playerIdForSide(roster, "near")).toBe("p_near");
+	});
+
+	it("returns null for an empty side", () => {
+		const nearOnly = [
+			{
+				playerId: "p_near",
+				side: "near" as const,
+				ready: true,
+				connected: true,
+			},
+		];
+		expect(playerIdForSide(nearOnly, "far")).toBeNull();
+		expect(playerIdForSide([], "near")).toBeNull();
 	});
 });

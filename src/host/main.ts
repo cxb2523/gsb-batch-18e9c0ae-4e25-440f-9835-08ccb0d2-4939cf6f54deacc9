@@ -29,6 +29,7 @@ import {
 	type MatchScore,
 	type PlayerId,
 	PROTOCOL_VERSION,
+	playerIdForSide,
 	RELAY_PATH,
 	type Side,
 } from "../shared/protocol.ts";
@@ -38,6 +39,7 @@ import {
 	type MatchState,
 	other,
 	type RallyInput,
+	swingVerdicts,
 	tick,
 } from "../shared/sim/index.ts";
 import { createArcade } from "./arcade.ts";
@@ -189,10 +191,6 @@ function sideFor(playerId: PlayerId): Side | undefined {
 	return players.find((p) => p.playerId === playerId)?.side;
 }
 
-function playerIdFor(side: Side): PlayerId | undefined {
-	return players.find((p) => p.side === side && p.connected)?.playerId;
-}
-
 /**
  * The side of a human player whose phone is not currently connected, or
  * `null`. While this is set mid-match the simulation is frozen: iOS drops
@@ -295,7 +293,15 @@ function onMessage(event: MessageEvent): void {
 		}
 		case "swing": {
 			const side = sideFor(msg.playerId);
-			if (!side) return;
+			if (!side) {
+				// An active-point swing from an id the host cannot seat: answer
+				// `refused` to that exact id so its phone clears the optimistic
+				// charge instead of hanging, and never broadcast it.
+				if (phase === "playing") {
+					send({ t: "feedback", playerId: msg.playerId, kind: "refused" });
+				}
+				return;
+			}
 			if (phase === "playing") {
 				pending.push({ side, swing: msg.swing, time: current.time });
 			} else if (phase === "lobby") {
@@ -351,10 +357,11 @@ function runTick(inputs: readonly RallyInput[]): void {
 	current = tick(before, inputs, FIXED_DT);
 	frameEvents.push(...detectEvents(before, current));
 
-	const stroke = current.stroke;
-	// A new stroke, not a harder peak re-striking the same ball.
-	if (stroke && stroke !== before.stroke && stroke.at !== before.stroke?.at) {
-		feedback(stroke.side, "hit");
+	// The authoritative swing rulings for this tick: a new stroke is a hit,
+	// a moved whiff counter is a whiff. Routed by playerId to the phone that
+	// played it, so the phone shows hit / 落空 instead of guessing.
+	for (const ruling of swingVerdicts(before, current)) {
+		feedback(ruling.side, ruling.verdict);
 	}
 
 	// `Score` is only ever replaced, never mutated in place (every
@@ -394,7 +401,9 @@ function runTick(inputs: readonly RallyInput[]): void {
 
 function feedback(side: Side, kind: FeedbackKind): void {
 	if (side === botSide) return;
-	const id = playerIdFor(side);
+	// Addressed by the playerId currently holding that side: two phones
+	// swinging in the same tick get separate, non-crossing verdicts.
+	const id = playerIdForSide(players, side);
 	if (id) send({ t: "feedback", playerId: id, kind });
 }
 

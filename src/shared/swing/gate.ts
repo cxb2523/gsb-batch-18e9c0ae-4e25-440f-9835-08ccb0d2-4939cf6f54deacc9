@@ -78,3 +78,29 @@ export function createSwingGate(): SwingGate {
 		},
 	};
 }
+
+/**
+ * The single phone-side decision for one announced peak: run it through the
+ * cooldown only while a point is live (`active` — the ball is in play).
+ *
+ * When inactive — the serve's toss/hit pair, the lobby motion check, the
+ * result screen — the gate is reset and every peak is admitted, so the serve's
+ * first swing after `reset()` always passes and the next point starts charged.
+ * When active, a `false` result means the peak is refused: the caller shows
+ * the racket's refusal cue and MUST NOT report it to the host.
+ *
+ * Extracted as pure logic so the "refused means not sent" half of the chain
+ * is testable without a browser; `controller/main.ts` is its production caller.
+ */
+export function admitPeak(
+	gate: SwingGate,
+	at: number,
+	power: number,
+	active: boolean,
+): boolean {
+	if (!active) {
+		gate.reset();
+		return true;
+	}
+	return gate.admit(at, power);
+}

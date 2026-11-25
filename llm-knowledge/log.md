@@ -656,3 +656,18 @@ tuning is against a simulated human.
 
 Added a 25-second trailer to the README, made with the
 [brag](https://github.com/latent-spaces/brag) skill.
+
+## [2026-11-26] feat | One authoritative swing verdict chain (hit / whiff / refused)
+
+Closed the desync between the phone gate and the host's contact judgement.
+`FeedbackKind` gains `whiff` and `refused` (`shared/protocol.ts`), plus a pure
+`playerIdForSide` router. `shared/sim/verdict.ts` reads new Stroke=hit and the
+whiffs counter=whiff off consecutive states (revised same-`at` strokes are not
+a second hit); `host/main.ts` routes each ruling to the playerId on that side
+and answers an unseat-able playing swing with `refused`. The phone side adds
+pure `admitPeak` (`swing/gate.ts`) and `dispatchFeedback`
+(`controller/feedback.ts`): a gate-refused peak is not sent and cues red; a
+host whiff drives the new amber `racket.whiff()` ("WHIFF"), never `hit()`.
+Every `assigned` (including resume after reconnect) calls `gate.reset()`, so
+the first swing back is admitted. Covered A1–A5 with pure unit/protocol tests
+and a real-socket two-phone no-cross relay test.

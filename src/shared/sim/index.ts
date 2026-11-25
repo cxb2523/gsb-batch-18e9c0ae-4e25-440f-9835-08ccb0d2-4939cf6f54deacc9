@@ -13,3 +13,4 @@ export * from "./rally.ts";
 export * from "./scoring.ts";
 export * from "./shot.ts";
 export * from "./state.ts";
+export * from "./verdict.ts";

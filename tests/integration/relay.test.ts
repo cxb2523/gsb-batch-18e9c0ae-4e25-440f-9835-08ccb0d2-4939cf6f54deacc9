@@ -238,7 +238,118 @@ describe("relay — identity and routing", () => {
 			const [feedback] = await nextMessages(ws1, 1);
 			expect(feedback).toEqual({ t: "feedback", kind: "hit" });
 		}));
+
+	// A4: two phones swinging in the same tick. Distinct verdict kinds make a
+	// crossed route fail loudly: near must see `hit`, far `whiff`, each from
+	// its own playerId-addressed host message. A persistent mailbox avoids
+	// depending on whether the join lobby frames coalesce with `assigned`.
+	it("routes two players' swing verdicts by playerId without crossing them", () =>
+		withRelay({}, async ({ url }) => {
+			const host = await connect(url);
+			const hostBox = mailbox(host);
+			send(host, { t: "host-hello", v: PROTOCOL_VERSION });
+			await hostBox.wait((m) => m.t === "lobby");
+
+			const near = await connect(url);
+			const nearBox = mailbox(near);
+			send(near, { t: "hello", v: PROTOCOL_VERSION });
+			const nearAssigned = (await nearBox.wait((m) => m.t === "assigned")) as {
+				playerId: string;
+				side: string;
+			};
+			expect(nearAssigned.side).toBe("near");
+
+			const far = await connect(url);
+			const farBox = mailbox(far);
+			send(far, { t: "hello", v: PROTOCOL_VERSION });
+			const farAssigned = (await farBox.wait((m) => m.t === "assigned")) as {
+				playerId: string;
+				side: string;
+			};
+			expect(farAssigned.side).toBe("far");
+			expect(nearAssigned.playerId).not.toBe(farAssigned.playerId);
+
+			// Wait for the join lobbies to be routed before sending verdicts.
+			await hostBox.wait(
+				(m) => Array.isArray(m.players) && m.players.length === 2,
+			);
+
+			send(host, {
+				t: "feedback",
+				playerId: nearAssigned.playerId,
+				kind: "hit",
+			});
+			send(host, {
+				t: "feedback",
+				playerId: farAssigned.playerId,
+				kind: "whiff",
+			});
+
+			const nearVerdict = await nearBox.wait((m) => m.t === "feedback");
+			const farVerdict = await farBox.wait((m) => m.t === "feedback");
+			expect(nearVerdict).toEqual({ t: "feedback", kind: "hit" });
+			expect(farVerdict).toEqual({ t: "feedback", kind: "whiff" });
+
+			// The refused verdict uses the same id channel.
+			send(host, {
+				t: "feedback",
+				playerId: farAssigned.playerId,
+				kind: "refused",
+			});
+			expect(
+				await farBox.wait((m) => m.t === "feedback" && m.kind === "refused"),
+			).toEqual({ t: "feedback", kind: "refused" });
+
+			// By the time far's refused round-trip has resolved, near's mailbox
+			// must contain only its own hit — none of far's verdicts crossed.
+			expect(nearBox.messages.filter((m) => m.t === "feedback")).toEqual([
+				{ t: "feedback", kind: "hit" },
+			]);
+		}));
 });
+
+/** Collects every JSON frame and resolves `wait` once a matching one arrives. */
+type MailMessage = Record<string, unknown>;
+interface Mailbox {
+	messages: MailMessage[];
+	wait: (predicate: (m: MailMessage) => boolean) => Promise<MailMessage>;
+}
+function mailbox(ws: WebSocket): Mailbox {
+	const messages: MailMessage[] = [];
+	const waiters: Array<{
+		predicate: (m: MailMessage) => boolean;
+		resolve: (m: MailMessage) => void;
+		reject: (e: Error) => void;
+		timer: ReturnType<typeof setTimeout>;
+	}> = [];
+	ws.on("message", (data: WebSocket.RawData) => {
+		const m = JSON.parse(data.toString()) as MailMessage;
+		messages.push(m);
+		for (let i = waiters.length - 1; i >= 0; i--) {
+			const w = waiters[i];
+			if (!w) continue;
+			if (w.predicate(m)) {
+				clearTimeout(w.timer);
+				waiters.splice(i, 1);
+				w.resolve(m);
+			}
+		}
+	});
+	return {
+		messages,
+		wait(predicate) {
+			const existing = messages.find(predicate);
+			if (existing !== undefined) return Promise.resolve(existing);
+			return new Promise((resolve, reject) => {
+				const timer = setTimeout(
+					() => reject(new Error("mailbox timed out waiting for a message")),
+					TIMEOUT_MS,
+				);
+				waiters.push({ predicate, resolve, reject, timer });
+			});
+		},
+	};
+}
 
 describe("relay — liveness", () => {
 	it("terminates a socket that goes silent and tells the host it disconnected", () =>
