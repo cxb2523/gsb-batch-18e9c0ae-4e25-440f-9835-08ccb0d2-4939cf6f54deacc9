@@ -1,3 +1,11 @@
+// Test/Node bridge: when loaded outside a browser/Electron renderer (e.g. a
+// vm sandbox or plain require), make the global object itself reachable as
+// `window` so the object literal below loads identically. In a real browser
+// `window` is already defined and this is a no-op.
+if (typeof window === "undefined" && typeof globalThis !== "undefined") {
+  globalThis.window = globalThis;
+}
+
 window.player = {
   drmLock: false,
   states: {
@@ -20,12 +28,29 @@ window.player = {
   duration: 0,
   levelId: -1,
   playhead: null,
+  // Monotonic playback-session generation. Every episode/stop/play rotation
+  // bumps it; async work captures the value at scheduling time and bails when
+  // it no longer matches, so old sessions can never rewrite the current one.
   _playSeq: 0,
+  // Pause baseline: _pausedAt is the wall-clock instant the current pause
+  // started (0 while not paused). _pauseToken is bumped on every pause/resume
+  // intent transition and invalidates stale "continue with playback" chains
+  // (e.g. resume -> async rebind -> user pauses before rebind settles).
   _pausedAt: 0,
+  _pauseToken: 0,
+  // Last reliable playback position in seconds. Unlike player.playhead (the
+  // initial start marker, cleared on first buffering complete), this keeps
+  // tracking currentTime so sleep/resume recovery never falls back to a stale
+  // episode-start playhead when the media element reports 0 after wake.
+  _lastKnownTime: 0,
   _audioDeviceChanged: false,
   _systemResumed: false,
   _watchersBound: false,
   _rebindPromise: null,
+  // Monotonic id of the rebind chain currently stored in _rebindPromise.
+  // Bumped whenever a fresh chain starts or pending work is cancelled, so a
+  // settled old chain can never clear/clobber a newer session's promise.
+  _rebindGeneration: 0,
   _audioWatchdogTimer: null,
   _deviceChangeTimers: [],
   _recoveryTimestamps: [],
@@ -42,9 +67,7 @@ window.player = {
       ) {
         navigator.mediaDevices.addEventListener("devicechange", function () {
           player._audioDeviceChanged = true;
-          while (player._deviceChangeTimers.length) {
-            clearTimeout(player._deviceChangeTimers.pop());
-          }
+          player._clearDeviceChangeTimers();
           if (
             player.state === player.states.PLAYING &&
             document.getElementById("video-screen")
@@ -62,6 +85,7 @@ window.player = {
                 }
                 var curV = player.getVideo();
                 if (curV && !curV.paused) {
+                  // Same-session concurrent calls coalesce inside rebindAudioOutput.
                   player.rebindAudioOutput(curV, true);
                 }
               }, delayMs);
@@ -80,6 +104,10 @@ window.player = {
         window.electronUtilsRender.onSystemPowerEvent(function (eventType) {
           if (eventType === "suspend") {
             player._systemResumed = true;
+            // Freeze the pause baseline and last known position BEFORE the
+            // media stack is torn down by the OS so wake recovery resumes at
+            // the real position instead of a stale episode-start playhead.
+            player._snapshotPosition();
             if (!player._pausedAt) {
               player._pausedAt = Date.now();
             }
@@ -87,6 +115,7 @@ window.player = {
           } else if (eventType === "resume") {
             player._systemResumed = true;
             player._audioDeviceChanged = true;
+            player._snapshotPosition();
             if (
               typeof session !== "undefined" &&
               typeof session.isExpired === "function" &&
@@ -103,6 +132,9 @@ window.player = {
               player.state === player.states.PLAYING &&
               document.getElementById("video-screen")
             ) {
+              // Recovery is asynchronous; do not touch player.state here. If it
+              // cannot start, state stays as-is and no continuation marks it
+              // PLAYING on failure.
               player._triggerStreamRecovery("system-resume-playing", false);
             }
           }
@@ -122,6 +154,55 @@ window.player = {
     } catch (_) {}
   },
 
+  // Remember the newest credible playback position (seconds). This is the
+  // shared position baseline used by sleep/wake and long-pause recovery.
+  _snapshotPosition: function () {
+    try {
+      var v = player.video;
+      if (!v) {
+        v =
+          typeof player.getVideo === "function" ? player.getVideo() : null;
+      }
+      if (v) {
+        var t = Number(v.currentTime);
+        if (isFinite(t) && t > 0) {
+          player._lastKnownTime = t;
+        }
+      }
+    } catch (_) {}
+    return player._lastKnownTime || 0;
+  },
+
+  // Capture the session sequence + pause/intent baseline an async operation
+  // belongs to. Pair with _isCurrentContext before writing shared state.
+  _captureContext: function () {
+    return {
+      seq: player._playSeq,
+      pauseToken: player._pauseToken,
+    };
+  },
+
+  _isCurrentContext: function (ctx) {
+    return (
+      !!ctx &&
+      ctx.seq === player._playSeq &&
+      ctx.pauseToken === player._pauseToken
+    );
+  },
+
+  _clearDeviceChangeTimers: function () {
+    if (!Array.isArray(player._deviceChangeTimers)) {
+      player._deviceChangeTimers = [];
+      return;
+    }
+    while (player._deviceChangeTimers.length) {
+      var tid = player._deviceChangeTimers.pop();
+      try {
+        clearTimeout(tid);
+      } catch (_) {}
+    }
+  },
+
   _clearAudioWatchdog: function () {
     if (player._audioWatchdogTimer) {
       clearTimeout(player._audioWatchdogTimer);
@@ -129,14 +210,119 @@ window.player = {
     }
   },
 
+  // Clear every piece of pending async work bound to the current session.
+  // Does NOT move _playSeq; use _invalidatePlaySession when the episode itself
+  // is being replaced/stopped. Bumping the rebind generation and pause token
+  // makes any Promise chain that is already mid-flight unable to write back.
+  _cancelSessionTasks: function () {
+    player._clearAudioWatchdog();
+    player._clearDeviceChangeTimers();
+    player._rebindGeneration++;
+    player._rebindPromise = null;
+    player._pauseToken++;
+  },
+
+  // Rotate the playback-session generation and drop all pending tasks.
+  // Called by player.play/stop and by the video screen on episode switch.
+  _invalidatePlaySession: function () {
+    player._playSeq++;
+    player._cancelSessionTasks();
+    return player._playSeq;
+  },
+
+  // Shared "we are really playing now" state transition. Returns false when a
+  // stale continuation (old session or superseded pause/resume intent) must
+  // not touch the current player. A fulfilled play() is trusted: any explicit
+  // pause/stop rotated the baseline token and is caught by the context check.
+  _commitPlaying: function (ctx, videoEl) {
+    if (!player._isCurrentContext(ctx)) return false;
+    player.state = player.states.PLAYING;
+    player._syncPowerSave(true);
+    if (
+      typeof video !== "undefined" &&
+      video &&
+      typeof video.syncMediaSessionPosition === "function"
+    ) {
+      try {
+        video.syncMediaSessionPosition();
+      } catch (_) {}
+    }
+    return true;
+  },
+
+  // Reconcile state after play() was rejected / threw. Recovery is attempted
+  // first; when it cannot start (rate limit, missing API) state is settled to
+  // PAUSED so a failed start is never misreported as PLAYING.
+  _handlePlayStartFailure: function (ctx, videoEl, reason, err) {
+    if (!player._isCurrentContext(ctx)) return false;
+    player._clearAudioWatchdog();
+    player._syncPowerSave(false);
+    if (err && err.name === "AbortError") {
+      // A newer load/pause aborted the play request and already owns state.
+      if (videoEl && videoEl.paused && player.state === player.states.PLAYING) {
+        player.state = player.states.PAUSED;
+      }
+      return false;
+    }
+    var elementPaused = true;
+    try {
+      elementPaused = !videoEl || videoEl.paused !== false;
+    } catch (_) {}
+    player.state = elementPaused
+      ? player.states.PAUSED
+      : player.states.BUFFERING;
+    var recoveryStarted = false;
+    try {
+      recoveryStarted = player._triggerStreamRecovery(
+        reason,
+        player.state === player.states.PAUSED
+      );
+    } catch (_) {
+      recoveryStarted = false;
+    }
+    if (!recoveryStarted) {
+      player.state = player.states.PAUSED;
+      if (videoEl && typeof videoEl.pause === "function") {
+        try {
+          videoEl.pause();
+        } catch (_) {}
+      }
+      if (
+        typeof video !== "undefined" &&
+        video &&
+        typeof video.showBTN === "function"
+      ) {
+        try {
+          video.showBTN("pause");
+        } catch (_) {}
+      }
+    }
+    return recoveryStarted;
+  },
+
   rebindAudioOutput: function (v, microSeek) {
     var targetVideo = v || player.getVideo();
     if (!targetVideo) return Promise.resolve();
+    // Coalesce concurrent rebind requests: while one chain is in flight every
+    // caller shares its promise. stop()/play()/episode-switch drop this slot
+    // and bump _rebindGeneration, so a chain left from an old session can
+    // never clear/clobber the promise owned by the new session.
     if (player._rebindPromise) {
       return player._rebindPromise;
     }
 
+    var sessionSeq = player._playSeq;
+    var rebindId = ++player._rebindGeneration;
+    var ownerCurrent = function () {
+      return (
+        rebindId === player._rebindGeneration &&
+        sessionSeq === player._playSeq
+      );
+    };
+
     var doMicroSeek = function () {
+      // Never micro-seek an element on behalf of an old session/chain.
+      if (!ownerCurrent()) return;
       if (microSeek !== false && targetVideo.readyState >= 1) {
         try {
           var curT = targetVideo.currentTime;
@@ -148,7 +334,9 @@ window.player = {
     };
 
     if (typeof targetVideo.setSinkId !== "function") {
-      player._audioDeviceChanged = false;
+      if (sessionSeq === player._playSeq) {
+        player._audioDeviceChanged = false;
+      }
       doMicroSeek();
       return Promise.resolve();
     }
@@ -157,8 +345,9 @@ window.player = {
     // Cycling through a concrete sinkId (e.g. "default") and back to "" forces
     // AudioRendererMixerManager to tear down any dead PulseAudio/PipeWire stream
     // and bind a fresh stream to PipeWire's current default output sink.
-    player._rebindPromise = Promise.resolve()
+    var chain = Promise.resolve()
       .then(function () {
+        if (!ownerCurrent()) return [];
         if (
           typeof navigator !== "undefined" &&
           navigator.mediaDevices &&
@@ -171,6 +360,7 @@ window.player = {
         return [];
       })
       .then(function (devices) {
+        if (!ownerCurrent()) return;
         var curSink = targetVideo.sinkId || "";
         var alt = null;
         if (Array.isArray(devices)) {
@@ -190,33 +380,48 @@ window.player = {
             }
           }
         }
-        var chain = Promise.resolve();
+        var stepChain = Promise.resolve();
         if (alt) {
-          chain = chain.then(function () {
+          stepChain = stepChain.then(function () {
+            if (!ownerCurrent()) return;
             return targetVideo.setSinkId(alt).catch(function () {});
           });
         }
-        return chain.then(function () {
+        return stepChain.then(function () {
+          if (!ownerCurrent()) return;
           return targetVideo.setSinkId("").catch(function () {});
         });
       })
       .then(function () {
-        player._audioDeviceChanged = false;
-        player._rebindPromise = null;
+        // Only the currently owned chain may clear the shared in-flight slot
+        // and device-change flag; a superseded chain must leave the new
+        // session's state untouched.
+        if (rebindId === player._rebindGeneration) {
+          player._rebindPromise = null;
+        }
+        if (sessionSeq === player._playSeq) {
+          player._audioDeviceChanged = false;
+        }
         doMicroSeek();
       })
       .catch(function () {
-        player._audioDeviceChanged = false;
-        player._rebindPromise = null;
+        if (rebindId === player._rebindGeneration) {
+          player._rebindPromise = null;
+        }
+        if (sessionSeq === player._playSeq) {
+          player._audioDeviceChanged = false;
+        }
         doMicroSeek();
       });
 
-    return player._rebindPromise;
+    player._rebindPromise = chain;
+    return chain;
   },
 
   _triggerStreamRecovery: function (reason, keepPaused) {
     if (
       typeof video === "undefined" ||
+      !video ||
       typeof video.recoverPlayback !== "function" ||
       !document.getElementById("video-screen") ||
       !video.episode
@@ -232,18 +437,46 @@ window.player = {
       return false;
     }
     player._recoveryTimestamps.push(now);
-    video.recoverPlayback(Boolean(keepPaused), reason);
+    // Refresh the position baseline first; recovery reads it back through
+    // player.getPlayed(), whose last-known value survives a currentTime reset
+    // after wake.
+    player._snapshotPosition();
+    var accepted;
+    try {
+      accepted = video.recoverPlayback(Boolean(keepPaused), reason);
+    } catch (err) {
+      accepted = false;
+    }
+    // A fake/host recoverPlayback may report synchronously that it cannot
+    // start by returning literal false or throwing. Such a refused attempt
+    // did not actually run, so roll back its rate-limit token.
+    if (accepted === false) {
+      var lastIdx = player._recoveryTimestamps.lastIndexOf(now);
+      if (lastIdx >= 0) {
+        player._recoveryTimestamps.splice(lastIdx, 1);
+      }
+      return false;
+    }
     return true;
   },
 
   _startAudioHealthWatchdog: function (seq, isSecondPass) {
     player._clearAudioWatchdog();
+    var sessionSeq = typeof seq === "number" ? seq : player._playSeq;
+    // Bind the timer chain to the current pause/intent baseline as well, so a
+    // pause (or pause->resume rotation) invalidates any pending forced play().
+    var pauseToken = player._pauseToken;
+    var alive = function () {
+      return (
+        sessionSeq === player._playSeq &&
+        pauseToken === player._pauseToken &&
+        player.state === player.states.PLAYING &&
+        !!document.getElementById("video-screen")
+      );
+    };
     player._audioWatchdogTimer = setTimeout(function () {
-      if (
-        seq !== player._playSeq ||
-        player.state !== player.states.PLAYING ||
-        !document.getElementById("video-screen")
-      ) {
+      player._audioWatchdogTimer = null;
+      if (!alive()) {
         return;
       }
       var v = player.getVideo();
@@ -261,11 +494,7 @@ window.player = {
       var a0 = v.webkitAudioDecodedByteCount;
       player._audioWatchdogTimer = setTimeout(function () {
         player._audioWatchdogTimer = null;
-        if (
-          seq !== player._playSeq ||
-          player.state !== player.states.PLAYING ||
-          !document.getElementById("video-screen")
-        ) {
+        if (!alive()) {
           return;
         }
         var curV = player.getVideo();
@@ -274,13 +503,31 @@ window.player = {
         var da = curV.webkitAudioDecodedByteCount - a0;
         if (dt > 0.6 && da <= 0) {
           if (!isSecondPass) {
-            player.rebindAudioOutput(curV, true).then(function () {
-              if (seq === player._playSeq && !curV.paused) {
-                curV.play().catch(function () {});
-                player._startAudioHealthWatchdog(seq, true);
-              }
-            });
+            // First evidence of silence: rebind output first. Only after the
+            // rebind settles and the session/baseline is still current do we
+            // restart the watchdog for the confirmatory second pass.
+            var rebindResult;
+            try {
+              rebindResult = player.rebindAudioOutput(curV, true);
+            } catch (_) {
+              rebindResult = null;
+            }
+            Promise.resolve(rebindResult)
+              .then(function () {
+                if (!alive() || curV.paused) return;
+                try {
+                  var playP = curV.play();
+                  if (playP && typeof playP.catch === "function") {
+                    playP.catch(function () {});
+                  }
+                } catch (_) {}
+                if (alive() && !curV.paused) {
+                  player._startAudioHealthWatchdog(sessionSeq, true);
+                }
+              })
+              .catch(function () {});
           } else {
+            // Second consecutive silent pass: rate-limited stream recovery.
             player._triggerStreamRecovery("silent-audio-watchdog", false);
           }
         }
@@ -392,8 +639,22 @@ window.player = {
 
   getPlayed: function () {
     var v = player.getVideo();
-    if (v && v.currentTime > 0) {
-      return v.currentTime;
+    if (v) {
+      var current = Number(v.currentTime);
+      if (isFinite(current) && current > 0) {
+        // Live element position is always the freshest baseline.
+        player._lastKnownTime = current;
+        return current;
+      }
+    }
+    // The element may report 0 after sleep/wake or source teardown: use the
+    // last tracked position before considering the initial-start playhead,
+    // otherwise recovery would jump back to the stale episode start.
+    if (
+      typeof player._lastKnownTime === "number" &&
+      player._lastKnownTime > 0
+    ) {
+      return player._lastKnownTime;
     }
     if (typeof player.playhead === "number" && player.playhead > 0) {
       return player.playhead;
@@ -436,8 +697,9 @@ window.player = {
 
   play: function (drm, url, playhead, noplay) {
     player.initDeviceWatchers();
-    player._clearAudioWatchdog();
-    var seq = ++player._playSeq;
+    // New playback session: bump _playSeq and cancel every timer/Promise slot
+    // left by the previous episode so none of its continuations can write back.
+    var seq = player._invalidatePlaySession();
     player._pausedAt = noplay ? Date.now() : 0;
     player._systemResumed = false;
     player._audioDeviceChanged = false;
@@ -451,6 +713,11 @@ window.player = {
     var startSeconds =
       playhead && Number(playhead) > 0 ? Number(playhead) * 60 : null;
     player.playhead = startSeconds;
+    // Anchor the position baseline to this session's requested start. A
+    // recovery call passes the freshly computed current position here, while a
+    // brand new episode with no playhead starts clean at 0 (no cross-episode
+    // position leak).
+    player._lastKnownTime = startSeconds || 0;
     player.noplay = noplay;
 
     player.config(video.setPlayingTime, video.end);
@@ -645,13 +912,19 @@ window.player = {
     var v = player.getVideo();
     if (!v) return;
     player._clearAudioWatchdog();
+    // Invalidate any resume->rebind->play continuation created before this
+    // pause so it cannot force playback/PLAYING after the user paused.
+    player._pauseToken++;
+    player._snapshotPosition();
     if (!player._pausedAt) {
       player._pausedAt = Date.now();
     }
     v.pause();
     player.state = player.states.PAUSED;
     player._syncPowerSave(false);
-    video.showBTN("pause");
+    if (typeof video !== "undefined" && video && typeof video.showBTN === "function") {
+      video.showBTN("pause");
+    }
     if (
       typeof video !== "undefined" &&
       typeof video.saveHistory === "function" &&
@@ -672,24 +945,50 @@ window.player = {
     var v = player.getVideo();
     if (!v) return;
     var seq = player._playSeq;
+    // Every resume gets a fresh intent baseline. A later pause()/stop() or a
+    // newer resume rotates _pauseToken, invalidating this call's async
+    // continuation (notably resume -> rebindAudioOutput -> startPlay).
+    var intentToken = ++player._pauseToken;
+    var ctx = { seq: seq, pauseToken: intentToken };
     var now = Date.now();
     var pausedMs = player._pausedAt > 0 ? now - player._pausedAt : 0;
     var hadSystemResume = player._systemResumed;
     var hadDeviceChange = player._audioDeviceChanged;
     player._pausedAt = 0;
+    player._snapshotPosition();
 
     // After system sleep/resume, video element error, or >= 10 minutes paused
     // (where DRM token was released on start and signed CDN URLs/keys may have expired),
     // mint a fresh stream session at the exact current second.
     if (hadSystemResume || pausedMs >= 600000 || v.error) {
+      var recoveryReason = hadSystemResume ? "system-resume" : "long-pause";
       player._systemResumed = false;
       player._audioDeviceChanged = false;
-      video.showBTN("loading");
+      if (typeof video !== "undefined" && video && typeof video.showBTN === "function") {
+        video.showBTN("loading");
+      }
       if (
         typeof video !== "undefined" &&
+        video &&
         typeof video.recoverPlayback === "function"
       ) {
-        video.recoverPlayback(false, hadSystemResume ? "system-resume" : "long-pause");
+        // Ensure the baseline is current; recoverPlayback pulls the position
+        // via player.getPlayed().
+        player._snapshotPosition();
+        var recoveryAccepted;
+        try {
+          recoveryAccepted = video.recoverPlayback(false, recoveryReason);
+        } catch (_) {
+          recoveryAccepted = false;
+        }
+        // This path must never fall through to mark PLAYING synchronously.
+        // If recovery was explicitly rejected/threw, settle back to paused.
+        if (recoveryAccepted === false) {
+          player.state = player.states.PAUSED;
+          try {
+            video.showBTN("pause");
+          } catch (_) {}
+        }
         return;
       }
     }
@@ -706,17 +1005,24 @@ window.player = {
     }
 
     var startPlay = function () {
-      if (seq !== player._playSeq) return;
+      // Stale guard: a pause/stop/episode-switch/new-resume happened while the
+      // rebind promise was settling. Do not call play() or write PLAYING.
+      if (!player._isCurrentContext(ctx)) return;
       var curV = player.getVideo();
       if (!curV) return;
       var playPromise;
       try {
         playPromise = curV.play();
       } catch (err) {
-        player._triggerStreamRecovery("play-throw", false);
+        player._handlePlayStartFailure(ctx, curV, "play-throw", err);
         return;
       }
-      video.hideBTN();
+      if (!player._isCurrentContext(ctx)) return;
+      if (typeof video !== "undefined" && video && typeof video.hideBTN === "function") {
+        video.hideBTN();
+      }
+      // Optimistic playing state for immediate UI feedback. A rejected play()
+      // is reconciled off PLAYING by _handlePlayStartFailure below.
       player.state = player.states.PLAYING;
       player._syncPowerSave(true);
       if (
@@ -728,15 +1034,17 @@ window.player = {
       if (playPromise && typeof playPromise.then === "function") {
         playPromise
           .then(function () {
-            if (seq === player._playSeq) {
+            if (player._commitPlaying(ctx, curV)) {
               player._startAudioHealthWatchdog(seq, false);
             }
           })
           .catch(function (err) {
-            if (seq !== player._playSeq) return;
-            if (err && err.name === "AbortError") return;
-            player._syncPowerSave(false);
-            player._triggerStreamRecovery("play-rejected", false);
+            player._handlePlayStartFailure(
+              ctx,
+              curV,
+              "play-rejected",
+              err
+            );
           });
       } else {
         player._startAudioHealthWatchdog(seq, false);
@@ -746,9 +1054,18 @@ window.player = {
     // WirePlumber suspends idle PipeWire/Bluetooth sinks after ~5s of pause.
     // Rebind the HTMLMediaElement audio output sink after >= 5s pause or any device change.
     if (pausedMs >= 5000 || hadDeviceChange) {
-      player
-        .rebindAudioOutput(v, pausedMs >= 15000 || hadDeviceChange)
-        .then(startPlay);
+      var rebindPromise;
+      try {
+        rebindPromise = player.rebindAudioOutput(
+          v,
+          pausedMs >= 15000 || hadDeviceChange
+        );
+      } catch (_) {
+        rebindPromise = Promise.resolve();
+      }
+      Promise.resolve(rebindPromise)
+        .then(startPlay, startPlay)
+        .catch(function () {});
     } else {
       startPlay();
     }
@@ -934,15 +1251,25 @@ window.player = {
   },
 
   stop: function () {
-    player._playSeq++;
-    player._clearAudioWatchdog();
-    while (player._deviceChangeTimers.length) {
-      clearTimeout(player._deviceChangeTimers.pop());
-    }
+    // Rotate session seq and clear watchdog/device timers, rebind slot and
+    // pending resume continuations in one place. Mid-flight rebind chains
+    // observe the bumped generation/seq and cannot write back afterwards.
+    player._invalidatePlaySession();
     clearTimeout(player.timers.forward_rewind);
     player._pausedAt = 0;
+    player._lastKnownTime = 0;
+    player._systemResumed = false;
+    player._audioDeviceChanged = false;
     player._syncPowerSave(false);
-    var v = player.video || document.getElementById("videoplayer");
+    var v = player.video;
+    if (
+      !v &&
+      typeof document !== "undefined" &&
+      document &&
+      typeof document.getElementById === "function"
+    ) {
+      v = document.getElementById("videoplayer");
+    }
     if (v) {
       try {
         v.pause();
@@ -974,12 +1301,17 @@ window.player = {
   },
 
   onbufferingstart: function () {
-    video.showBTN("loading");
+    if (typeof video !== "undefined" && video && typeof video.showBTN === "function") {
+      video.showBTN("loading");
+    }
   },
 
   onbufferingcomplete: function () {
     var v = player.getVideo();
     if (!v) return;
+    // A late 'playing' callback from a stopped session must not call play() or
+    // resurrect PLAYING after stop()/destroy().
+    if (player.state === player.states.STOPPED) return;
 
     if (
       session.storage.quality !== "auto" &&
@@ -1016,25 +1348,60 @@ window.player = {
       video.renderChapterMarkers();
     }
 
+    player._snapshotPosition();
+
     if (player.playhead) {
-      if (Math.abs((v.currentTime || 0) - player.playhead) > 1.5) {
-        v.currentTime = player.playhead;
+      var targetStart = Number(player.playhead);
+      var currentAtReady = Number(v.currentTime) || 0;
+      // Correct forward toward the requested start marker when the stream
+      // attached late. Never seek backward to this marker: after sleep/wake
+      // recovery player.playhead holds the freshly recovered position, and a
+      // backward seek here could otherwise re-apply a stale episode start.
+      if (
+        isFinite(targetStart) &&
+        targetStart > 0 &&
+        targetStart - currentAtReady > 1.5
+      ) {
+        v.currentTime = targetStart;
+        player._lastKnownTime = targetStart;
       }
       player.playhead = null;
     }
 
+    var completeCtx = player._captureContext();
     if (player.noplay) {
       player.noplay = null;
       player.pause();
     } else if (!v.paused || player.state !== player.states.PAUSED) {
-      var playP = v.play();
-      if (playP && typeof playP.catch === "function") {
-        playP.catch(function () {});
+      var playP;
+      try {
+        playP = v.play();
+      } catch (playErr) {
+        playP = Promise.reject(playErr);
       }
       player.state = player.states.PLAYING;
       player._syncPowerSave(true);
-      video.hideBTN();
+      if (typeof video !== "undefined" && video && typeof video.hideBTN === "function") {
+        video.hideBTN();
+      }
       player._startAudioHealthWatchdog(player._playSeq, false);
+      if (playP && typeof playP.then === "function") {
+        playP.then(
+          function () {
+            player._commitPlaying(completeCtx, v);
+          },
+          function (err) {
+            // A rejected play() must not leave state labelled PLAYING unless a
+            // newer pause/session already took ownership.
+            player._handlePlayStartFailure(
+              completeCtx,
+              v,
+              "buffering-complete-play-rejected",
+              err
+            );
+          }
+        );
+      }
     }
 
     if (typeof video !== "undefined" && typeof video.onPlaybackStarted === "function") {
@@ -1067,3 +1434,15 @@ window.player = {
     console.log("onsubtitlechange");
   },
 };
+
+// CommonJS bridge for local/CI injection tests. Harmless in browser/Electron.
+if (typeof module !== "undefined" && module.exports) {
+  try {
+    // Ensure bare `player` references resolve for require()-based harnesses
+    // even when `window` is a separate fake object.
+    if (typeof globalThis !== "undefined" && window && window.player) {
+      globalThis.player = window.player;
+    }
+  } catch (_) {}
+  module.exports = window.player;
+}

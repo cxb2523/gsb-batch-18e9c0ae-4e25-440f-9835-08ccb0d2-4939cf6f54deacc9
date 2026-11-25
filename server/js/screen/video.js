@@ -1638,14 +1638,19 @@ window.video = {
     }
   },
 
-  recoverPlayback: function (keepPaused) {
+  recoverPlayback: function (keepPaused, reason, explicitTimeSec) {
     if (!video.episode || !document.getElementById(video.id)) {
-      return;
+      return false;
     }
     var playedSec =
-      typeof player !== "undefined" && typeof player.getPlayed === "function"
-        ? player.getPlayed()
-        : 0;
+      typeof explicitTimeSec === "number" &&
+      isFinite(explicitTimeSec) &&
+      explicitTimeSec > 0
+        ? explicitTimeSec
+        : typeof player !== "undefined" &&
+            typeof player.getPlayed === "function"
+          ? player.getPlayed()
+          : 0;
     var curPlayheadMin =
       playedSec > 0
         ? playedSec / 60
@@ -1673,6 +1678,7 @@ window.video = {
       Boolean(keepPaused),
       video.subtitle || video._preferredSubtitle || undefined
     );
+    return true;
   },
 
   play: function (item, noplay, forceSubtitle) {
@@ -1690,8 +1696,23 @@ window.video = {
           player.video.pause();
         } catch (e) {}
       }
+      // Rapid episode switch: rotate the play sequence and drop the outgoing
+      // session's device timers, watchdog and rebind/resume continuations
+      // BEFORE the async service callback starts the new player.play session.
+      // The seq bump must also happen while player.plugin is still null (the
+      // initial player.play's session.refresh may still be in flight),
+      // otherwise that late success could attach the old episode's source.
+      if (typeof player._invalidatePlaySession === "function") {
+        player._invalidatePlaySession();
+      } else {
+        if (typeof player._cancelSessionTasks === "function") {
+          player._cancelSessionTasks();
+        }
+        if (player.plugin) {
+          player._playSeq++;
+        }
+      }
       if (player.plugin) {
-        player._playSeq++;
         try {
           player.plugin.reset();
         } catch (e) {}
