@@ -1,0 +1,16 @@
+{
+  "name": "trax-skin-reference",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reference implementation of the TRAX cassette skin.json engine: playback-position-driven background cycle, skin parsing and label text fitting.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\"",
+    "demo": "node demo/run-demo.js",
+    "serve": "node demo/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

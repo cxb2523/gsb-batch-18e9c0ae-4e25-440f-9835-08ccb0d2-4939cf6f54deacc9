@@ -1,0 +1,17 @@
+{
+  "name": "Stepper",
+  "background": {
+    "colors": ["#FFFFFF", "#FFD060", "#23946F", "#D23E48", "#4B6FCB", "#C0589A"],
+    "seconds": 2,
+    "blend": "step",
+    "while": "playing"
+  },
+  "areas": [
+    {
+      "rect": [91, 31, 263, 22],
+      "size": 11,
+      "align": "center",
+      "lines": [["artist", " — ", "album"]]
+    }
+  ]
+}

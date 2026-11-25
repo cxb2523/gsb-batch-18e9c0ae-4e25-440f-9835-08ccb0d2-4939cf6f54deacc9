@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TRAX tape deck — background cycle demo</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    background: #0b1117; color: #e8edf1;
+    font: 15px/1.5 system-ui, "Segoe UI", sans-serif;
+  }
+  .panel { width: min(720px, 94vw); display: grid; gap: 14px; }
+  h1 { font-size: 1.15rem; margin: 0; letter-spacing: .04em; }
+  .deck {
+    position: relative; height: 240px; border-radius: 14px; overflow: hidden;
+    border: 1px solid #2a3642; transition: background-color 120ms linear;
+    display: grid; place-items: center;
+  }
+  .reels { display: flex; gap: 120px; }
+  .reel {
+    width: 84px; height: 84px; border-radius: 50%;
+    border: 10px solid rgba(255,255,255,.35);
+    background: radial-gradient(circle, #111 0 22%, #2e2e2e 23% 60%, #111 61%);
+    display: grid; place-items: center; color: #ddd; font-size: .8rem;
+  }
+  .reel.spin { animation: spin 1.2s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .label {
+    position: absolute; left: 50%; top: 18px; transform: translateX(-50%);
+    background: rgba(244,241,232,.92); color: #121a22; border-radius: 6px;
+    padding: 6px 14px; text-align: center; min-width: 260px;
+  }
+  .label .sub { font-size: .8rem; color: #56636f; }
+  .readout {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    font-family: ui-monospace, Menlo, monospace; font-size: .85rem;
+  }
+  .chip { background: #17212b; border: 1px solid #2a3642; border-radius: 999px; padding: 4px 12px; }
+  input[type="range"] { width: 100%; accent-color: #70c0e0; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+  button, select {
+    background: #17212b; color: #e8edf1; border: 1px solid #2a3642;
+    border-radius: 8px; padding: 8px 14px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: #70c0e0; }
+  .swatch { width: 18px; height: 18px; border-radius: 4px; border: 1px solid #fff5; display: inline-block; vertical-align: -4px; margin-right: 6px; }
+  .note { color: #97a5b2; font-size: .82rem; }
+</style>
+</head>
+<body>
+<div class="panel">
+  <h1>TRAX tape deck — background follows the <em>playback position</em></h1>
+
+  <div class="deck" id="deck">
+    <div class="label">
+      <div id="line1">&nbsp;</div>
+      <div class="sub" id="line2">&nbsp;</div>
+    </div>
+    <div class="reels">
+      <div class="reel" id="reelL">L</div>
+      <div class="reel" id="reelR">R</div>
+    </div>
+  </div>
+
+  <div class="readout">
+    <span class="chip" id="statusChip">status</span>
+    <span class="chip" id="posChip">0.0 s</span>
+    <span class="chip"><span class="swatch" id="swatch"></span><span id="hexChip">#000000</span></span>
+    <span class="chip" id="skinChip">skin</span>
+  </div>
+
+  <input type="range" id="scrub" min="0" max="240" step="0.1" value="0">
+  <div class="note">Drag the bar: the background jumps to the new phase immediately — no waiting for a natural tick.</div>
+
+  <div class="buttons">
+    <button data-cmd='{"command":"play"}'>Play / resume</button>
+    <button data-cmd='{"command":"pause"}'>Pause</button>
+    <button data-cmd='{"command":"stop"}'>Stop</button>
+    <button data-cmd='{"command":"nextTrack"}'>Next track (phase resets)</button>
+    <button data-cmd='{"command":"skinStep","value":"prev"}'>▲ skin</button>
+    <button data-cmd='{"command":"skinStep","value":"next"}'>▼ skin</button>
+    <select id="skinSelect"></select>
+  </div>
+  <div class="note">
+    Try it: play a few seconds, pause (while=playing snaps to the first color; while=always holds),
+    scrub, switch skins and back (skin.json is re-read, phase continues from the current position).
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+async function send(payload) {
+  const r = await fetch('/api/command', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  render(await r.json());
+}
+function render(s) {
+  const pb = s.playback;
+  $('deck').style.backgroundColor = s.background;
+  $('swatch').style.backgroundColor = s.background;
+  $('hexChip').textContent = s.background;
+  $('statusChip').textContent = pb.status;
+  $('posChip').textContent = pb.positionSeconds.toFixed(1) + ' s';
+  $('skinChip').textContent = s.selected;
+  $('scrub').value = pb.positionSeconds;
+  const texts = s.frame.areas.flatMap(a => a.rendered.map(l => l.text));
+  $('line1').textContent = texts[0] || ' ';
+  $('line2').textContent = texts[1] || ' ';
+  const spinning = pb.status === 'playing';
+  $('reelL').classList.toggle('spin', spinning);
+  $('reelR').classList.toggle('spin', spinning);
+  const sel = $('skinSelect');
+  if (sel.options.length !== s.skins.length) {
+    sel.innerHTML = s.skins.map(n => `<option${n === s.selected ? ' selected' : ''}>${n}</option>`).join('');
+  }
+}
+document.querySelectorAll('button[data-cmd]').forEach(b =>
+  b.addEventListener('click', () => send(JSON.parse(b.dataset.cmd))));
+$('skinSelect').addEventListener('change', e => send({ command: 'skin', value: e.target.value }));
+$('scrub').addEventListener('input', e => send({ command: 'seek', value: Number(e.target.value) }));
+
+// Heartbeat: advance playback 100 ms per poll while playing.
+setInterval(async () => {
+  const r = await fetch('/api/state');
+  render(await r.json());
+}, 250);
+setInterval(() => send({ command: 'tick', value: 0.25 }), 250);
+fetch('/api/state').then(r => r.json()).then(render);
+</script>
+</body>
+</html>

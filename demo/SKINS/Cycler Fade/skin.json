@@ -1,0 +1,24 @@
+{
+  "name": "Cycler Fade",
+  "background": {
+    "colors": ["#FF0000", "#00FF00", "#0000FF"],
+    "seconds": 6,
+    "blend": "fade",
+    "while": "playing"
+  },
+  "defaults": { "size": 14, "align": "left", "color": "#000000" },
+  "areas": [
+    {
+      "rect": [91, 31, 263, 22],
+      "size": 11,
+      "align": "center",
+      "lines": [["album", ": ", "artist"]]
+    },
+    {
+      "rect": [91, 60, 263, 20],
+      "size": 11,
+      "align": "center",
+      "lines": [["Side A · ", "title"]]
+    }
+  ]
+}

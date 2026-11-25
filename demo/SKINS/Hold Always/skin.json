@@ -1,0 +1,17 @@
+{
+  "name": "Hold Always",
+  "background": {
+    "colors": ["#1B0B3A", "#0B3A5C", "#0B5C3A", "#5C3A0B"],
+    "seconds": 4,
+    "blend": "fade",
+    "while": "always"
+  },
+  "areas": [
+    {
+      "rect": [91, 31, 263, 22],
+      "size": 11,
+      "align": "center",
+      "lines": ["title"]
+    }
+  ]
+}

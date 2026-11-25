@@ -1,0 +1,5 @@
+{ "background": "#0B3A5C",
+  "areas": [
+    { "rect": [91, 31, 263, 22], "size": 11, "align": "center", "lines": ["title"] }
+  ]
+}
