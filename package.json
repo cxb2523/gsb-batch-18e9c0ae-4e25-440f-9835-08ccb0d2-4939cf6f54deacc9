@@ -1,0 +1,56 @@
+{
+  "name": "gl-bench",
+  "version": "1.0.47",
+  "description": "WebGL performance monitor that showing percentage of GPU/CPU load",
+  "main": "./dist/gl-bench.js",
+  "browser": "./dist/gl-bench.min.js",
+  "module": "./dist/gl-bench.module.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "rollup -c",
+    "dev": "npm run build && concurrently \"rollup -cw\" \"npm:http\"",
+    "test": "node -r esm ./test/puppeteer.js",
+    "http": "servez -p 1234",
+    "cov": "sed -i 's/.nyc_output\\/js/dist/g' .nyc_output/out.json && nyc report --reporter=lcov",
+    "ci": "CI=true npm run http & npm run test && npm run cov; pkill http"
+  },
+  "devDependencies": {
+    "@ampproject/rollup-plugin-closure-compiler": "0.27.0",
+    "codecov": "3.8.3",
+    "concurrently": "9.1.0",
+    "esm": "^3.2.25",
+    "servez": "^1.12.0",
+    "nyc": "^15.0.0",
+    "puppeteer": "23.10.4",
+    "puppeteer-to-istanbul": "1.4.0",
+    "rollup": "2.79.2",
+    "rollup-plugin-modify": "3.0.0",
+    "rollup-plugin-string": "3.0.0",
+    "zora": "5.2.0"
+  },
+  "author": "munrocket",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/munrocket/gl-bench.git"
+  },
+  "nyc": {
+    "include": "**/gl-bench**"
+  },
+  "keywords": [
+    "monitor",
+    "benchmark",
+    "profiling",
+    "performance",
+    "webgl",
+    "webgl2",
+    "stats.js",
+    "pixi",
+    "three",
+    "babylon",
+    "regl",
+    "cesium"
+  ]
+}

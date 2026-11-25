@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>E2E Testing - Web Worker support</title>
+  <link rel="icon" href="data:;base64,iVBORw0KGgo=">
+  <link rel="stylesheet" type="text/css" href="./common/style.css">
+</head>
+<body>
+
+  <h1>Web Worker support</h1>
+  <p>Lorenz Attractor by @DonKarlssonSan</p>
+  <canvas id="c"></canvas>
+  <div class="star">
+    <iframe src="https://ghbtns.com/github-btn.html?user=munrocket&repo=gl-bench&type=star&count=true&size=large" frameborder="0" scrolling="0" width="130px" height="30px"></iframe>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.9/dat.gui.min.js"></script>
+  <script src="../dist/gl-bench.js"></script>
+  <script src="./common/maingui.js"></script>
+  <script src="./themes/behance.js"></script>
+  <script>
+    //GLBench initialization
+    let bench = new GLBench(null, { css:CSS, svg:SVG, trackGPU: true });
+
+    countControl.onChange((val) => { settingsChanged(val) });
+    function settingsChanged() {
+      if (count != settings.count || width != settings.width || height != settings.height) {
+        count = settings.count;
+        width = window.innerWidth;
+        height = window.innerHeight;
+        worker.postMessage({
+          msg: 'settings',
+          settings: {
+            count: settings.count,
+            width: settings.width,
+            height: settings.height
+          }
+        });
+      }
+    }
+    window.addEventListener('resize', settingsChanged);
+
+    const canvas = document.querySelector('canvas');
+    const offscreenCanvas = canvas.transferControlToOffscreen();
+    const worker = new Worker('./common/worker.js');
+    worker.postMessage({
+      msg: 'init',
+      canvas: offscreenCanvas,
+      settings: {
+        count: settings.count,
+        width: settings.width,
+        height: settings.height
+      }
+    }, [offscreenCanvas]);
+
+    worker.onmessage = function(e) {
+      if (e.data.msg == 'initUI') {
+        bench.addUI(e.data.name);
+      } else if (e.data.msg == 'paramLogger') {
+        bench.paramLogger(bench.names.indexOf(e.data.name), e.data.cpu, e.data.gpu, e.data.mem, e.data.fps);
+      } else if (e.data.msg == 'chartLogger') {
+        bench.chartLogger(bench.names.indexOf(e.data.name), e.data.chart, e.data.circularId);
+      }
+    };
+  </script>
+</body>
+</html>
