@@ -1,7 +1,21 @@
-import { Clock } from 'lucide-react';
+import { Clock, Compass, Swords, Timer } from 'lucide-react';
 import { useGame } from '../app/useGameStore';
 import { skillsById } from '../data/skills';
 import { formatNumber } from '../systems/formulas';
+import type { OfflineMapSummary } from '../types/game';
+
+function travelStatusText(map: OfflineMapSummary): string {
+  if (map.interruptedBy === 'combat') return 'Stopped — an encounter began';
+  if (map.interruptedBy === 'time') return 'Stopped — offline time ran out';
+  if (map.arrivedTileName) return 'Arrived';
+  return 'Journey advanced';
+}
+
+function TravelStatusIcon({ map }: { map: OfflineMapSummary }) {
+  if (map.interruptedBy === 'combat') return <Swords size={15} />;
+  if (map.interruptedBy === 'time') return <Timer size={15} />;
+  return <Compass size={15} />;
+}
 
 export function OfflineModal() {
   const { state, dispatch } = useGame();
@@ -10,6 +24,7 @@ export function OfflineModal() {
 
   const minutes = Math.floor(summary.secondsAway / 60);
   const seconds = summary.secondsAway % 60;
+  const map = summary.map;
 
   return (
     <div className="modal-backdrop" role="presentation">
@@ -42,6 +57,17 @@ export function OfflineModal() {
           </div>
         ) : (
           <p>No active action was running.</p>
+        )}
+        {map.advanced && (
+          <div className="offline-grid offline-map-grid">
+            <span>Map</span>
+            <strong>{map.arrivedTileName ?? 'On the road'}</strong>
+            <span>Travel</span>
+            <strong className={`offline-travel-status ${map.interruptedBy ?? 'arrived'}`}>
+              <TravelStatusIcon map={map} />
+              {travelStatusText(map)}
+            </strong>
+          </div>
         )}
         <button className="primary-button" onClick={() => dispatch({ type: 'dismissOffline' })}>OK</button>
       </section>

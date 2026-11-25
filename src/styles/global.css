@@ -1766,6 +1766,30 @@ button:disabled {
   background: rgba(15, 23, 42, 0.72);
 }
 
+.offline-map-grid {
+  margin-top: 10px;
+}
+
+.offline-travel-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  justify-self: end;
+  text-align: right;
+}
+
+.offline-travel-status.combat {
+  color: #fb7185;
+}
+
+.offline-travel-status.time {
+  color: #fbbf24;
+}
+
+.offline-travel-status.arrived {
+  color: #34d399;
+}
+
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;

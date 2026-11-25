@@ -278,6 +278,15 @@ export interface OfflineRewardLine {
   quantity: number;
 }
 
+export interface OfflineMapSummary {
+  /** True when the trip progress or the hero position changed while offline. */
+  advanced: boolean;
+  /** Name of the map tile the hero reached during this settlement, if any. */
+  arrivedTileName: string | null;
+  /** Why travel stopped: an arrival launched a fight, or the offline time ran out. */
+  interruptedBy: 'combat' | 'time' | null;
+}
+
 export interface OfflineSummary {
   secondsAway: number;
   capped: boolean;
@@ -285,6 +294,7 @@ export interface OfflineSummary {
   completions: number;
   rewards: OfflineRewardLine[];
   xp: Partial<Record<SkillId, number>>;
+  map: OfflineMapSummary;
 }
 
 export interface LogEntry {

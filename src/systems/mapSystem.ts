@@ -244,12 +244,20 @@ export function startMapTravel(state: GameState, destination: MapCoord): void {
   addMapLog(state, 'info', `Travelling to ${destinationTile.name}.`);
 }
 
-export function processMapTick(state: GameState, deltaMs: number): void {
-  if (!state.map.destination || state.combat.mode !== 'idle') return;
+export interface MapTickResult {
+  arrived: boolean;
+  arrivedTileName: string | null;
+  startedCombat: boolean;
+}
+
+const NO_MAP_TICK: MapTickResult = { arrived: false, arrivedTileName: null, startedCombat: false };
+
+export function processMapTick(state: GameState, deltaMs: number): MapTickResult {
+  if (!state.map.destination || state.combat.mode !== 'idle') return NO_MAP_TICK;
   if (state.map.runStatus !== 'active') {
     state.map.destination = null;
     state.map.travelProgressMs = 0;
-    return;
+    return NO_MAP_TICK;
   }
 
   const destination = state.map.destination;
@@ -257,13 +265,13 @@ export function processMapTick(state: GameState, deltaMs: number): void {
     state.map.destination = null;
     state.map.travelProgressMs = 0;
     addMapLog(state, 'warning', 'Travel cancelled: that room is outside this run.');
-    return;
+    return NO_MAP_TICK;
   }
   const destinationTile = ensureMapTile(state, destination);
   state.map.travelIntervalMs = destinationTile.travelTimeMs;
   state.map.travelProgressMs += deltaMs;
 
-  if (state.map.travelProgressMs < state.map.travelIntervalMs) return;
+  if (state.map.travelProgressMs < state.map.travelIntervalMs) return NO_MAP_TICK;
 
   state.map.position = destination;
   state.map.destination = null;
@@ -272,12 +280,55 @@ export function processMapTick(state: GameState, deltaMs: number): void {
   revealAround(state, destination, destinationTile.secret ?? false);
   addMapLog(state, 'success', `Arrived at ${destinationTile.name}.`);
   triggerTileArrival(state, destinationTile);
+  return { arrived: true, arrivedTileName: destinationTile.name, startedCombat: state.combat.mode !== 'idle' };
 }
 
-export function completeOfflineTravel(state: GameState, deltaMs: number): boolean {
-  if (!state.map.destination || state.combat.mode !== 'idle') return false;
-  processMapTick(state, deltaMs);
-  return !state.map.destination;
+export interface OfflineTravelResult {
+  /** True when travel progress or position actually changed. */
+  advanced: boolean;
+  /** Name of the tile reached during this settlement, if any. */
+  arrivedTileName: string | null;
+  /** Why travel stopped early: an arrival started a fight, or the time ran out mid-route. */
+  interruptedBy: 'combat' | 'time' | null;
+}
+
+/**
+ * Advance an in-progress map trip using leftover offline time.
+ *
+ * The caller is responsible for only handing over time that the skill
+ * settlement did not already consume. This reuses the live tick rules so the
+ * arrival, fog reveal, encounter, puzzle and reward handling all match. When
+ * the run is over, a fight is already active, or no destination is set, it
+ * returns without mutating the map so the saved destination and progress are
+ * preserved exactly.
+ */
+export function completeOfflineTravel(state: GameState, deltaMs: number): OfflineTravelResult {
+  const result: OfflineTravelResult = { advanced: false, arrivedTileName: null, interruptedBy: null };
+  if (deltaMs <= 0) return result;
+  if (state.combat.mode !== 'idle') return result;
+  if (state.map.runStatus !== 'active') return result;
+  if (!state.map.destination) return result;
+  if (!isCoordWithinBounds(state.map.destination, state.map.bounds)) return result;
+
+  const startProgress = state.map.travelProgressMs;
+  const startKey = coordKey(state.map.position);
+
+  const tick = processMapTick(state, deltaMs);
+
+  if (tick.arrived) {
+    result.advanced = true;
+    result.arrivedTileName = tick.arrivedTileName;
+    if (tick.startedCombat) result.interruptedBy = 'combat';
+    return result;
+  }
+
+  // Reaching this point means the trip did not finish: either the destination
+  // was left intact (time ran out) or the tick cancelled a corrupt route.
+  if (state.map.travelProgressMs !== startProgress || coordKey(state.map.position) !== startKey) {
+    result.advanced = true;
+    result.interruptedBy = state.map.destination ? 'time' : null;
+  }
+  return result;
 }
 
 export function getCurrentMapTile(state: GameState): MapTile {

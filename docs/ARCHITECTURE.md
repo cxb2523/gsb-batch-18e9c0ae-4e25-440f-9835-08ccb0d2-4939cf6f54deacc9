@@ -39,7 +39,7 @@ Game rules live in `src/systems`:
 
 The game state is defined by `GameState` in `src/types/game.ts`. Saves are stored in browser `localStorage`, then hydrated against the latest initial state so new fields can receive defaults.
 
-Offline progression currently applies to active skilling actions and is capped at 24 hours. Combat does not currently advance while offline.
+Offline progression is capped at 24 hours. On load, `applyOfflineProgression` first settles the active skill action using the same rules as `idleSystem.ts`, then hands whatever offline time remains to map travel via `completeOfflineTravel`. Travel reuses the live `processMapTick` rules, so crossing the arrival point triggers the normal reveal, encounter, puzzle, and reward handling. If the arrival starts a combat encounter, settlement stops there; when the run is over, combat is already active, or there is no destination, the map is left untouched (destination and progress preserved). The offline summary reports the resolved skill action plus a `map` block (`advanced`, `arrivedTileName`, `interruptedBy`) that `OfflineModal` renders. Combat itself does not advance while offline.
 
 ## Rendering and UI
 
