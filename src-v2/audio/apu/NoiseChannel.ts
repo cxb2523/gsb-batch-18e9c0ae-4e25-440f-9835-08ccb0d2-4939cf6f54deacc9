@@ -25,13 +25,29 @@ interface NoiseBufferCache {
   duration: number;
 }
 
+/**
+ * Build the cache identity for a generated noise buffer. A buffer may only be
+ * reused when the LFSR mode, clock frequency and required length all match —
+ * reusing a buffer across any of those parameters would make a note at a new
+ * position sound with the wrong noise character after a seek/stop.
+ *
+ * Frequencies produced by the GB frequency table are exact values, but the
+ * key is quantized slightly so mathematically-equal values that differ only
+ * by floating point rounding still hit the same entry.
+ */
+function noiseCacheKey(frequency: number, mode: LFSRMode, duration: number): string {
+  return `${mode}:${frequency.toFixed(4)}:${Math.ceil(duration * 1000)}`;
+}
+
 export class NoiseChannel {
   private audioContext: AudioContext;
   private mode: LFSRMode;
   private outputNode: GainNode;
-  
-  // Cache recently used noise buffers
-  private bufferCache: NoiseBufferCache[] = [];
+
+  // Buffers keyed by their exact generation parameters (mode + frequency +
+  // duration). Lookups never cross parameters, so seeks can't reuse a buffer
+  // built for different noise settings.
+  private bufferCache: Map<string, NoiseBufferCache> = new Map();
   private maxCacheSize = 8;
   
   constructor(
@@ -52,33 +68,32 @@ export class NoiseChannel {
   setMode(mode: LFSRMode): void {
     this.mode = mode;
   }
-  
+
   /**
    * Get current mode.
    */
   getMode(): LFSRMode {
     return this.mode;
   }
-  
+
   /**
    * Get or create a noise buffer with the given parameters.
+   *
+   * The cache is keyed on (mode, frequency, duration), so a buffer generated
+   * for one set of parameters is never returned for another — including after
+   * a seek or stop/restart.
    */
   private getNoiseBuffer(
     frequency: number,
     duration: number,
     mode: LFSRMode
   ): AudioBuffer {
-    // Check cache first
-    const cached = this.bufferCache.find(
-      c => c.frequency === frequency && 
-           c.mode === mode && 
-           c.duration >= duration
-    );
-    
+    const key = noiseCacheKey(frequency, mode, duration);
+    const cached = this.bufferCache.get(key);
     if (cached) {
       return cached.buffer;
     }
-    
+
     // Generate new buffer
     const buffer = generateNoiseBuffer(
       this.audioContext,
@@ -86,15 +101,14 @@ export class NoiseChannel {
       frequency,
       mode
     );
-    
-    // Add to cache
-    this.bufferCache.push({ buffer, frequency, mode, duration });
-    
-    // Trim cache if too large
-    while (this.bufferCache.length > this.maxCacheSize) {
-      this.bufferCache.shift();
+
+    // Add to cache, evicting the oldest entry when full (insertion order).
+    this.bufferCache.set(key, { buffer, frequency, mode, duration });
+    if (this.bufferCache.size > this.maxCacheSize) {
+      const oldestKey = this.bufferCache.keys().next().value;
+      if (oldestKey !== undefined) this.bufferCache.delete(oldestKey);
     }
-    
+
     return buffer;
   }
   
@@ -110,12 +124,13 @@ export class NoiseChannel {
     duration: number,
     frequency: number,
     velocity: number = 100,
-    startTime?: number
+    startTime?: number,
+    mode: LFSRMode = this.mode
   ): NoiseNoteResult {
     const now = startTime ?? this.audioContext.currentTime;
-    
-    // Get or generate noise buffer
-    const buffer = this.getNoiseBuffer(frequency, duration, this.mode);
+
+    // Get or generate noise buffer for THIS note's exact parameters.
+    const buffer = this.getNoiseBuffer(frequency, duration, mode);
     
     // Create source
     const source = this.audioContext.createBufferSource();
@@ -183,8 +198,8 @@ export class NoiseChannel {
   ): NoiseNoteResult {
     const { divisorCode, clockShift } = midiToNoiseParams(midiNote);
     const frequency = calculateNoiseFrequency(divisorCode, clockShift);
-    
-    return this.playNoise(duration, frequency, velocity, startTime);
+
+    return this.playNoise(duration, frequency, velocity, startTime, this.mode);
   }
   
   /**
@@ -307,9 +322,10 @@ export class NoiseChannel {
   }
   
   /**
-   * Clear the buffer cache.
+   * Clear the buffer cache. Called on stop/seek so buffers generated for a
+   * previous playback position can never be served for a new position.
    */
   clearCache(): void {
-    this.bufferCache = [];
+    this.bufferCache.clear();
   }
 }

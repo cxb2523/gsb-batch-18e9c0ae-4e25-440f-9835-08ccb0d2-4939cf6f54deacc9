@@ -41,3 +41,6 @@ server/cache/
 
 # Wrangler local state
 .wrangler/
+
+# Headless browser profiles used by local diagnostic smoke tests
+.chrome-cdp-profile/

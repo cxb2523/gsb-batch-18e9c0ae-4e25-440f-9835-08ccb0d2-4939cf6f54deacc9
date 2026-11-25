@@ -4,6 +4,11 @@ import { resolve } from 'node:path'
 export default defineConfig({
   server: {
     port: 3000,
+    // Local test/diagnostic artifacts (headless-browser profiles, node
+    // tests) must not trigger the dev file watcher.
+    watch: {
+      ignored: ['**/.chrome-cdp-profile/**', '**/tests/mocks/**'],
+    },
     proxy: {
       '/api': 'http://localhost:3001',
       '/health': 'http://localhost:3001',

@@ -14,10 +14,11 @@ import { PulseChannel } from './PulseChannel';
 import { WaveChannel } from './WaveChannel';
 import { NoiseChannel } from './NoiseChannel';
 import { GameBoyColorizer } from '../effects/GameBoyColorizer';
-import { 
+import {
   DEFAULT_V2_CONFIG,
-  type ChannelId, 
-  type ChannelNote, 
+  type ChannelAssignment,
+  type ChannelId,
+  type ChannelNote,
   type ChannelState,
   type PulseChannelId,
   type WaveChannelId,
@@ -73,6 +74,10 @@ export class GameBoyAPU {
   
   // Track active audio nodes for stop functionality
   private activeNodes: Set<OscillatorNode | AudioBufferSourceNode> = new Set();
+
+  // Gain envelopes created alongside each tracked source, so stopAll() can
+  // disconnect them too instead of leaving them attached to the channel bus.
+  private nodeEnvelopes: Map<OscillatorNode | AudioBufferSourceNode, GainNode> = new Map();
   
   constructor(audioContext?: AudioContext, config?: Partial<V2Config>) {
     this.audioContext = audioContext || new AudioContext();
@@ -129,9 +134,10 @@ export class GameBoyAPU {
       this.initChannelState(config.id);
     }
     
-    // Create noise channels - MUTED for now
+    // Create noise channels (2 × 0.08 = 0.16 max). Audible: percussion tracks
+    // are routed here by the ChannelMapper.
     for (const config of CHANNEL_CONFIG.noise) {
-      const gain = this.createChannelGain(config.id, 0);
+      const gain = this.createChannelGain(config.id, 0.08);
       const channel = new NoiseChannel(this.audioContext, gain, config.mode);
       this.noiseChannels.set(config.id, channel);
       this.initChannelState(config.id);
@@ -254,11 +260,11 @@ export class GameBoyAPU {
   ): void {
     const channel = this.pulseChannels.get(channelId);
     if (!channel) return;
-    
+
     const result = channel.playNote(midiNote, duration, velocity, startTime);
-    this.trackNode(result.oscillator, result.stopTime);
+    this.trackNode(result.oscillator, result.stopTime, result.gainNode);
   }
-  
+
   /**
    * Schedule a wave channel note.
    */
@@ -271,11 +277,11 @@ export class GameBoyAPU {
   ): void {
     const channel = this.waveChannels.get(channelId);
     if (!channel) return;
-    
+
     const result = channel.playNote(midiNote, duration, velocity, startTime);
-    this.trackNode(result.oscillator, result.stopTime);
+    this.trackNode(result.oscillator, result.stopTime, result.gainNode);
   }
-  
+
   /**
    * Schedule a noise channel note.
    */
@@ -288,22 +294,34 @@ export class GameBoyAPU {
   ): void {
     const channel = this.noiseChannels.get(channelId);
     if (!channel) return;
-    
+
     const result = channel.playNote(midiNote, duration, velocity, startTime);
-    this.trackNode(result.source, result.stopTime);
+    this.trackNode(result.source, result.stopTime, result.gainNode);
   }
-  
+
   /**
-   * Track an audio node for stop functionality.
+   * Track an audio node for stop functionality. The channel already installed
+   * an onended handler that disconnects its nodes; chain onto it instead of
+   * replacing it, and remember the envelope gain so stopAll() can free it.
    */
-  private trackNode(node: OscillatorNode | AudioBufferSourceNode, _stopTime: number): void {
+  private trackNode(
+    node: OscillatorNode | AudioBufferSourceNode,
+    _stopTime: number,
+    envelope?: GainNode
+  ): void {
     this.activeNodes.add(node);
-    
-    // Auto-remove when the node ends naturally
-    const cleanup = () => {
+    if (envelope) this.nodeEnvelopes.set(node, envelope);
+
+    const previousOnEnded = node.onended;
+    node.onended = (event) => {
+      try {
+        previousOnEnded?.call(node, event);
+      } catch {
+        // A previous handler failing must not block our bookkeeping.
+      }
       this.activeNodes.delete(node);
+      this.nodeEnvelopes.delete(node);
     };
-    node.onended = cleanup;
   }
   
   /**
@@ -395,6 +413,27 @@ export class GameBoyAPU {
       channel.setMode(mode);
     }
   }
+
+  /**
+   * Re-apply every channel's timbre settings (pulse duty cycle, wave
+   * preset, noise LFSR mode) from the channel assignments of the loaded
+   * arrangement. Called every time playback (re)starts — including after a
+   * seek — so a channel can never keep sounding with a setting left over
+   * from a previous song or playback position.
+   */
+  applyAssignmentSettings(assignments: ChannelAssignment[]): void {
+    for (const assignment of assignments) {
+      const { channelId, dutyCycle, wavePreset, noiseMode } = assignment;
+
+      if (channelId.startsWith('p') && dutyCycle !== undefined) {
+        this.setPulseDuty(channelId as PulseChannelId, dutyCycle);
+      } else if (channelId.startsWith('w') && wavePreset) {
+        this.setWavePreset(channelId as WaveChannelId, wavePreset);
+      } else if (channelId.startsWith('n') && noiseMode) {
+        this.setNoiseMode(channelId as NoiseChannelId, noiseMode);
+      }
+    }
+  }
   
   /**
    * Set individual channel volume.
@@ -467,11 +506,13 @@ export class GameBoyAPU {
   }
   
   /**
-   * Stop all currently playing and scheduled sounds immediately.
+   * Stop all currently playing and scheduled sounds immediately, disconnect
+   * their nodes, and drop per-parameter noise buffer caches so a later
+   * playback can never reuse a buffer from the abandoned position.
    */
   stopAll(): void {
     const now = this.audioContext.currentTime;
-    
+
     // Stop all tracked nodes
     for (const node of this.activeNodes) {
       try {
@@ -480,8 +521,27 @@ export class GameBoyAPU {
         // Node may have already stopped
       }
     }
+
+    // Disconnect every envelope gain the channels created. The channels'
+    // onended handlers also disconnect, but those run asynchronously; doing
+    // it here guarantees no node survives a stop/seek.
+    for (const gain of this.nodeEnvelopes.values()) {
+      try {
+        gain.disconnect();
+      } catch {
+        // Already disconnected
+      }
+    }
+    this.nodeEnvelopes.clear();
     this.activeNodes.clear();
-    
+
+    // Noise buffers are keyed by the parameters they were generated for;
+    // clearing them guarantees a restart only ever plays freshly generated
+    // buffers for the new position.
+    for (const channel of this.noiseChannels.values()) {
+      channel.clearCache();
+    }
+
     // Reset channel states
     this.reset();
   }
@@ -491,6 +551,23 @@ export class GameBoyAPU {
    */
   getScheduledNoteCount(): number {
     return this.scheduledNoteCount;
+  }
+
+  /**
+   * Number of source nodes currently tracked for stop/seek teardown.
+   * Returns 0 after stopAll() — used by lifecycle tests to prove no
+   * scheduled node survives a stop.
+   */
+  getTrackedNodeCount(): number {
+    return this.activeNodes.size;
+  }
+
+  /**
+   * Number of envelope gain nodes paired with tracked sources.
+   * Returns 0 after stopAll().
+   */
+  getTrackedEnvelopeCount(): number {
+    return this.nodeEnvelopes.size;
   }
   
   // ===== COLORIZER CONTROLS =====

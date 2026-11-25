@@ -6,6 +6,15 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Playback lifecycle gaps (pause/resume, seek, WAV export).** Pause now retains the exact song position and releases every scheduled audio node and timer; resume restarts from that position on the original timeline instead of stopping and replaying. Seeking tears down the previous run before starting the new one, and every (re)start re-applies the arrangement's per-channel timbres (pulse duty cycle, wave preset, noise LFSR mode), so channels can no longer keep a previous run's sound after a jump.
+- **Noise buffer cache correctness.** LFSR noise buffers are keyed by the exact frequency, mode and duration they were generated for, and the cache is cleared on stop/seek, so a note at a new position can never reuse a buffer built for different parameters. Noise channels are also audible again (their mixer gains were created muted).
+- **Stop now fully releases resources.** Stopping cancels both the scheduler interval and the natural-end timer (a stale timer from a superseded run is also guarded by a run id), stops and disconnects all source nodes and their envelope gains, and drops scheduling bookkeeping — no residual sound or timers after repeated seeks.
+- **Live/offline parity.** The 30-second WAV export renders from the same cached, arranged channel notes and the same `applyAssignmentSettings` call as live playback, via a fresh offline APU. Preparing the same MIDI bytes twice no longer fails on a detached `ArrayBuffer`.
+
+### Added
+- Headless playback-lifecycle test suite (`npm test`) covering pause/resume alignment, seek timbre reset, noise cache isolation, stop teardown, timer leaks and live/offline render parity, plus a local `playback-lifecycle-diagnostic.html` page (not part of the production build) for manual and headless-browser verification.
+
 ### Changed
 - Guide page links moved from the home page footer into the FAQ under "More".
 

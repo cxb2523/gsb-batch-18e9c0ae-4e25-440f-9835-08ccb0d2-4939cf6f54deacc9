@@ -47,7 +47,6 @@ class MotifApp {
   private isPreviewPlaying = false;
   private hasGenerated = false;
   private isMotifPlaying = false;
-  private motifResumeProgress = 0;
 
   // Preview player (no UI volume)
 
@@ -319,7 +318,6 @@ class MotifApp {
     this.handleMotifStop();
     this.hasGenerated = false;
     this.isMotifPlaying = false;
-    this.motifResumeProgress = 0;
     this.currentMIDI = null;
     this.currentSource = null;
     this.searchResults = [];
@@ -520,7 +518,6 @@ class MotifApp {
       this.stopPreview();
       this.hasGenerated = false;
       this.disablePlayerControls();
-      this.motifResumeProgress = 0;
       this.currentMIDI = { buffer: midiBuffer, events, metadata: { ...metadata, duration: actualDuration } };
       this.currentSource = { type: 'upload', fileName: file.name };
       if (this.embedSection) this.embedSection.style.display = 'none';
@@ -628,7 +625,6 @@ class MotifApp {
         actualDuration = Math.max(...events.map(e => e.time + e.duration));
       }
 
-      this.motifResumeProgress = 0;
       this.currentMIDI = { buffer: midiBuffer, events, metadata: { ...metadata, duration: actualDuration } };
       this.currentSource = { type: 'remote', resultIndex: index };
 
@@ -766,9 +762,11 @@ class MotifApp {
   }
 
   private handleMotifSeek(progress: number): void {
-    this.motifResumeProgress = progress;
+    // WarioPlayer routes this correctly: a live seek restarts from the new
+    // offset; while paused it only moves the remembered position, so the
+    // next resume starts there without starting sound early.
+    this.motifEngine.seek(progress);
     if (this.isMotifPlaying) {
-      this.motifEngine.seek(progress);
       this.updateMotifProgress();
       return;
     }
@@ -803,7 +801,6 @@ class MotifApp {
     // Auto-pause at end
     const duration = this.motifEngine.getDuration();
     if (duration > 0 && progress >= 0.999) {
-      this.motifResumeProgress = 0;
       this.handleMotifStop();
       this.motifCurrentTime.textContent = this.formatTime(duration);
       this.motifProgressBar.value = '100';
@@ -1073,8 +1070,10 @@ class MotifApp {
     if (!this.hasGenerated) return;
 
     if (this.isMotifPlaying) {
-      this.motifResumeProgress = this.motifEngine.getProgress();
-      this.motifEngine.stop();
+      // Pause: the engine remembers the exact song position and releases all
+      // scheduled nodes/timers; resume restarts from that same position using
+      // the same cached channel notes.
+      this.motifEngine.pause();
       this.isMotifPlaying = false;
       this.stopMotifProgressUpdates();
       this.playPauseBtn.textContent = 'Play';
@@ -1087,8 +1086,9 @@ class MotifApp {
       await unlockAudio();
 
       this.motifEngine.setVolume(0.8);
+      // play() either resumes from the pause/scrub position or starts from 0;
+      // it never double-schedules, so no extra seek is needed here.
       await this.motifEngine.play();
-      if (this.motifResumeProgress > 0) this.motifEngine.seek(this.motifResumeProgress);
       this.isMotifPlaying = true;
       this.playPauseBtn.textContent = 'Pause';
       this.startMotifProgressUpdates();

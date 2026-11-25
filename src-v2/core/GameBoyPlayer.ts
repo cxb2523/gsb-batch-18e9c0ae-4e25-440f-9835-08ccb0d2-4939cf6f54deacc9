@@ -50,9 +50,13 @@ export class GameBoyPlayer {
   private config: GameBoyPlayerConfig;
   
   private isPlaying: boolean = false;
+  private isPaused: boolean = false;
   private currentPlaybackInfo: PlaybackInfo | null = null;
   private playbackStartTime: number = 0;
-  
+  // Song position (seconds) at the moment playback was paused. While playing
+  // the position is derived from the audio clock; this holds it while paused.
+  private pausedAt: number = 0;
+
   // Progressive scheduling state
   private pendingNotes: ChannelNote[] = [];
   private scheduleIndex: number = 0;
@@ -62,6 +66,13 @@ export class GameBoyPlayer {
   private loadedDuration: number = 0;
   private loadedAssignments: ChannelAssignment[] = [];
   private schedulerInterval: ReturnType<typeof setInterval> | null = null;
+  // Timer that flips the player to "stopped" at the natural end of a run.
+  // Tracked so stop()/seek() can cancel it — an uncancelled timer from an old
+  // run must never touch the state of a new run.
+  private endTimer: ReturnType<typeof setTimeout> | null = null;
+  // Identifies the playback run the end timer belongs to; a stale timer whose
+  // run was superseded becomes a no-op even if clearTimeout is unavailable.
+  private playbackRunId: number = 0;
   private readonly SCHEDULE_AHEAD_TIME = 2.0; // Schedule 2 seconds ahead
   private readonly SCHEDULER_INTERVAL_MS = 250; // Check every 250ms
   
@@ -82,7 +93,7 @@ export class GameBoyPlayer {
   
   /**
    * Parse and play a MIDI file.
-   * 
+   *
    * @param midiData - MIDI file as ArrayBuffer
    * @returns Playback information
    */
@@ -91,12 +102,10 @@ export class GameBoyPlayer {
     if (this.config.autoResume) {
       await this.apu.resume();
     }
-    
-    // Stop any current playback
-    if (this.isPlaying) {
-      this.stop();
-    }
-    
+
+    // Tear down any current playback (scheduler, nodes, timers) first.
+    this.stop();
+
     const info = this.prepare(midiData);
     this.startFromOffset(startOffset);
     return info;
@@ -107,11 +116,16 @@ export class GameBoyPlayer {
    * WITHOUT starting playback. Lets the WAV export render without a sound.
    */
   prepareMIDI(midiData: ArrayBuffer): PlaybackInfo {
+    // A new song invalidates any playback state from the previous one.
+    this.stop();
     return this.prepare(midiData);
   }
 
   private prepare(midiData: ArrayBuffer): PlaybackInfo {
-    const midi = new Midi(midiData);
+    // Slice the bytes: @tonejs/midi detaches the ArrayBuffer it receives,
+    // and callers (e.g. the export path) may need to prepare the same MIDI
+    // more than once.
+    const midi = new Midi(midiData.slice(0));
     const bpm = midi.header.tempos[0]?.bpm || this.config.defaultBPM;
     this.arpeggiator.setBPM(bpm);
     this.arranger.setBPM(bpm);
@@ -129,6 +143,12 @@ export class GameBoyPlayer {
     this.loadedNotes = gbNotes;
     this.loadedDuration = midi.duration;
     this.loadedAssignments = assignments;
+
+    // Make the live APU's channel timbres match this arrangement's channel
+    // assignment immediately, so even the very first startFromOffset() runs
+    // with the correct duty cycles / wave presets / noise modes.
+    this.apu.applyAssignmentSettings(assignments);
+
     const info = {
       duration: midi.duration,
       assignments,
@@ -144,12 +164,48 @@ export class GameBoyPlayer {
    */
   playFrom(offsetSec: number): void {
     if (this.loadedNotes.length === 0) return;
-    this.startFromOffset(Math.max(0, offsetSec));
+    this.startFromOffset(Math.max(0, Math.min(this.loadedDuration, offsetSec)));
+  }
+
+  /**
+   * Pause playback and remember the exact song position. Already-scheduled
+   * audio nodes and the scheduler are torn down; resume() restarts from the
+   * same position using the same cached channel notes.
+   */
+  pause(): void {
+    if (!this.isPlaying || this.isPaused) return;
+    this.pausedAt = this.getElapsedTime();
+    this.haltPlaybackRun();
+    this.isPaused = true;
+  }
+
+  /**
+   * Resume from the position stored by pause(). A no-op when not paused.
+   */
+  resumePlayback(): void {
+    if (!this.isPaused) return;
+    const offset = this.pausedAt;
+    this.isPaused = false;
+    this.pausedAt = 0;
+    this.startFromOffset(offset);
+  }
+
+  /**
+   * Move the remembered position while paused, without starting any sound.
+   * The next resumePlayback() starts from this new position.
+   */
+  seekPaused(offsetSec: number): void {
+    if (!this.isPaused) return;
+    this.pausedAt = Math.max(0, Math.min(this.loadedDuration, offsetSec));
   }
 
   /**
    * Render the currently loaded song to an AudioBuffer offline (faster than
    * real time). Used to export a WAV. Returns null if nothing is loaded.
+   *
+   * The render goes through the exact same cached channel notes and the same
+   * per-channel assignment settings as live playback, so the exported clip
+   * matches what is heard when playing the song from the start.
    */
   async renderToBuffer(sampleRate: number = 22050, maxSeconds: number = 30): Promise<AudioBuffer | null> {
     if (this.loadedNotes.length === 0) return null;
@@ -171,17 +227,12 @@ export class GameBoyPlayer {
     const offline = new OfflineAudioContext(2, Math.ceil(totalDuration * sampleRate), sampleRate);
     const offlineApu = new GameBoyAPU(offline as unknown as AudioContext, this.config);
 
-    // Re-apply the per-channel settings this arrangement used.
-    for (const a of this.loadedAssignments) {
-      if (a.channelId.startsWith('p') && a.dutyCycle !== undefined) {
-        offlineApu.setPulseDuty(a.channelId as any, a.dutyCycle);
-      } else if (a.channelId.startsWith('w') && a.wavePreset) {
-        offlineApu.setWavePreset(a.channelId as any, a.wavePreset);
-      } else if (a.channelId.startsWith('n') && a.noiseMode) {
-        offlineApu.setNoiseMode(a.channelId as any, a.noiseMode);
-      }
-    }
+    // Re-apply the exact per-channel settings this arrangement used — same
+    // call the live player makes on every (re)start.
+    offlineApu.applyAssignmentSettings(this.loadedAssignments);
 
+    // Schedule the same notes (same channels, same song-relative times) that
+    // the live scheduler would emit for this clip.
     for (const note of notes) {
       offlineApu.scheduleNote(note);
     }
@@ -189,9 +240,34 @@ export class GameBoyPlayer {
     return offline.startRendering();
   }
 
-  private startFromOffset(offsetSec: number): void {
+  /**
+   * Cancel the scheduler interval and the natural-end timer for the current
+   * playback run, and stop all scheduled audio nodes. Leaves the loaded song
+   * and pause bookkeeping untouched.
+   */
+  private haltPlaybackRun(): void {
     this.stopScheduler();
+    this.clearEndTimer();
     this.apu.stopAll();
+  }
+
+  private clearEndTimer(): void {
+    if (this.endTimer !== null) {
+      clearTimeout(this.endTimer);
+      this.endTimer = null;
+    }
+  }
+
+  private startFromOffset(offsetSec: number): void {
+    // Full teardown of any previous run (stop, seek, or restart) so no node
+    // or timer from an old run can overlap the new one.
+    this.haltPlaybackRun();
+    const runId = ++this.playbackRunId;
+
+    // Every (re)start re-applies this arrangement's channel timbres. After a
+    // seek the channels therefore sound exactly as they would at the same
+    // position when playing from the start.
+    this.apu.applyAssignmentSettings(this.loadedAssignments);
 
     this.pendingNotes = this.loadedNotes;
     // Skip notes that start before the offset (pendingNotes is sorted by time).
@@ -210,12 +286,20 @@ export class GameBoyPlayer {
     this.scheduleNextBatch();
     this.startScheduler();
 
-    // Auto-stop after the remaining duration.
+    // Auto-stop after the remaining duration. The run id guard makes a timer
+    // left over from a superseded run a guaranteed no-op.
     const stopDelay = (this.loadedDuration - offsetSec + 1) * 1000;
-    setTimeout(() => {
-      if (this.isPlaying && this.playbackStartTime === startTime) {
-        this.isPlaying = false;
-      }
+    this.endTimer = setTimeout(() => {
+      if (this.playbackRunId !== runId) return;
+      this.endTimer = null;
+      this.playbackRunId++;
+      this.stopScheduler();
+      this.apu.stopAll();
+      this.pendingNotes = [];
+      this.scheduleIndex = 0;
+      this.isPlaying = false;
+      this.isPaused = false;
+      this.pausedAt = 0;
     }, Math.max(0, stopDelay));
   }
   
@@ -284,19 +368,9 @@ export class GameBoyPlayer {
    * Apply channel-specific settings from assignment.
    */
   private applyChannelSettings(assignment: ChannelAssignment): void {
-    const { channelId, dutyCycle, wavePreset, noiseMode } = assignment;
-    
-    if (channelId.startsWith('p') && dutyCycle !== undefined) {
-      this.apu.setPulseDuty(channelId as any, dutyCycle);
-    }
-    
-    if (channelId.startsWith('w') && wavePreset) {
-      this.apu.setWavePreset(channelId as any, wavePreset);
-    }
-    
-    if (channelId.startsWith('n') && noiseMode) {
-      this.apu.setNoiseMode(channelId as any, noiseMode);
-    }
+    // Delegate to the APU's single settings entry point so preparation and
+    // restart apply timbres identically.
+    this.apu.applyAssignmentSettings([assignment]);
   }
   
   /**
@@ -366,22 +440,43 @@ export class GameBoyPlayer {
   }
   
   /**
-   * Stop playback.
+   * Stop playback and release everything scheduled for this run: the
+   * scheduler interval, the natural-end timer, and every audio node (plus
+   * its envelope). After this returns nothing is sounding and no timer is
+   * left running. The loaded song is kept so play() can restart it.
    */
   stop(): void {
+    this.playbackRunId++; // invalidate any in-flight end timer
+    this.haltPlaybackRun();
     this.isPlaying = false;
-    this.stopScheduler();
+    this.isPaused = false;
+    this.pausedAt = 0;
     this.pendingNotes = [];
     this.scheduleIndex = 0;
-    this.apu.stopAll();
     console.log('Playback stopped');
   }
-  
+
   /**
-   * Check if currently playing.
+   * Check if currently playing (false while paused or stopped).
    */
   getIsPlaying(): boolean {
-    return this.isPlaying;
+    return this.isPlaying && !this.isPaused;
+  }
+
+  /**
+   * Check if playback is paused mid-song.
+   */
+  getIsPaused(): boolean {
+    return this.isPaused;
+  }
+
+  /**
+   * Get the current song position in seconds, including while paused.
+   */
+  getPosition(): number {
+    if (this.isPaused) return Math.max(0, Math.min(this.loadedDuration, this.pausedAt));
+    if (!this.isPlaying) return 0;
+    return Math.max(0, Math.min(this.loadedDuration, this.apu.getCurrentTime() - this.playbackStartTime));
   }
   
   /**
@@ -392,11 +487,10 @@ export class GameBoyPlayer {
   }
   
   /**
-   * Get elapsed playback time in seconds.
+   * Get elapsed playback time in seconds (the current song position).
    */
   getElapsedTime(): number {
-    if (!this.isPlaying) return 0;
-    return this.apu.getCurrentTime() - this.playbackStartTime;
+    return this.getPosition();
   }
   
   /**
@@ -469,8 +563,25 @@ export class GameBoyPlayer {
    * Get detailed track analysis.
    */
   getTrackAnalysis(midiData: ArrayBuffer) {
-    const midi = new Midi(midiData);
+    const midi = new Midi(midiData.slice(0));
     const tracks = this.convertMIDITracks(midi);
     return this.mapper.analyzeTracks(tracks);
+  }
+
+  /**
+   * The cached, fully arranged channel notes of the currently loaded song.
+   * Playback, seeking and offline rendering all schedule from this exact
+   * list, which is what keeps the three paths audibly identical.
+   */
+  getLoadedNotes(): readonly ChannelNote[] {
+    return this.loadedNotes;
+  }
+
+  /**
+   * The channel assignments (duty cycles, wave presets, noise modes) for the
+   * currently loaded song.
+   */
+  getLoadedAssignments(): readonly ChannelAssignment[] {
+    return this.loadedAssignments;
   }
 }
