@@ -17,10 +17,10 @@ export default class GLBench {
 
     this.names = [];
     this.cpuAccums = [];
-    this.gpuAccums = [];  
+    this.gpuAccums = [];
     this.activeAccums = [];
     this.chart = new Array(this.chartLen);
-    this.now = () => (performance && performance.now) ? performance.now() : Date.now();
+    this.now = () => (typeof performance !== 'undefined' && performance && performance.now) ? performance.now() : Date.now();
     this.updateUI = () => {
       [].forEach.call(this.nodes['gl-gpu-svg'], node => {
         node.style.display = this.trackGPU ? 'inline' : 'none';
@@ -29,6 +29,8 @@ export default class GLBench {
 
     Object.assign(this, settings);
     this.detected = 0;
+    // Probes of the current stats window. At a window switch this list is
+    // rotated (not cleared through an old Promise), see nextFrame().
     this.finished = [];
     this.isFramebuffer = 0;
     this.frameId = 0;
@@ -44,23 +46,36 @@ export default class GLBench {
       }
       if (!t0) t0 = t;
     }
-    requestAnimationFrame(loop);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
 
     // attach gpu profilers
     if (gl) {
-      const glFinish = async (t, activeAccums) =>
-        Promise.resolve(setTimeout(() => {
-          gl.getError();
-          const dt = this.now() - t;
-          activeAccums.forEach((active, i) => {
-            if (active) this.gpuAccums[i] += dt;
-          });
-        }, 0));
+      // The promise resolves only after the delayed gl.getError() probe has
+      // finished and its dt was added to the accumulators of the stats window
+      // that initiated the draw.
+      const glFinish = (t, activeAccums, windowGpuAccums) =>
+        new Promise(resolve => {
+          setTimeout(() => {
+            gl.getError();
+            const dt = this.now() - t;
+            activeAccums.forEach((active, i) => {
+              if (active) windowGpuAccums[i] += dt;
+            });
+            resolve();
+          }, 0);
+        });
 
       const addProfiler = (fn, self, target) => function() {
         const t = self.now();
         fn.apply(target, arguments);
-        if (self.trackGPU) self.finished.push(glFinish(t, self.activeAccums.slice(0)));
+        if (self.trackGPU) {
+          // Capture both the measurements active right now and the current
+          // stats window accumulators: later begin/end toggles and window
+          // switches must not re-route this probe.
+          const activeAccums = self.activeAccums.slice(0);
+          const windowGpuAccums = self.gpuAccums;
+          self.finished.push(glFinish(t, activeAccums, windowGpuAccums));
+        }
       };
 
       ['drawArrays', 'drawElements', 'drawArraysInstanced',
@@ -68,7 +83,7 @@ export default class GLBench {
         .forEach(fn => { if (gl[fn]) gl[fn] = addProfiler(gl[fn], this, gl) });
 
       gl.getExtension = ((fn, self) => function() {
-        let ext = fn.apply(gl, arguments);
+        let ext = fn ? fn.apply(gl, arguments) : undefined;
         if (ext) {
           ['drawElementsInstancedANGLE', 'drawBuffersWEBGL']
             .forEach(fn => { if (ext[fn]) ext[fn] = addProfiler(ext[fn], self, ext) });
@@ -146,7 +161,7 @@ export default class GLBench {
    */
   nextFrame(now) {
     this.frameId++;
-    const t = now ? now : this.now();
+    const t = (now !== undefined && now !== null) ? now : this.now();
 
     // params
     if (this.frameId <= 1) {
@@ -157,17 +172,21 @@ export default class GLBench {
       if (duration >= 1e3) {
         const frameCount = this.frameId - this.paramFrame;
         const fps = frameCount / duration * 1e3;
+        // Report the closing window exactly as before and while
+        // this.gpuAccums/this.finished still point at that window.
         for (let i = 0; i < this.names.length; i++) {
           const cpu = this.cpuAccums[i] / duration * 100,
             gpu = this.gpuAccums[i] / duration * 100,
-            mem = (performance && performance.memory) ? performance.memory.usedJSHeapSize / (1 << 20) : 0;
+            mem = (typeof performance !== 'undefined' && performance.memory) ? performance.memory.usedJSHeapSize / (1 << 20) : 0;
           this.paramLogger(i, cpu, gpu, mem, fps, duration, frameCount);
           this.cpuAccums[i] = 0;
-          Promise.all(this.finished).then(() => {
-            this.gpuAccums[i] = 0;
-            this.finished = [];
-          });
         }
+        // Open a fresh stats window. In-flight probes already captured the
+        // previous gpuAccums/finished references, so they settle inside the
+        // old window and can neither write the new gpuAccums nor clear the
+        // new finished list.
+        this.gpuAccums = new Array(this.names.length).fill(0);
+        this.finished = [];
         this.paramFrame = this.frameId;
         this.paramTime = t;
       }

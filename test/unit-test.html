@@ -46,5 +46,155 @@
     }
   </script>
   <script type="module" src="./test.js"></script>
+
+  <!--
+    Local, reproducible GPU timing tests (no CDN / WebGL needed).
+    Uses an injectable fake now() and a fake gl.getError/drawArrays.
+    Also run as zora cases in ./test.js; this block keeps the coverage
+    visible directly on this page and exposes window.__gpuAttribTests.
+  -->
+  <pre id="gpu-attrib-results" style="text-align:left;margin:16px;padding:12px;background:#101418;color:#9fe88a;border-radius:8px;"></pre>
+  <script type="module">
+    import LocalGLBench from '../dist/gl-bench.module.js';
+
+    const out = document.getElementById('gpu-attrib-results');
+    const lines = [];
+    let passed = 0, failed = 0;
+    const checks = [];
+    function check(name, actual, expected) {
+      const ok = JSON.stringify(actual) === JSON.stringify(expected);
+      checks.push({ name, ok, actual, expected });
+      if (ok) { passed++; lines.push('ok   - ' + name + ' => ' + JSON.stringify(actual)); }
+      else {
+        failed++;
+        lines.push('FAIL - ' + name + ' | expected ' + JSON.stringify(expected) +
+          ' got ' + JSON.stringify(actual));
+      }
+    }
+    const tick = () => new Promise(r => setTimeout(r, 0));
+    const fakeGL = () => ({
+      errorCount: 0,
+      getError() { this.errorCount++; return 0; },
+      drawArrays() {},
+      drawElements() {},
+    });
+
+    try {
+      // ---- Case 1: multi-measurement attribution -------------------------
+      {
+        let clock = 0;
+        const gl = fakeGL();
+        const bench = new LocalGLBench(gl, { withoutUI: true, trackGPU: true, now: () => clock });
+        bench.addUI('A'); bench.addUI('B');
+        bench.begin('A'); gl.drawArrays(); bench.end('A');
+        bench.begin('B'); gl.drawArrays(); bench.end('B');
+        clock = 50;
+        await Promise.all(bench.finished);
+        check('multi-item sequential gpuAccums', bench.gpuAccums, [50, 50]);
+        check('getError probe count', gl.errorCount, 2);
+      }
+      {
+        let clock = 0;
+        const gl = fakeGL();
+        const bench = new LocalGLBench(gl, { withoutUI: true, trackGPU: true, now: () => clock });
+        bench.addUI('A'); bench.addUI('B');
+        bench.begin('A'); bench.begin('B');
+        gl.drawArrays();            // both active
+        bench.end('B');
+        gl.drawArrays();            // only A active
+        bench.end('A');
+        clock = 40;
+        await Promise.all(bench.finished);
+        check('overlapping items A=[80] B=[40]', bench.gpuAccums, [80, 40]);
+      }
+
+      // ---- Case 2: stats-window switch isolation -------------------------
+      {
+        let clock = 1000;
+        const gpuLogs = [];
+        const gl = fakeGL();
+        const bench = new LocalGLBench(gl, {
+          withoutUI: true, trackGPU: true, now: () => clock,
+          paramLogger: (i, cpu, gpu) => gpuLogs.push([i, gpu]),
+        });
+        bench.addUI('A'); bench.addUI('B');
+        bench.nextFrame();
+        bench.begin('A'); gl.drawArrays(); bench.end('A');   // old probe t=1000
+        const oldFinished = bench.finished.slice();
+        const oldGpu = bench.gpuAccums;
+        clock = 2000;
+        bench.nextFrame();                                    // switch
+        check('paramLogger calls on switch', gpuLogs.length, 2);
+        check('new window finished starts empty', bench.finished.length, 0);
+        check('new window gpuAccums are zeroed', bench.gpuAccums, [0, 0]);
+        bench.begin('B'); gl.drawArrays(); bench.end('B');   // new probe t=2000
+        const newFinished = bench.finished;
+        check('new window tracks its probe', newFinished.length, 1);
+        clock = 2070;
+        await Promise.all(oldFinished);
+        await Promise.all(newFinished);
+        await tick();
+        check('old probe settles in old window', oldGpu, [1070, 0]);
+        check('new window isolated from old probe', bench.gpuAccums, [0, 70]);
+        check('new finished list retained', bench.finished.length, 1);
+        check('new finished list identity kept', bench.finished === newFinished, true);
+        clock = 3000;
+        bench.nextFrame();
+        const last = gpuLogs.slice(-2).map(x => [x[0], Math.round(x[1] * 1000) / 1000]);
+        check('next window reports own gpu only', last, [[0, 0], [1, 7]]);
+      }
+
+      // ---- Case 3: trackGPU off keeps in-flight ownership ---------------
+      {
+        let clock = 0;
+        const gl = fakeGL();
+        const bench = new LocalGLBench(gl, { withoutUI: true, trackGPU: true, now: () => clock });
+        bench.addUI('A');
+        bench.begin('A'); gl.drawArrays(); bench.end('A');
+        bench.trackGPU = false;
+        gl.drawArrays();
+        check('no new probe after trackGPU=false', bench.finished.length, 1);
+        clock = 30;
+        await Promise.all(bench.finished);
+        check('in-flight probe still attributed', bench.gpuAccums, [30]);
+        check('getError only for in-flight probe', gl.errorCount, 1);
+      }
+
+      // ---- Case 4: real UI click toggles trackGPU ------------------------
+      {
+        const host = document.createElement('div');
+        document.body.appendChild(host);
+        const gl = fakeGL();
+        const bench = new LocalGLBench(gl, { dom: host, trackGPU: true });
+        const node = host.querySelector('#gl-bench');
+        node.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        const afterFirstClick = bench.trackGPU;
+        gl.drawArrays();
+        const finishedWhenOff = bench.finished.length;
+        node.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        const afterSecondClick = bench.trackGPU;
+        gl.drawArrays();
+        const finishedWhenOn = bench.finished.length;
+        host.remove();
+        check('first UI click turns trackGPU off', afterFirstClick, false);
+        check('no probe while UI-disabled', finishedWhenOff, 0);
+        check('second UI click turns trackGPU on', afterSecondClick, true);
+        check('probe created after UI re-enable', finishedWhenOn, 1);
+      }
+    } catch (err) {
+      failed++;
+      lines.push('ERROR - ' + (err && err.stack ? err.stack : String(err)));
+    }
+
+    const summary = failed === 0
+      ? 'GPU attribution local tests: ALL ' + passed + ' CHECKS PASSED'
+      : 'GPU attribution local tests: ' + failed + ' FAILED / ' + passed + ' passed';
+    lines.push('');
+    lines.push(summary);
+    out.textContent = lines.join('\n');
+    // Distinct marker (never the exact zora "# ok") plus machine-readable state.
+    console.log(failed === 0 ? '# gpu-local ok - ' + passed : '# gpu-local not ok - ' + failed);
+    window.__gpuAttribTests = { passed, failed, checks, ok: failed === 0 };
+  </script>
 </body>
 </html>
