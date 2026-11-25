@@ -8,11 +8,20 @@ export enum WorkerMessageType {
 	EVAL_FN = 'EVAL_FN',
 	RELEASE = 'RELEASE',
 	BATCH = 'BATCH',
+	INSPECT = 'INSPECT',
 }
+
+export type WorkerLifecycleSnapshot = {
+	managers: string[];
+	outputs: string[];
+	releasedCanvases: string[];
+	canvasProxies: [string, string[]][];
+};
 
 export type WorkerMessages =
 	| { proxyId: string; type: WorkerMessageType.INIT; canvasId: string; output?: OffscreenCanvas; width: number; height: number }
 	| { type: WorkerMessageType.RELEASE; canvasId: string }
+	| { type: WorkerMessageType.INSPECT; id: string }
 	| { type: WorkerMessageType.ERROR; id?: string; error: string }
 	| { type: WorkerMessageType.CALL_METHOD; proxyId: string; id?: string; method: keyof WebGLManager; args: any[]; async?: boolean }
 	| { type: WorkerMessageType.RESPONSE; id: string; result?: any; error?: string }

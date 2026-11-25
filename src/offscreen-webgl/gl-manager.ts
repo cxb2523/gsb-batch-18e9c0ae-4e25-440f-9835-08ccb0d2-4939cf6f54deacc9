@@ -27,6 +27,7 @@ export class WebGLManager {
 	private frameTask: FrameTask | null = null;
 	private readUniformStream: ReturnType<typeof createUniformStreamReader> | null = null;
 	private streamNeedsPaint = false;
+	private destroyed = false;
 
 	private framebuffers: [FrameBufferObject, FrameBufferObject] | null = null;
 
@@ -89,8 +90,13 @@ export class WebGLManager {
 	}
 
 	public destroy(): Result<WebGLManager> {
+		// Repeated destruction is a safe no-op.
+		if (this.destroyed) return ok(this);
+		this.destroyed = true;
 		this.frameTask?.cancel();
 		this.frameTask = null;
+		// Drop the shared-memory reader so a destroyed manager never observes
+		// further stream writes.
 		this.readUniformStream = null;
 		this.streamNeedsPaint = false;
 		try {
@@ -280,6 +286,7 @@ export class WebGLManager {
 	}
 
 	public paintCanvas(): Result<WebGLManager> {
+		if (this.destroyed) return ok(this);
 		this.consumeUniformStream();
 		this.streamNeedsPaint = false;
 		if (this.shaderPrograms && this.fragmentShaderGroups) {
@@ -451,6 +458,7 @@ export class WebGLManager {
 	}
 
 	public setUniformStream(stream: SharedUniformStream | null): void {
+		if (this.destroyed) return;
 		this.readUniformStream = stream ? createUniformStreamReader(stream) : null;
 		this.streamNeedsPaint = false;
 	}
@@ -510,6 +518,7 @@ export class WebGLManager {
 			return ok(this);
 		}
 		this.frameTask = scheduleFrames(interval, (now) => {
+			if (this.destroyed) return;
 			this.startTime ??= now;
 			this.frame++;
 			this.timeElapsed = now - this.startTime;
@@ -519,6 +528,8 @@ export class WebGLManager {
 			for (let i = 0; i < arr.length; i++) {
 				arr[i](this, this.frame, this.timeElapsed);
 			}
+			// A per-frame callback may have destroyed the manager.
+			if (this.destroyed) return;
 			if (this.streamNeedsPaint) this.paintCanvas();
 		});
 		return ok(this);

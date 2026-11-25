@@ -1,6 +1,6 @@
 import { uuidv4 } from '../utils/uuid';
 import { RunOnWorkerContextFn, WebGLManager } from './gl-manager';
-import { WorkerMessageType, WorkerMessages } from './worker-messages';
+import { WorkerMessageType, WorkerMessages, type WorkerLifecycleSnapshot } from './worker-messages';
 import WebWorker from './webgl.worker?worker&inline';
 
 type MappedManagerFunctions = { [K in keyof WebGLManager]: WebGLManager[K] extends (...args: any) => any ? WebGLManager[K] : never };
@@ -12,6 +12,8 @@ type MappedManagerFunctionsAsync = {
 
 export type WebGLManagerProxyType = WebGLManagerProxyClass & MappedManagerFunctions & MappedManagerFunctionsAsync;
 
+const LIFECYCLE_METHODS = new Set(['destroy', 'destroyAsync', 'release', 'releaseAsync', 'dispose', 'disposeAsync']);
+
 class WebGLManagerProxyClass {
 	private static worker: Worker | null = null;
 	private static workerFailure: Error | null = null;
@@ -22,6 +24,9 @@ class WebGLManagerProxyClass {
 	private static queuedMessages: WorkerMessages[] = [];
 	private static pendingResponses: Record<string, { resolve: (value: any) => void; reject: (error: Error) => void }> = {};
 	private readonly PROXY_ID = `WebGLManagerProxy-${uuidv4()}`;
+	private canvasId: string = '';
+	private destroyed = false;
+	private destroyPromise: Promise<void> | null = null;
 
 	private static readonly _managerPrototype = Object.getOwnPropertyNames(WebGLManager.prototype).reduce(
 		(acc, prop) => {
@@ -48,6 +53,25 @@ class WebGLManagerProxyClass {
 		return worker;
 	}
 
+	/**
+	 * Test/diagnostic seam: asks the shared worker for its current lifecycle
+	 * bookkeeping (registered managers, output contexts and tombstones).
+	 */
+	public static inspectWorker(): Promise<WorkerLifecycleSnapshot> {
+		const id = uuidv4();
+		const ctor = WebGLManagerProxyClass;
+		return new Promise<WorkerLifecycleSnapshot>((resolve, reject) => {
+			ctor.pendingResponses[id] = { resolve, reject };
+			try {
+				const worker = ctor.prewarm();
+				worker.postMessage({ type: WorkerMessageType.INSPECT, id } satisfies WorkerMessages);
+			} catch (error) {
+				delete ctor.pendingResponses[id];
+				reject(error instanceof Error ? error : new Error(String(error)));
+			}
+		});
+	}
+
 	constructor(canvas: HTMLCanvasElement) {
 		const worker = WebGLManagerProxyClass.prewarm();
 
@@ -60,6 +84,7 @@ class WebGLManagerProxyClass {
 			WebGLManagerProxyClass.canvasIds.set(canvas, canvasId);
 			WebGLManagerProxyClass.releasedCanvases.register(canvas, canvasId);
 		}
+		this.canvasId = canvasId;
 		WebGLManagerProxyClass.flush();
 		worker.postMessage(
 			{
@@ -79,6 +104,11 @@ class WebGLManagerProxyClass {
 	private static wrapThisPrototype(thisObj: WebGLManagerProxyClass): WebGLManagerProxyType {
 		return new Proxy(thisObj, {
 			get(target, prop, receiver) {
+				// Lifecycle methods have explicit idempotent implementations.
+				if (typeof prop === 'string' && LIFECYCLE_METHODS.has(prop)) {
+					const value = Reflect.get(target, prop, receiver);
+					return typeof value === 'function' ? value.bind(target) : value;
+				}
 				if (WebGLManagerProxyClass._managerPrototype[prop as string] && !(prop as string).startsWith('runOnContext')) {
 					if (prop.toString().endsWith('Async')) {
 						return (...args: any[]) => {
@@ -136,7 +166,82 @@ class WebGLManagerProxyClass {
 		);
 	}
 
+	/**
+	 * Releases the worker-side manager and 2D output context for this canvas.
+	 * Idempotent: repeated calls post nothing and never throw.
+	 */
+	public destroy(): void {
+		if (this.destroyed) return;
+		this.destroyed = true;
+		const ctor = WebGLManagerProxyClass;
+		// Preserve ordering after any already-queued fire-and-forget messages.
+		ctor.flush();
+		const worker = ctor.worker;
+		if (!worker) return;
+		worker.postMessage({
+			type: WorkerMessageType.CALL_METHOD,
+			proxyId: this.PROXY_ID,
+			method: 'destroy',
+			args: [],
+		} satisfies WorkerMessages);
+		worker.postMessage({
+			type: WorkerMessageType.RELEASE,
+			canvasId: this.canvasId,
+		} satisfies WorkerMessages);
+	}
+
+	/** Alias for {@link destroy}: releases both the manager and its output. */
+	public release(): void {
+		this.destroy();
+	}
+
+	public destroyAsync(): Promise<void> {
+		if (this.destroyPromise) return this.destroyPromise;
+		// A synchronous destroy() already dispatched teardown but without an ack.
+		if (this.destroyed) return Promise.resolve();
+		this.destroyed = true;
+		const ctor = WebGLManagerProxyClass;
+		const id = uuidv4();
+		this.destroyPromise = new Promise<void>((resolve) => {
+			ctor.pendingResponses[id] = { resolve: () => resolve(), reject: () => resolve() };
+			try {
+				ctor.flush();
+				const worker = ctor.prewarm();
+				worker.postMessage({
+					type: WorkerMessageType.CALL_METHOD,
+					proxyId: this.PROXY_ID,
+					method: 'destroy',
+					args: [],
+					id,
+					async: true,
+				} satisfies WorkerMessages);
+				// Canvas-scoped output/manager release, ordered after destroy.
+				worker.postMessage({
+					type: WorkerMessageType.RELEASE,
+					canvasId: this.canvasId,
+				} satisfies WorkerMessages);
+			} catch {
+				delete ctor.pendingResponses[id];
+				resolve();
+			}
+		});
+		return this.destroyPromise;
+	}
+
+	public releaseAsync(): Promise<void> {
+		return this.destroyAsync();
+	}
+
+	public dispose(): void {
+		this.destroy();
+	}
+
+	public disposeAsync(): Promise<void> {
+		return this.destroyAsync();
+	}
+
 	public callMethod<ManagerMethod extends keyof WebGLManager>(method: ManagerMethod, ...args: any[]): void {
+		if (this.destroyed) return;
 		WebGLManagerProxyClass.enqueue({
 			type: WorkerMessageType.CALL_METHOD,
 			proxyId: this.PROXY_ID,
@@ -149,6 +254,11 @@ class WebGLManagerProxyClass {
 		method: ManagerMethod,
 		...args: any[]
 	): Promise<ReturnType<WebGLManager[ManagerMethod] extends (...args: any) => any ? WebGLManager[ManagerMethod] : never>> {
+		if (this.destroyed) {
+			// Match the worker's post-teardown rejection wording so callers can
+			// observe destruction through the same error as a missing manager.
+			return Promise.reject(new Error(`WebGLManager not initialized for ${this.PROXY_ID}`));
+		}
 		const id = uuidv4();
 		return this.request(id, {
 			type: WorkerMessageType.CALL_METHOD,
@@ -161,6 +271,7 @@ class WebGLManagerProxyClass {
 	}
 
 	public runOnContext(key: string, fn: RunOnWorkerContextFn, onEachFrame: boolean = false) {
+		if (this.destroyed) return;
 		WebGLManagerProxyClass.enqueue({
 			type: WorkerMessageType.EVAL_FN,
 			fn: fn.toString(),
@@ -171,6 +282,7 @@ class WebGLManagerProxyClass {
 	}
 
 	public runOnContextAsync<T>(key: string, fn: RunOnWorkerContextFn<T>, onEachFrame: boolean = false) {
+		if (this.destroyed) return Promise.reject(new Error(`WebGLManager not initialized for ${this.PROXY_ID}`));
 		const id = uuidv4();
 		return this.request<T>(id, {
 			type: WorkerMessageType.EVAL_FN,
@@ -202,4 +314,5 @@ class WebGLManagerProxyClass {
 export const WebGLManagerProxy = WebGLManagerProxyClass as unknown as {
 	new (worker: HTMLCanvasElement): WebGLManagerProxyType;
 	prewarm(): Worker;
+	inspectWorker(): Promise<WorkerLifecycleSnapshot>;
 };
