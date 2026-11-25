@@ -58,16 +58,21 @@ dinosour/
 │   ├── components/
 │   │   └── DinoGame.tsx     # Primary Canvas render loop, state machine & UI overlay
 │   ├── hooks/
-│   │   └── useGameScores.ts # Dual-tier score hook (Supabase API + LocalStorage fallback)
+│   │   ├── useGameScores.ts # Dual-tier score hook (Supabase API + LocalStorage fallback)
+│   │   ├── useRoundResult.ts # Per-round UI state: name, leaderboard toggle, reset
+│   │   └── useScoreSubmission.ts # One-shot save guard with in-flight protection
 │   ├── lib/
+│   │   ├── scores.ts        # Merge (dedupe by id, top 10), local storage, timeouts
 │   │   └── supabase.ts      # Safe Supabase client factory with runtime null guard
 │   ├── App.tsx              # Application root
 │   ├── main.tsx             # DOM mounting point
 │   └── index.css            # Tailwind CSS directives
+├── tests/                   # Vitest suites (merge/sort, save dedupe, round reset)
 ├── supabase/migrations/     # PostgreSQL schema for cloud leaderboard table
 ├── index.html               # Single-page entry with modern viewport meta
 ├── package.json             # Pinned scripts and dependencies
 ├── tailwind.config.js       # Utility styling configuration
+├── vitest.config.ts         # Vitest + jsdom configuration
 └── vite.config.ts           # Production build configuration with Pages base path
 ```
 
@@ -118,6 +123,7 @@ dinosour/
 | `npm run dev` | Starts Vite HMR local development server |
 | `npm run typecheck` | Validates TypeScript types across the entire project |
 | `npm run lint` | Runs ESLint to verify style and hook rules |
+| `npm test` | Runs the Vitest suite (score merging, save de-duplication, round reset) |
 | `npm run build` | Compiles optimized production bundle into `dist/` |
 | `npm run preview` | Locally serves production build for inspection |
 

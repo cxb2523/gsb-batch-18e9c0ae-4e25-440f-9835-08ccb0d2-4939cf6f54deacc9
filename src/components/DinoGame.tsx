@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { Trophy, Play, RotateCcw } from 'lucide-react';
+import { Trophy, Play, RotateCcw, CheckCircle2, CloudOff, Loader2 } from 'lucide-react';
 import { useGameScores } from '../hooks/useGameScores';
+import type { UseGameScoresOptions } from '../hooks/useGameScores';
+import { useRoundResult } from '../hooks/useRoundResult';
 
 interface GameObject {
   x: number;
@@ -13,15 +15,27 @@ interface Obstacle extends GameObject {
   type: 'cactus' | 'bird';
 }
 
-export function DinoGame() {
+export interface DinoGameProps {
+  /**
+   * Optional overrides for the score layer (Supabase client / storage).
+   * Production renders the component with no props; tests inject fakes.
+   */
+  scoresOptions?: UseGameScoresOptions;
+}
+
+export function DinoGame({ scoresOptions }: DinoGameProps = {}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [gameStarted, setGameStarted] = useState(false);
   const [gameOver, setGameOver] = useState(false);
   const [score, setScore] = useState(0);
   const [level, setLevel] = useState(1);
-  const [playerName, setPlayerName] = useState('');
-  const [showLeaderboard, setShowLeaderboard] = useState(false);
-  const { topScores, loading, saveScore } = useGameScores();
+  const { topScores, loading, saveScore, refreshScores } =
+    useGameScores(scoresOptions);
+
+  // Everything that belongs to a single finished round — name input,
+  // leaderboard toggle and one-shot submission — lives in one hook so a new
+  // round can clear all of it while saved scores survive in useGameScores.
+  const round = useRoundResult({ saveScore, refreshScores });
 
   const gameStateRef = useRef({
     dino: { x: 50, y: 0, width: 40, height: 50, velocityY: 0, isJumping: false },
@@ -212,14 +226,22 @@ export function DinoGame() {
     setGameOver(false);
     setScore(0);
     setLevel(1);
+    // Fresh round: clear last round's name, leaderboard toggle and submission
+    // state. Saved scores live in useGameScores and are intentionally kept.
+    round.resetRound();
   };
 
-  const handleSaveScore = async () => {
-    if (playerName.trim()) {
-      await saveScore(playerName.trim(), score, level);
-      setShowLeaderboard(true);
-    }
+  const handleSaveScore = () => {
+    void round.submit(score, level);
   };
+
+  const handleToggleLeaderboard = () => {
+    round.toggleLeaderboard();
+  };
+
+  const hasSaved = round.submission.isSaved;
+  const isSaving = round.submission.isSaving;
+  const showLoadingPlaceholder = loading && topScores.length === 0;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-sky-100 to-blue-200 flex items-center justify-center p-4">
@@ -257,24 +279,50 @@ export function DinoGame() {
                   <p className="text-xl text-gray-700">Level Reached: <span className="font-bold text-green-600">{level}</span></p>
                 </div>
 
-                {!showLeaderboard && (
+                {!hasSaved && (
                   <div className="mb-6">
                     <input
                       type="text"
                       placeholder="Enter your name"
-                      value={playerName}
-                      onChange={(e) => setPlayerName(e.target.value)}
-                      className="w-full px-4 py-3 border-2 border-gray-300 rounded-lg focus:outline-none focus:border-blue-500 mb-3"
+                      value={round.playerName}
+                      onChange={(e) => round.setPlayerName(e.target.value)}
+                      disabled={isSaving}
+                      className="w-full px-4 py-3 border-2 border-gray-300 rounded-lg focus:outline-none focus:border-blue-500 mb-3 disabled:bg-gray-100"
                       maxLength={20}
                     />
                     <button
                       onClick={handleSaveScore}
-                      disabled={!playerName.trim()}
-                      className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-400 text-white font-bold py-3 rounded-lg flex items-center justify-center gap-2 transition-all"
+                      disabled={!round.playerName.trim() || isSaving}
+                      className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white font-bold py-3 rounded-lg flex items-center justify-center gap-2 transition-all"
                     >
-                      <Trophy className="w-5 h-5" />
-                      Save Score
+                      {isSaving ? (
+                        <>
+                          <Loader2 className="w-5 h-5 animate-spin" />
+                          Saving...
+                        </>
+                      ) : (
+                        <>
+                          <Trophy className="w-5 h-5" />
+                          Save Score
+                        </>
+                      )}
                     </button>
+                  </div>
+                )}
+
+                {hasSaved && (
+                  <div className="mb-6">
+                    {round.submission.savedToCloud ? (
+                      <div className="flex items-center justify-center gap-2 bg-green-50 text-green-800 font-medium px-4 py-3 rounded-lg">
+                        <CheckCircle2 className="w-5 h-5" />
+                        Score saved to the leaderboard!
+                      </div>
+                    ) : (
+                      <div className="flex items-center justify-center gap-2 bg-amber-50 text-amber-800 font-medium px-4 py-3 rounded-lg text-center">
+                        <CloudOff className="w-5 h-5 shrink-0" />
+                        Cloud unavailable — score saved on this device.
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -287,17 +335,22 @@ export function DinoGame() {
                 </button>
 
                 <button
-                  onClick={() => setShowLeaderboard(!showLeaderboard)}
+                  onClick={handleToggleLeaderboard}
                   className="w-full mt-3 bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold py-3 rounded-lg flex items-center justify-center gap-2 transition-all"
                 >
                   <Trophy className="w-5 h-5" />
-                  {showLeaderboard ? 'Hide' : 'Show'} Leaderboard
+                  {round.showLeaderboard ? 'Hide' : 'Show'} Leaderboard
                 </button>
 
-                {showLeaderboard && (
+                {round.showLeaderboard && (
                   <div className="mt-6 border-t-2 border-gray-200 pt-4">
-                    <h3 className="text-xl font-bold text-gray-800 mb-3 text-center">Top 10 Scores</h3>
-                    {loading ? (
+                    <div className="flex items-center justify-center gap-2 mb-3">
+                      <h3 className="text-xl font-bold text-gray-800 text-center">Top 10 Scores</h3>
+                      {loading && topScores.length > 0 && (
+                        <Loader2 className="w-4 h-4 text-gray-400 animate-spin" aria-label="Refreshing leaderboard" />
+                      )}
+                    </div>
+                    {showLoadingPlaceholder ? (
                       <p className="text-center text-gray-600">Loading...</p>
                     ) : topScores.length > 0 ? (
                       <div className="space-y-2">
