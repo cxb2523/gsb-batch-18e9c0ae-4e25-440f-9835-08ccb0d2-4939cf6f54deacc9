@@ -208,9 +208,13 @@ export type Renderer = {
   getLastDrawPath(): StaticDrawPath
   /**
    * World rects the most recent eraser-preview patch cleared+repainted — one
-   * per coalesced group of pending erasures, `[]` when not erasing. Test
-   * instrumentation: lets browser tests assert scattered erasures stay
-   * localized (N small rects) instead of collapsing to one viewport-sized rect.
+   * per coalesced group of pending erasures, `[]` when no eraser patch is
+   * active. The patch runs after every present tier in `erasing-ink` mode and
+   * also for a concurrent `zooming` frame that still carries the eraser draft
+   * (including after a scaled / scaled-extend blit); its rects are projected
+   * with the live camera. Test instrumentation: lets browser tests assert
+   * scattered erasures stay localized (N small rects) instead of collapsing
+   * to one viewport-sized rect.
    */
   getLastEraserPatchRects(): WorldRect[]
   /** Current overlay-mounted custom-node ids. */
@@ -896,8 +900,19 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
   const paintEraserPreviewPatch = (camera: CameraState): void => {
     lastEraserPatchRects = []
     const interaction = store.getInteractionState()
-    if (interaction.mode !== 'erasing-ink' || !interaction.draftEraser) return
-    const excludedNodes = new Set(interaction.draftEraser.erasedIds)
+    // The patch also runs while `mode === 'zooming'`: a zoom gesture can run
+    // concurrently with an active eraser preview because
+    // `setInteractionState` merges patches, so the live `draftEraser`
+    // survives the flip to `'zooming'`. In that state the scaled /
+    // scaled-extend tier below has already blitted the cache, and the patch
+    // MUST be projected with the live `camera` (never the cache's frozen
+    // `cacheCam*`) so its device rect aligns with the current viewport.
+    // Other modes (including the idle gesture end) keep the historical
+    // no-patch behavior; ending an eraser gesture clears `draftEraser`.
+    const eraserDraft = interaction.draftEraser
+    const patchModeActive = interaction.mode === 'erasing-ink' || interaction.mode === 'zooming'
+    if (!patchModeActive || !eraserDraft) return
+    const excludedNodes = new Set(eraserDraft.erasedIds)
     if (excludedNodes.size === 0) return
 
     const margin = 2 / Math.max(0.01, camera.z)
@@ -1486,7 +1501,15 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
       const { segments, size, color, opacity, options } = interaction.draftInk
       for (const samples of segments) drawInkDraft(ctx, samples, size, color, opacity, options)
     }
-    if (interaction.mode === 'erasing-ink' && interaction.draftEraser) {
+    // Draw in the same modes the static patch accepts so the ghost strokes
+    // and cursor ring stay aligned through a concurrent zoom gesture, where
+    // the merged interaction state can report mode 'zooming' with the draft
+    // still present. Coordinates are world space under the live camera
+    // transform applied above.
+    if (
+      interaction.draftEraser &&
+      (interaction.mode === 'erasing-ink' || interaction.mode === 'zooming')
+    ) {
       const { point, radius, erasedIds } = interaction.draftEraser
       for (const id of erasedIds) {
         const node = store.getNode(id)
