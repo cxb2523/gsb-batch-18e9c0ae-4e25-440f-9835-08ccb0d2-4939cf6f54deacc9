@@ -139,6 +139,12 @@ describe('Engine: extension', function() {
   test.dummy_midi_in();
   test.dummy_midi_out();
   test.connect_watcher();
+  test.watcher_disconnect_callback();
+  test.send_after_disconnect();
+  test.disconnect_closes_all_clients();
+  test.replug_dedup();
+  test.virtual_out_disconnect();
+  test.virtual_in_disconnect();
   test.virtual_midi_in();
   test.virtual_midi_out();
   test.virtual_midi_in_busy();
@@ -164,5 +170,6 @@ describe('Engine: extension', function() {
   test.web_midi_output_connect();
   test.web_midi_output_disconnect();
   test.web_midi_output_reconnect();
+  test.watcher_close_no_residue();
   test.close_engine();
 });

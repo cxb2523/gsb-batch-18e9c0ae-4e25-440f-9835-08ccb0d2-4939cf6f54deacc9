@@ -221,6 +221,179 @@ module.exports = function(JZZ, PARAMS, DRIVER) {
       });
     },
 
+    watcher_disconnect_callback: function() {
+      it('Watcher disconnect removes callback', function(done) {
+        var name = 'MIDI-Out watcher disconnect';
+        var dst = DRIVER.MidiDst(name);
+        var calls = 0;
+        var cb = function() { calls++; };
+        engine.onChange(cb);
+        engine.refresh().and(function() {
+          engine.onChange().disconnect(cb);
+          dst.connect();
+          engine.refresh();
+          dst.disconnect();
+          engine.refresh();
+          setTimeout(function() {
+            assert.equal(calls, 0);
+            done();
+          }, 50);
+        });
+      });
+    },
+
+    send_after_disconnect: function() {
+      it('Send after disconnect', function(done) {
+        var name = 'MIDI-Out send after disconnect';
+        var dst = DRIVER.MidiDst(name);
+        dst.connect();
+        var port;
+        engine.refresh().openMidiOut(name).and(function() {
+          port = this;
+          engine.onChange(function() {});
+          dst.disconnect();
+          engine.refresh();
+          setTimeout(function() {
+            engine.onChange().disconnect();
+            port.send([0x90, 0x40, 0x7f]).and(function() {
+              done(new Error('send must fail after disconnect'));
+            }).or(function() {
+              assert.equal(this._err(), 'Port disconnected');
+              done();
+            });
+          }, 50);
+        });
+      });
+    },
+
+    disconnect_closes_all_clients: function() {
+      it('Disconnect closes all clients', function(done) {
+        var name = 'MIDI-Out disconnect closes all';
+        var dst = DRIVER.MidiDst(name);
+        dst.connect();
+        var port1, port2;
+        var bad = 0;
+        var finished = false;
+        function fin(err) {
+          if (finished) return;
+          finished = true;
+          engine.onChange().disconnect();
+          done(err);
+        }
+        engine.refresh().openMidiOut(name).and(function() {
+          port1 = this;
+          engine.openMidiOut(name).and(function() {
+            port2 = this;
+            engine.onChange(function() {});
+            dst.disconnect();
+            engine.refresh();
+            setTimeout(function() {
+              port1.send([0x90, 0x40, 0x7f]).and(function() { fin(new Error('port1 must be closed')); }).or(function() { if (++bad == 2) fin(); });
+              port2.send([0x90, 0x40, 0x7f]).and(function() { fin(new Error('port2 must be closed')); }).or(function() { if (++bad == 2) fin(); });
+            }, 50);
+          });
+        });
+      });
+    },
+
+    replug_dedup: function() {
+      it('Replug does not duplicate watcher callbacks', function(done) {
+        var name = 'MIDI-Out replug dedup';
+        var dst = DRIVER.MidiDst(name);
+        var calls = 0;
+        var cycles = 3;
+        engine.onChange(function(arg) {
+          if (arg.outputs.added.length && arg.outputs.added[0].name == name) calls++;
+          if (arg.outputs.removed.length && arg.outputs.removed[0].name == name) calls++;
+        });
+        function cycle() {
+          dst.connect();
+          engine.refresh();
+          setTimeout(function() {
+            dst.disconnect();
+            engine.refresh();
+            setTimeout(function() {
+              if (--cycles) cycle();
+              else setTimeout(function() {
+                engine.onChange().disconnect();
+                assert.equal(calls, 6);
+                done();
+              }, 50);
+            }, 30);
+          }, 30);
+        }
+        cycle();
+      });
+    },
+
+    virtual_out_disconnect: function() {
+      it('Virtual MIDI-Out disconnect/reconnect', function(done) {
+        var name = 'Virtual MIDI-Out hot-plug';
+        var widget = JZZ.Widget();
+        widget._receive = function() {};
+        JZZ.addMidiOut(name, widget);
+        var port;
+        engine.refresh().openMidiOut(name).and(function() {
+          port = this;
+          engine.onChange(function() {});
+          JZZ.removeMidiOut(name);
+          port.send([0x90, 0x40, 0x7f]).and(function() {
+            done(new Error('send must fail after removeMidiOut'));
+          }).or(function() {
+            JZZ.addMidiOut(name, widget);
+            engine.refresh().openMidiOut(name).and(function() {
+              this.send([0x90, 0x40, 0x7f]);
+              setTimeout(function() {
+                engine.onChange().disconnect();
+                JZZ.removeMidiOut(name);
+                done();
+              }, 10);
+            }).or(function() {
+              done(new Error('reopen after reconnect failed'));
+            });
+          });
+        });
+      });
+    },
+
+    virtual_in_disconnect: function() {
+      it('Virtual MIDI-In disconnect', function(done) {
+        var name = 'Virtual MIDI-In hot-plug';
+        var widget = JZZ.Widget();
+        JZZ.addMidiIn(name, widget);
+        var port;
+        var received = 0;
+        engine.refresh().openMidiIn(name).and(function() {
+          port = this;
+          port.connect(function() { received++; });
+          engine.onChange(function() {});
+          JZZ.removeMidiIn(name);
+          widget.emit([0x90, 0x40, 0x7f]);
+          setTimeout(function() {
+            engine.onChange().disconnect();
+            assert.equal(received, 0);
+            assert.ok(port._bad);
+            done();
+          }, 20);
+        });
+      });
+    },
+
+    watcher_close_no_residue: function() {
+      it('No watcher callbacks after engine close', function(done) {
+        var calls = 0;
+        engine.onChange(function() { calls++; });
+        engine.refresh().close();
+        var widget = JZZ.Widget();
+        JZZ.addMidiOut('MIDI-Out after close', widget);
+        JZZ.removeMidiOut('MIDI-Out after close');
+        setTimeout(function() {
+          assert.equal(calls, 0);
+          done();
+        }, 50);
+      });
+    },
+
     virtual_midi_in: function() {
       it('Virtual MIDI-In', function(done) {
         var port;

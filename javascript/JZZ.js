@@ -15,7 +15,7 @@
 
   var _scope = typeof window === 'undefined' ? global : window;
   var _version = '1.9.6';
-  var i, j, k, m, n;
+  var i, k, m, n;
 
   /* istanbul ignore next */
   var _time = Date.now || function () { return new Date().getTime(); };
@@ -201,7 +201,7 @@
     _ins = [];
     _engine._allOuts = {};
     _engine._allIns = {};
-    var i, x;
+    var i, j, x;
     for (i = 0; i < _engine._outs.length; i++) {
       x = _engine._outs[i];
       if (_outsM[x.name]) continue;
@@ -260,10 +260,12 @@
         for (j = 0; j < diff.inputs.removed.length; j++) {
           x = _engine._inMap[diff.inputs.removed[j].name];
           if (x) x._closeAll();
+          _closeVirtualIn(diff.inputs.removed[j].name);
         }
         for (j = 0; j < diff.outputs.removed.length; j++) {
           x = _engine._outMap[diff.outputs.removed[j].name];
           if (x) x._closeAll();
+          _closeVirtualOut(diff.outputs.removed[j].name);
         }
         _schedule(function() { _fireW(diff); });
       }
@@ -376,6 +378,7 @@
 
   _J.prototype._close = function() {
     _engine._close();
+    if (_jzz._watcher) _jzz._watcher._handles = [];
     var a = _plugged.slice();
     for (var i = 0; i < a.length; i++) if (a[i]) {
       if (a[i]._close) a[i]._close();
@@ -643,13 +646,43 @@
     return { inputs: { added: ax, removed: rx }, outputs: { added: ay, removed: ry } };
   }
   function _fireW(arg) {
-    for (i = 0; i < _jzz._watcher._handles.length; i++) _jzz._watcher._handles[i].apply(_jzz, [arg]);
+    var i;
+    var handles = _jzz._watcher._handles.slice();
+    for (i = 0; i < handles.length; i++) {
+      if (_jzz._watcher._handles.indexOf(handles[i]) != -1) handles[i].apply(_jzz, [arg]);
+    }
   }
 
   var _jzz;
   var _engine = { _outs: [], _ins: [], _close: _nop };
   var _virtual = { _outs: [], _ins: [] };
   var _plugged = [];
+  // open clients of virtual ports, by port name
+  var _vOutClients = {};
+  var _vInClients = {};
+  function _trackVirtual(engine, func, map) {
+    var orig = engine[func];
+    if (!_func(orig) || orig._vtrack) return;
+    var wrapped = function(port, name) {
+      var clients;
+      if (typeof name != 'undefined') _push(clients = map[name] || (map[name] = []), port._orig);
+      orig.call(this, port, name);
+      if (clients && port._bad) _pop(clients, port._orig);
+    };
+    wrapped._vtrack = true;
+    engine[func] = wrapped;
+  }
+  function _closeVirtual(map, name) {
+    var a = map[name];
+    if (!a) return;
+    delete map[name];
+    for (var i = 0; i < a.length; i++) {
+      try { if (a[i]._close) a[i]._close(); } catch (err) {/**/}
+      a[i]._crash('Port disconnected');
+    }
+  }
+  function _closeVirtualIn(name) { _closeVirtual(_vInClients, name); }
+  function _closeVirtualOut(name) { _closeVirtual(_vOutClients, name); }
 
   // Node.js
   function _tryNODE() {
@@ -842,7 +875,11 @@
     _engine._sysex = true;
     var watcher;
     function _closeAll() {
-      for (var i = 0; i < this.clients.length; i++) this._close(this.clients[i]);
+      var clients = this.clients.slice();
+      for (var i = 0; i < clients.length; i++) {
+        this._close(clients[i]);
+        clients[i]._crash('Port disconnected');
+      }
     }
     _engine._refresh = function() {
       _engine._outs = [];
@@ -1001,7 +1038,11 @@
     _engine._insW = [];
     var watcher;
     function _closeAll() {
-      for (var i = 0; i < this.clients.length; i++) this._close(this.clients[i]);
+      var clients = this.clients.slice();
+      for (var i = 0; i < clients.length; i++) {
+        this._close(clients[i]);
+        clients[i]._crash('Port disconnected');
+      }
     }
     _engine._refresh = function() {
       _engine._outs = [];
@@ -1171,7 +1212,11 @@
       });
     };
     function _closeAll() {
-      for (var i = 0; i < this.clients.length; i++) this._close(this.clients[i]);
+      var clients = this.clients.slice();
+      for (var i = 0; i < clients.length; i++) {
+        this._close(clients[i]);
+        clients[i]._crash('Port disconnected');
+      }
     }
     _engine._openOut = function(port, name) {
       var impl = _engine._outMap[name];
@@ -3789,13 +3834,13 @@
 
   JZZ.lib.openMidiOut = function(name, engine) {
     var port = new _M();
-    engine._openOut(port);
+    engine._openOut(port, name);
     port._info = engine._info(name);
     return port;
   };
   JZZ.lib.openMidiIn = function(name, engine) {
     var port = new _M();
-    engine._openIn(port);
+    engine._openIn(port, name);
     port._info = engine._info(name);
     return port;
   };
@@ -3803,6 +3848,7 @@
     var x = engine._info(name);
     for (var i = 0; i < _virtual._outs.length; i++) if (_virtual._outs[i].name == x.name) return false;
     x.engine = engine;
+    _trackVirtual(engine, '_openOut', _vOutClients);
     _virtual._outs.push(x);
     if (_jzz) {
       _postRefresh();
@@ -3814,6 +3860,7 @@
     var x = engine._info(name);
     for (var i = 0; i < _virtual._ins.length; i++) if (_virtual._ins[i].name == x.name) return false;
     x.engine = engine;
+    _trackVirtual(engine, '_openIn', _vInClients);
     _virtual._ins.push(x);
     if (_jzz) {
       _postRefresh();

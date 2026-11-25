@@ -24,6 +24,8 @@ describe('Engine: node', function() {
   test.dummy_midi_in();
   test.dummy_midi_out();
   test.connect_watcher();
+  test.virtual_out_disconnect();
+  test.virtual_in_disconnect();
   if (MT) {
     test.virtual_midi_in();
     test.virtual_midi_out();
@@ -49,5 +51,6 @@ describe('Engine: node', function() {
     test.web_midi_output_disconnect();
     //test.web_midi_output_reconnect();
   }
+  test.watcher_close_no_residue();
   test.close_engine();
 });
