@@ -3,10 +3,11 @@ import { ref, computed, useTemplateRef, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import VPlayer from '@/components/player/VPlayer.vue'
+import StatPanel from '@/components/player/StatPanel.vue'
 import PlaylistPanel from '@/components/PlaylistPanel.vue'
 import { imgSrc, playerInfo } from '@/service'
 import { toast } from '@/utils/toast'
-import type { PlayerInfo } from '@/types'
+import type { Fastloader, LoadItem, PlayerInfo } from '@/types'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -21,6 +22,9 @@ const playlist = computed(() => (route.query.playlist as string) || '')
 const pinfo = ref<Partial<PlayerInfo>>({})
 const showlist = ref(false)
 const playlistPanel = useTemplateRef<InstanceType<typeof PlaylistPanel>>('playlist')
+const statPanel = useTemplateRef<InstanceType<typeof StatPanel>>('statPanel')
+/** 最近一次 VPlayer 重建产出的加载单元,按序与 loaders/dispatchs 对应 */
+const loadItems = ref<LoadItem[]>([])
 
 const errMsg = computed(() => pinfo.value.error || pinfo.value.msg)
 
@@ -30,6 +34,7 @@ async function init(id: string) {
   const cur = ++seq
   try {
     pinfo.value = {}
+    loadItems.value = []
     const { ok, data } = await playerInfo(id)
     if (cur !== seq) return
     if (!ok) {
@@ -51,6 +56,21 @@ function toggleList() {
 
 function playNext(info: PlayerInfo) {
   playlistPanel.value?.playNext(info.id)
+}
+
+function onLoad(items: LoadItem[]) {
+  loadItems.value = items
+}
+
+/** VPlayer 每次 init 重建开始即触发:先解绑旧统计监听并清空上一轮数据 */
+function onPlayerInit() {
+  loadItems.value = []
+  statPanel.value?.clear()
+}
+
+/** 引擎 ready 后把新一代加载器/分块表交给统计面板 */
+function onLoadersready(loaders: Fastloader[], dispatchs: unknown[]) {
+  statPanel.value?.onLoadersready(loaders, dispatchs, loadItems.value)
 }
 
 watch(
@@ -75,6 +95,9 @@ watch(
             :level="level"
             :nop2p="nop2p"
             :screenshot="screenshot"
+            @init="onPlayerInit"
+            @load="onLoad"
+            @loadersready="onLoadersready"
             @list="toggleList"
             @ended="playNext"
           />
@@ -87,6 +110,14 @@ watch(
             @play="init"
           />
         </div>
+        <!-- 嵌入页分块统计:跟随 VPlayer 每次重建绑定新一代加载器 -->
+        <StatPanel
+          ref="statPanel"
+          class="mt-4 rounded-xl bg-zinc-100 p-3 sm:p-5"
+          :title="pinfo.title ?? ''"
+          :load-items="loadItems"
+          :audio="audio"
+        />
       </template>
       <div
         v-else

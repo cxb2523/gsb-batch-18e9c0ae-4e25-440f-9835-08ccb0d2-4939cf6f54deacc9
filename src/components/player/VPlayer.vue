@@ -205,25 +205,33 @@ function init() {
       }
       // 引擎以 tracker 是否为空判断是否启用 P2P,故 nop2p 直接传空串
       const tracker = props.nop2p ? '' : signalURL()
-      loader.value = new fastload({
+      const player = new fastload({
         thread: 2,
         tracker,
         // 仅在启用 P2P 时需要
         rtcConf: tracker ? { iceServers: ICE_SERVERS } : undefined,
       })
-      loader.value.listen('ready', (loaders, dispatchs) => {
+      loader.value = player
+      player.listen('ready', (loaders, dispatchs) => {
+        // 连续切换会作废旧 init 流程并 destroy 旧引擎;过期引擎的迟到 ready 不得再转发,
+        // 否则旧加载器会在 StatPanel 上覆盖最后一代绑定。
+        // 只比较 gen:loader.value 是被 ref 深响应式包装后的代理,不能与原始 player 直接判等。
+        if (gen !== initGen) return
         emit('loadersready', loaders as Fastloader[], dispatchs as unknown[])
       })
-      loader.value.listen('error', (err) => {
+      player.listen('error', (err) => {
+        if (gen !== initGen) return
         // 界面只展示 message,完整堆栈留在控制台便于排查
         console.error(err)
         video.value.error = err
-        loader.value?.pause()
+        player.pause()
       })
       // attach 为异步:内部 sourceOpen 失败会走 error 事件,此处兜住其余拒绝路径
-      void loader.value
+      void player
         .attach(el, items)
-        .catch((err) => (video.value.error = err))
+        .catch((err) => {
+          if (gen === initGen) video.value.error = err
+        })
       if (!props.audio) {
         const first = items[0]
         switchQuality({ itag: first.itag, quality: first.quality })

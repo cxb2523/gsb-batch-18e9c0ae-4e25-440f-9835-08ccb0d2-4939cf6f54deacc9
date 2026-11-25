@@ -1,15 +1,22 @@
 <script setup lang="ts">
-import { ref, computed, useTemplateRef } from 'vue'
+import { ref, computed, useTemplateRef, onBeforeUnmount } from 'vue'
 import { useI18n } from 'vue-i18n'
-import type { Fastloader, LoadItem, RtcPeerStat, SegmentItem } from '@/types'
+import type { LoadItem, RtcPeerStat, SegmentItem } from '@/types'
 import { byteFormat } from '@/utils'
 import StatCard from './StatCard.vue'
+import { StatSession, applyCardEvent, normalizeReadyArgs, resolveTrackIndexes } from './statSession'
+import type { StatSink } from './statSession'
 
 const { t } = useI18n()
-const props = defineProps<{
-  title: string
-  loadItems: LoadItem[]
-}>()
+const props = withDefaults(
+  defineProps<{
+    title: string
+    loadItems: LoadItem[]
+    /** 嵌入页音频模式:只有音频轨,单加载器兜底绑到音频卡 */
+    audio?: boolean
+  }>(),
+  { audio: false },
+)
 
 const vCard = useTemplateRef<InstanceType<typeof StatCard>>('vcard')
 const aCard = useTemplateRef<InstanceType<typeof StatCard>>('acard')
@@ -21,18 +28,15 @@ const stat = ref<Record<string, RtcPeerStat>>({})
 const mid = ref('')
 
 const names = computed(() => {
-  const [v, a] = props.loadItems
-  let vtitle = ''
-  let atitle = ''
-  if (v) {
-    const ext = /webm/.test(v.mimeCodec) ? 'webm' : 'mp4'
-    vtitle = `${props.title}-${v.itag}.${ext}`
+  // 不能直接按 [v, a] 解构:音频模式下 loadItems 只有一个音频轨,位置 0 并非视频
+  const idx = resolveTrackIndexes(props.loadItems, props.loadItems.length, props.audio)
+  const titleOf = (i: number | undefined) => {
+    const item = i === undefined ? undefined : props.loadItems[i]
+    if (!item) return ''
+    const ext = /webm/.test(item.mimeCodec) ? 'webm' : 'mp4'
+    return `${props.title}-${item.itag}.${ext}`
   }
-  if (a) {
-    const ext = /webm/.test(a.mimeCodec) ? 'webm' : 'mp4'
-    atitle = `${props.title}-${a.itag}.${ext}`
-  }
-  return { vtitle, atitle }
+  return { vtitle: titleOf(idx.video), atitle: titleOf(idx.audio) }
 })
 
 const statOnNum = computed(() =>
@@ -49,31 +53,19 @@ const LEGEND: { cls: string; key: string }[] = [
   { cls: 'http-start rtc-start rtc-done', key: 'stats.bothRtc' },
 ]
 
-function bindLoader(loader: Fastloader | undefined, card: InstanceType<typeof StatCard> | null) {
-  if (!loader) return
-  // 引擎轮询时回传 (stat, uid),open/close/error 触发时只回传 stat;
-  // 后者不能把已取得的节点标识清空
-  loader.listen('rtc.stat', (s, uid) => {
+/** 本面板当前的加载器绑定会话;每次重建开新一代,旧代监听被摘除且回调失效 */
+const session = new StatSession()
+
+const sink: StatSink = {
+  rtcStat(s, uid) {
     stat.value = (s as Record<string, RtcPeerStat>) ?? {}
+    // open/close/error 触发时只回传 stat;后者不能把已取得的节点标识清空
     if (uid) mid.value = String(uid)
-  })
-  loader.listen('http.start', (item) => {
-    card?.statusupdate('http-start', item as SegmentItem)
-  })
-  loader.listen('http.done', (res) => {
-    const r = res as SegmentItem & { err?: unknown }
-    card?.statusupdate(r.err ? 'http-error' : 'http-done', r)
-  })
-  loader.listen('rtc.start', (item) => {
-    card?.statusupdate('rtc-start', item as SegmentItem)
-  })
-  loader.listen('rtc.done', (res) => {
-    card?.statusupdate('rtc-done', res as SegmentItem)
-  })
-  loader.listen('rtc.progress', (res) => {
-    const r = res as { i?: number; n?: number; part?: number }
-    card?.statusupdate('progress', { no: r.part ?? 0, i: r.i, n: r.n } as SegmentItem)
-  })
+  },
+  cardEvent(kind, type, res) {
+    const card = kind === 'video' ? vCard.value : aCard.value
+    applyCardEvent(card, type, res)
+  },
 }
 
 /** fastloadjs 的分块对象用 start/end 表示字节区间,StatCard 需要 m/n */
@@ -87,17 +79,50 @@ function toSegments(raw: unknown): Record<number, SegmentItem> {
   return out
 }
 
-/** 由播放页在 loadersready 事件后调用 */
-function onLoadersready(loaders: Fastloader[], dispatchs: unknown[]) {
-  const [vloader, aloader] = loaders
-  const [vd, ad] = dispatchs as [unknown, unknown]
-  vdispatch.value = toSegments(vd)
-  adispatch.value = toSegments(ad)
-  bindLoader(vloader, vCard.value)
-  bindLoader(aloader, aCard.value)
+/** 清空上一轮的分块/节点状态与两张卡的块状态 */
+function resetState() {
+  stat.value = {}
+  mid.value = ''
+  vdispatch.value = {}
+  adispatch.value = {}
+  vCard.value?.reset()
+  aCard.value?.reset()
 }
 
-defineExpose({ onLoadersready })
+/**
+ * 由播放页在 loadersready 事件后调用。
+ * 既支持既有约定 (loaders, dispatchs, items?),也兼容 (items, loaders, dispatchs);
+ * 显式 items 优先,否则用面板 loadItems prop。
+ */
+function onLoadersready(a?: unknown, b?: unknown, c?: unknown) {
+  const ready = normalizeReadyArgs(a ?? [], b, c)
+  session.restart()
+  resetState()
+
+  const trackItems = ready.items ?? props.loadItems
+  const indexes = resolveTrackIndexes(trackItems, ready.loaders.length, props.audio)
+
+  if (indexes.video !== undefined) {
+    vdispatch.value = toSegments(ready.dispatchs[indexes.video])
+    session.bind(ready.loaders[indexes.video], 'video', sink)
+  }
+  if (indexes.audio !== undefined) {
+    adispatch.value = toSegments(ready.dispatchs[indexes.audio])
+    session.bind(ready.loaders[indexes.audio], 'audio', sink)
+  }
+}
+
+/** 重建开始时可由父组件(@init)立即调用:摘除旧监听并清空统计,不等新 ready */
+function clear() {
+  session.restart()
+  resetState()
+}
+
+onBeforeUnmount(() => {
+  session.dispose()
+})
+
+defineExpose({ onLoadersready, clear })
 </script>
 
 <template>
@@ -134,11 +159,11 @@ defineExpose({ onLoadersready })
     </div>
 
     <!-- 视频/音频分块统计 -->
-    <div class="rounded-lg border border-zinc-200 bg-white p-5 shadow-sm">
+    <div data-track="video" class="rounded-lg border border-zinc-200 bg-white p-5 shadow-sm">
       <div class="text-base font-medium">{{ t('stats.video') }}</div>
       <StatCard ref="vcard" :title="names.vtitle" :segments="vdispatch" />
     </div>
-    <div class="mt-4 rounded-lg border border-zinc-200 bg-white p-5 shadow-sm">
+    <div data-track="audio" class="mt-4 rounded-lg border border-zinc-200 bg-white p-5 shadow-sm">
       <div class="text-base font-medium">{{ t('stats.audio') }}</div>
       <StatCard ref="acard" :title="names.atitle" :segments="adispatch" />
     </div>

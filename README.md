@@ -12,7 +12,24 @@ pnpm install        # 或 npm install
 pnpm dev            # 本地开发 http://localhost:5173
 pnpm build          # 类型检查 + 生产构建 (dist/)
 pnpm typecheck      # 仅 vue-tsc 类型检查
+pnpm test           # vitest:假 fastloadjs 加载器验证统计面板生命周期
+pnpm verify:stat    # 零依赖 node 脚本:正常/连续切换/卸载 + 音轨识别
 ```
+
+### 统计面板联动验证
+
+切换清晰度或视频 id 会重建播放引擎,`StatPanel` 通过 `loadersready` 拿到新一代
+`loadItems/loaders/dispatchs`,由 `src/components/player/statSession.ts` 统一处理:
+
+- 重建代次守卫:连续快速切换时只有最后一代加载器的回调能写入,旧代回调直接丢弃;
+- 监听生命周期:绑定的每个事件都登记解绑,重建(`@init`/新 `loadersready`)与面板
+  `onBeforeUnmount` 时调用加载器的 `remove(event, cb)`(兼容 `off/unlisten/removeListener`
+  及 `listen` 返回退订函数);没有解绑方法的假加载器由代次守卫兜底;
+- 视频/音频分轨:按 `LoadItem.mimeCodec` 与同序下标识别,音频模式单加载器归音频卡。
+
+`tests/` 下用假的 fastloadjs 加载器对象覆盖正常切换、连续切换、卸载、音频错绑,
+以及 PlayView 转发链路和 VPlayer 旧引擎迟到 `ready` 的作废。
+
 
 ## 部署
 

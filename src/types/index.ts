@@ -141,12 +141,20 @@ export interface FastloadConfig {
   rtcConf?: RTCConfiguration
 }
 
+export type FastloadListener = (...args: any[]) => void
+
 /**
  * 单路流的下载器,即 attach 后由 ready 事件回传的 loaders 元素。
  * 这些实例由引擎按流创建,调用方只挂事件监听
  */
 export interface Fastloader {
-  listen(event: string, cb: (a?: unknown, b?: unknown) => void): Fastloader
+  listen(event: string, cb: FastloadListener): Fastloader
+  /** fastloadjs 的解绑接口:remove(event, cb) 删单个监听;省略 cb 清空该事件;无 event 清空全部 */
+  remove?(event?: string, cb?: FastloadListener): Fastloader
+  /** 兼容其他/模拟加载器可能提供的解绑命名 */
+  unlisten?(event: string, cb?: FastloadListener): unknown
+  off?(event: string, cb?: FastloadListener): unknown
+  removeListener?(event: string, cb?: FastloadListener): unknown
   start(): Fastloader
   pause(): Fastloader
   setBufferHealth(t: number): Fastloader

@@ -8,7 +8,10 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit -p tsconfig.app.json && vite build",
     "preview": "vite preview",
-    "typecheck": "vue-tsc --noEmit -p tsconfig.app.json"
+    "typecheck": "vue-tsc --noEmit -p tsconfig.app.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify:stat": "node scripts/verify-stat.ts"
   },
   "dependencies": {
     "@lucide/vue": "^1.31.0",
@@ -21,9 +24,12 @@
     "@tailwindcss/vite": "^4.3.3",
     "@types/node": "^26.2.0",
     "@vitejs/plugin-vue": "^6.0.8",
+    "@vue/test-utils": "^2.6.0",
+    "happy-dom": "^21.0.4",
     "tailwindcss": "^4.3.3",
     "typescript": "~5.9.3",
     "vite": "^8.2.1",
+    "vitest": "^5.1.1",
     "vue-tsc": "^3.3.9"
   }
 }

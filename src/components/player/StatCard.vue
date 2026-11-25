@@ -69,7 +69,13 @@ function statusupdate(t: string, res: SegmentItem & { i?: number; n?: number }) 
   }
 }
 
-defineExpose({ statusupdate })
+/** 清空本卡全部块状态;播放器重建统计会话时由 StatPanel 调用 */
+function reset() {
+  curr.value = null
+  status.value = {}
+}
+
+defineExpose({ statusupdate, reset })
 </script>
 
 <template>
