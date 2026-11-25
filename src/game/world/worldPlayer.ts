@@ -5,7 +5,7 @@ import {
   Position,
 } from '../../types';
 import getShipSpeed from './shipSpeed';
-import state, { Velocity } from '../../state/state';
+import state from '../../state/state';
 import { directionMap } from '../../input';
 import updateInterface from '../../state/updateInterface';
 import { calculateDestination } from './worldUtils';
@@ -26,16 +26,15 @@ const createWorldPlayer = (
   let heading: Direction | '' = '';
   let speed = 0;
 
-  let lastHeading: Direction | '' = '';
-  let lastWind: Velocity = {
-    direction: 0,
-    speed: 0,
-  };
+  /*
+    Speed depends on heading, wind, captain, crew and cargo. The signature
+    lets updateSpeed skip the actual recalculation (and interface update)
+    unless at least one of those inputs changed, preserving the time-sliced
+    update cadence instead of recomputing every frame.
+   */
+  let lastSpeedSignature: string | undefined;
 
   updateInterface.playerFleetDirection(directionMap[heading]);
-
-  const windUnchanged = (wind: Velocity) =>
-    wind.direction === lastWind.direction && wind.speed === lastWind.speed;
 
   const animate = () => {
     frameAlternate = frameAlternate === 0 ? 1 : 0;
@@ -117,19 +116,45 @@ const createWorldPlayer = (
       updateInterface.playerFleetDirection(directionMap[heading]);
     },
     heading: () => heading,
-    updateSpeed: () => {
-      if (heading === lastHeading && windUnchanged(state.wind)) {
+    speed: () => speed,
+    updateSpeed: (force = false) => {
+      const ship = state.fleets[1]?.ships[0];
+      // a captain is only needed once there’s a heading to sail in
+      const captain = heading ? getCaptain(0) : undefined;
+
+      const speedSignature = JSON.stringify({
+        heading,
+        wind: state.wind ?? null,
+        ship: ship
+          ? {
+              id: ship.id,
+              crew: ship.crew,
+              cargo: ship.cargo.map(({ type, quantity }) => ({
+                type,
+                quantity,
+              })),
+            }
+          : null,
+        captain: captain
+          ? {
+              navigationLevel: captain.navigationLevel,
+              seamanship: captain.stats.seamanship,
+            }
+          : null,
+      });
+
+      if (!force && speedSignature === lastSpeedSignature) {
         return;
       }
 
-      const ship = state.fleets[1].ships[0];
+      lastSpeedSignature = speedSignature;
 
-      speed = heading
-        ? getShipSpeed(ship, getCaptain(0), directionMap[heading], state.wind)
-        : 0;
+      if (!heading) {
+        speed = 0;
+      } else {
+        speed = getShipSpeed(ship, captain!, directionMap[heading], state.wind);
+      }
 
-      lastHeading = heading;
-      lastWind = state.wind;
       updateInterface.playerFleetSpeed(speed);
     },
     frame: () => startFrame + frameOffset + frameAlternate,

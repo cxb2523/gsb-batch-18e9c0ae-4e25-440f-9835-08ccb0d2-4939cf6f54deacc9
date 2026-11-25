@@ -45,7 +45,7 @@ export const dock = (position: Position) => {
   return true;
 };
 
-const updateProvisions = () => {
+export const updateProvisions = () => {
   const provisions = {
     water: 0,
     food: 0,
@@ -88,9 +88,20 @@ export const updateWorldStatus = () => {
 };
 
 export const worldTimeTick = () => {
+  const previousTimePassed = state.timePassed;
+
   state.timePassed += 20;
 
-  if (shouldUpdateWorldStatus()) {
+  /*
+    In addition to the fixed time slice, crossing a summer/winter boundary
+    must refresh wind and current exactly once, even when the boundary tick
+    doesn’t line up with the status-update interval.
+   */
+  const seasonChanged =
+    getIsSummer(START_DATE, previousTimePassed) !==
+    getIsSummer(START_DATE, state.timePassed);
+
+  if (shouldUpdateWorldStatus() || seasonChanged) {
     updateWorldStatus();
   }
 

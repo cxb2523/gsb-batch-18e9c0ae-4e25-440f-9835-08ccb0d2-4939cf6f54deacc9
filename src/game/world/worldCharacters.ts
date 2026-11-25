@@ -6,7 +6,11 @@ import createWorldNpc, { WorldNpc } from './worldNpc';
 import state from '../../state/state';
 import type { Ship } from './fleets';
 import { hasOars } from './worldUtils';
-import { dock } from '../../state/actionsWorld';
+import {
+  dock,
+  updateProvisions,
+  updateWorldStatus,
+} from '../../state/actionsWorld';
 
 const FRAMES_PER_SHIP = 8;
 const SHIP_VARIANTS = 2;
@@ -44,12 +48,25 @@ const createWorldCharacters = (map: Map) => {
 
   const collision = (position: Position) => map.collisionAt(position);
 
+  /*
+    Hydrate the HUD from the current state. The normal port flow already does
+    this in setSail, but a save loaded directly at sea would otherwise show
+    empty/stale indicators until the first time slice. These run once, not per
+    frame; updateSpeed keeps skipping while nothing changes.
+   */
+  updateWorldStatus();
+  updateProvisions();
+  player.updateSpeed();
+
   return {
     update: () => {
       player.update();
 
       if (Input.getPressedE() && dock(player.position())) {
         player.setHeading('');
+        // zero the speed and indicator straight away instead of waiting for
+        // the next time at sea
+        player.updateSpeed();
         return;
       }
 
