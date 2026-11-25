@@ -14,14 +14,68 @@ _dirs = {"forward": False, "reverse": False, "turnLeft": False, "turnRight": Fal
 _dir_keys = {"forward": ("arrow_up", "w"), "reverse": ("arrow_down", "s"),
              "turnLeft": ("arrow_left", "a"), "turnRight": ("arrow_right", "d")}
 
+# ---- the page going away (phone switched to another app, screen locked) ------------------------------
+# The browser stops delivering touch events the moment the page is hidden, so a thumb that was resting on the stick or
+# on JUMP/ACTION never produces its release and the game would keep that button held. While the page is away (and until
+# the game lets the player walk again) every press is ignored and everything is let go; on the way back the controls
+# start from a clean state, so nothing is held over from the old session.
+_page = {"visible": True, "suspended": False, "resumed": False}
 
-def _send_keys(names, down):
+
+def _press_allowed():
+    """Whether a new press may reach the game right now. Releases always go through, so a button can never stay stuck."""
+    return not _page["suspended"]
+
+
+# The keys the game currently believes are held because of a touch input. Several inputs can share one key (the stick's
+# turn-left and the tug-of-war left button both send A / Left), and two paths can try to let go of the same input (the
+# page going away and the controls being hidden). Diffing against this set means each key is sent down (and up) exactly
+# once no matter how many inputs or paths want it, so nothing is ever released twice or left down.
+_keys_down = set()
+
+
+def _sync_keys():
+    """Send only the key events the touch inputs' current state calls for: keys newly wanted go down, keys no longer
+    wanted come up. Releases are worked out from the remembered input state alone, so they still go out when the game
+    object that wanted a key has already gone (a crane finished, a minigame ended, a reconnect reset the world)."""
+    want = set()
+    for name, on in _dirs.items():
+        if on:
+            want.update(_dir_keys[name])
+    if _jump_down[0]:
+        want.add("space")
+    if _action_down[0]:
+        want.add(_action_down[0])
+    if _pad_down[0]:
+        want.update(("a", "arrow_left"))
+    if _pad_down[1]:
+        want.update(("d", "arrow_right"))
+    up = _keys_down - want
+    down = want - _keys_down
+    if not (up or down):
+        return
     import builtins
     m = getattr(builtins, "messenger", None)
     if m is None:
-        return
-    for n in names:
-        m.send(n if down else n + "-up")
+        return          # nothing can be sent yet: keep the old record so the next call sends the difference
+    _keys_down.clear()
+    _keys_down.update(want)
+    for n in sorted(up):          # let go first, then press: a key swapped in a single step never stays held
+        m.send(n + "-up")
+    for n in sorted(down):
+        m.send(n)
+
+
+def ui_lost_connection():
+    """True while the game shows the "connection lost, try to connect again?" box."""
+    try:
+        import builtins
+        cr = getattr(getattr(builtins, "base", None), "cr", None)
+        fsm = getattr(cr, "loginFSM", None)
+        st = fsm.getCurrentState() if fsm is not None else None
+        return st is not None and st.getName() == "noConnection"
+    except BaseException:
+        return False
 
 
 _CHAT_OPEN_STATES = ("normalChat", "whiteListOpenChat", "whiteListAvatarChat", "whiteListPlayerChat",
@@ -79,16 +133,17 @@ def ui_move(fwd, back, left, right):
     """Joystick: drive the same input states the arrow keys drive, and send the key events too
     (minigames read W/A/S/D and the arrow keys directly)."""
     try:
-        if fwd or back or left or right:
+        want = (bool(fwd), bool(back), bool(left), bool(right))
+        if any(want) and not _press_allowed():
+            return          # a press made while the page was away is a leftover, not a new push
+        if any(want):
             _cancel_chat_if_open()
             _unstick_walking()
         st = _input_state()
-        for name, on in (("forward", fwd), ("reverse", back), ("turnLeft", left), ("turnRight", right)):
-            on = bool(on)
+        for name, on in (("forward", want[0]), ("reverse", want[1]), ("turnLeft", want[2]), ("turnRight", want[3])):
             st.set(name, on, "touch")
-            if _dirs[name] != on:
-                _dirs[name] = on
-                _send_keys(_dir_keys[name], on)
+            _dirs[name] = on
+        _sync_keys()
     except BaseException:
         print("ui_move error", traceback.format_exc(), flush=True)
 
@@ -97,15 +152,24 @@ _analog = [0.0, 0.0]       # the thumb stick's own position, -1..1 (x: right is 
 
 
 def ui_analog(ax, ay):
+    if _page["suspended"]:
+        ax, ay = 0.0, 0.0       # the page is away or the world is being rebuilt: nothing may push the toon
     _analog[0], _analog[1] = float(ax), float(ay)
+
+
+_jump_down = [False]
 
 
 def ui_jump(down):
     try:
+        down = bool(down)
+        if down and not _press_allowed():
+            return
         if down:
             _cancel_chat_if_open()
-        _input_state().set("jump", bool(down), "touch")
-        _send_keys(("space",), bool(down))
+        _input_state().set("jump", down, "touch")
+        _jump_down[0] = down
+        _sync_keys()
     except BaseException:
         print("ui_jump error", traceback.format_exc(), flush=True)
 
@@ -278,11 +342,15 @@ def ui_action(down):
     """ACTION button: press the key the current game is waiting for (Control, Delete, Insert or Alt)."""
     try:
         if down:
+            if not _press_allowed() or _action_down[0] is not None:
+                return          # a press while away is a leftover; a repeated press keeps the key it already sent
             _action_down[0] = "arrow_down" if _slingshot_active() else (_action_key() or "control")
-            _send_keys((_action_down[0],), True)
         else:
-            _send_keys((_action_down[0] or "control",), False)
+            # The object that wanted the key may be gone by the time the button is let go (crane finished, game ended,
+            # reconnect reset the world). The release is worked out from the remembered key alone, so it still goes out;
+            # if the press never happened (already released, or released while away) there is nothing to send.
             _action_down[0] = None
+        _sync_keys()
     except BaseException:
         print("ui_action error", traceback.format_exc(), flush=True)
 
@@ -302,10 +370,19 @@ def ui_tug_active():
     return 0
 
 
+_pad_down = [False, False]
+
+
 def ui_pad(side, down):
     """Tug-of-war buttons: side 0 = left (A), 1 = right (D)."""
     try:
-        _send_keys(("a", "arrow_left") if side == 0 else ("d", "arrow_right"), bool(down))
+        if side not in (0, 1):
+            return
+        down = bool(down)
+        if down and not _press_allowed():
+            return
+        _pad_down[side] = down
+        _sync_keys()
     except BaseException:
         print("ui_pad error", traceback.format_exc(), flush=True)
 
@@ -345,20 +422,118 @@ _chat_prev = [None]
 
 
 def _release_inputs():
-    """The touch controls just disappeared (door, mailbox, menu...). A thumb still on the joystick will never send
-    'released' to a hidden view, so let go of everything here or the toon keeps running when the controls return."""
+    """Let go of every touch input (stick, JUMP, ACTION, both tug-of-war buttons, the analog stick's speed) and send the
+    key releases that follow from it. Both ways the controls disappear call this: the page going away and the game
+    hiding the controls (door, mailbox, menu, reconnect). Because the key events are diffed against what is actually
+    recorded as held, a second release (the other path arriving a moment later) sends nothing, so nothing is let go twice
+    or left held."""
     try:
         ui_move(0, 0, 0, 0)
         ui_jump(0)
         ui_action(0)
         ui_pad(0, 0)
         ui_pad(1, 0)
+        ui_analog(0.0, 0.0)
     except BaseException:
         print("release inputs error", traceback.format_exc(), flush=True)
 
 
+def ui_set_page_visible(visible, lost_connection=False, hidden_since_last=False):
+    """The page became hidden or visible again (phone switched to another app, screen locked, tab changed).
+
+    Going away: stop taking presses and let go of everything, because the browser will never deliver the releases of
+    thumbs still resting on the controls. Coming back: forget any press carried over from the old session and wait for
+    the game to be out of the lost-connection box (and to let the player walk again) before taking presses, so the
+    controls restart from a clean state instead of finishing a half-done press from before the drop.
+
+    `hidden_since_last` marks the case where the page was hidden and shown again between two polls (the game loop is
+    suspended along with the page while hidden, so no poll saw the hidden state): the touch controls still restart from
+    clean, even though the page is visible both before and after. Returns True when this call changed anything, so the
+    caller can tell the game to give its input focus back too.
+    """
+    visible = bool(visible)
+    changed = visible != _page["visible"]
+    _page["visible"] = visible
+    if not visible:
+        _page["suspended"] = True
+        _page["resumed"] = False
+        _release_inputs()
+        return changed
+    if not changed and not _page["suspended"]:
+        if not hidden_since_last:
+            return False
+        # the page is visible before and after, but it really was hidden in between: treat it like a fresh return
+    # back on screen: everything is let go already; presses stay off until _resume_touch() says the game is ready
+    _page["suspended"] = True
+    _page["resumed"] = True
+    _release_inputs()
+    if not lost_connection:
+        _resume_touch()
+    return True
+
+
+def _resume_touch(controls_visible=None):
+    """Take presses again, once the page is back on screen, the game is out of the lost-connection box and the player can
+    walk or act. `controls_visible` lets a caller that already worked the answer out pass it in."""
+    if not _page["resumed"] or not _page["visible"]:
+        return
+    try:
+        if ui_lost_connection():
+            return
+        if controls_visible is None:
+            controls_visible = _controls_visible()
+    except BaseException:
+        return
+    if not controls_visible:
+        return
+    _page["resumed"] = False
+    _page["suspended"] = False
+    print("webui: touch controls ready again after coming back", flush=True)
+
+
+def ui_touch_suspended():
+    """True while the touch controls are waiting to restart (page away, connection lost, world being rebuilt)."""
+    return bool(_page["suspended"] or not _page["visible"])
+
+
+def ui_recheck_ready():
+    """Called every time the game lets the player walk or act again: if the page came back and the game is ready, the
+    touch controls take presses again. Cheap when nothing is waiting."""
+    _resume_touch()
+
+
+def ui_world_reset():
+    """The game world is gone or being rebuilt (connection lost, reconnect). Let go of every touch input now and hold
+    presses back until the player is out of the lost-connection box and can walk again. Safe to call more than once;
+    a second call sends nothing the first one already released."""
+    _page["resumed"] = True
+    _page["suspended"] = True
+    _release_inputs()
+
+
+def ui_world_ready():
+    """The player is back in a rebuilt world after a reconnect: let go of anything still held (the world that wanted it
+    is gone) and take presses again from a clean state when the game lets them walk."""
+    _page["resumed"] = True
+    _page["suspended"] = True
+    _release_inputs()
+    _resume_touch()
+
+
+def ui_player_walkable():
+    """True when the player is really back in the world (not the sign-in screen, not the lost-connection box)."""
+    if ui_lost_connection():
+        return False
+    try:
+        return bool(_controls_visible())
+    except BaseException:
+        return False
+
+
 def ui_controls_visible():
     v = _controls_visible()
+    if _page["resumed"]:
+        _resume_touch(controls_visible=v)
     if _vis_prev[0] and not v:
         _release_inputs()
     _vis_prev[0] = bool(v)

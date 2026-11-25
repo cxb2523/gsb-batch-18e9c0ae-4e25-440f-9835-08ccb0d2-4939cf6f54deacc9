@@ -407,6 +407,11 @@
     addEventListener('pagehide', () => { try { const r = JSON.parse(localStorage.getItem(ALIVE) || '{}'); r.clean = 1; r.t = Date.now(); localStorage.setItem(ALIVE, JSON.stringify(r)); } catch (e) {} plog('JS| mem pagehide (page closing)'); });
     setTimeout(() => beat('start'), 1500);
   }
+  // Count the hides. The game loop is suspended along with the page while it is hidden, so a hide and a return can both
+  // fit between two game frames and never be seen. webui.py reads this count to know a hide happened even so, and lets
+  // go of anything a thumb left held on the touch controls before the player came back.
+  T.ttaHideSeq = 0;
+  document.addEventListener('visibilitychange', () => { if (document.hidden) T.ttaHideSeq++; });
   // The saved pack holding a lazy file, as a Blob (a Blob is read from disk as needed, not held in memory), then the file's bytes as a slice of it.
   T.lazyBlob = async (path) => {
     const e = lazy.get(path); if (!e) return null;
@@ -1442,7 +1447,13 @@
   // Blur and refocus it after returning so Panda's input device is reattached too.
   addEventListener('focus', () => setTimeout(() => regainGame('window focus'), 50));
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) { releaseAll(); if (keyCapture) keyCapture = null; }
+    // The page stops getting pointer events once hidden, so a finger resting on JUMP, ACTION or the tug-of-war buttons
+    // never sends its release. Clear every touch flag here, so the game is told they were let go (webui_core.py does the
+    // same on its side) and nothing is still held when the player comes back.
+    if (document.hidden) {
+      releaseAll(); if (keyCapture) keyCapture = null;
+      if (hudVisible) { joyReset(); st.j = st.a = st.pl = st.pr = 0; pushInput(); }
+    }
     else setTimeout(() => regainGame('tab return'), 50);
   });
   addEventListener('pageshow', () => setTimeout(() => regainGame('page show'), 50));

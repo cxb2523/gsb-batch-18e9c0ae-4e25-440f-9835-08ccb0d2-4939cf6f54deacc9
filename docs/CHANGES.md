@@ -132,6 +132,27 @@ the `anywhere` branch of our fork, [open-toontown-anywhere](https://github.com/l
   and "add to Home Screen" screens (on a sky background), an optional test-session log (`?log=1`), and the Toon font.
 - Discord and Reddit buttons on the sign-in screen.
 
+### Touch controls and reconnecting (`web/game/webui.py`, `webui_core.py`, `web/tta-ui.js`)
+
+- Switching the phone to another app (or locking it) releases every touch input at once: the thumb stick (including how
+  far it is pushed, which sets walking speed), JUMP, ACTION and both tug-of-war buttons. A thumb resting on a control
+  when the page goes away never gets to send its release, so the toon could otherwise run off on its own after returning.
+- Coming back to a game that is ready to walk, the touch controls start from a clean state: everything is let go once
+  more, presses are ignored until the game is out of the "connection lost" box and lets the player walk, and then they
+  work again. Page-visibility changes and the touch controls being hidden by the game (a door, a menu, a reconnect) share
+  the same release path, and because key events are worked out from what is actually held, the two paths never release
+  the same key twice.
+- ACTION no longer sticks. The key it pressed is remembered when it goes down, so letting go still sends that key's
+  release even if the crane, minigame or Field Office battle that wanted it has already gone (a reconnect resets the
+  world), and a repeat press/release sends nothing extra.
+- The page counts hide events, so a hide and return squeezed between two game frames (the game loop is suspended with the
+  page) still releases everything and restarts the controls clean.
+- Automatic reconnecting now tells a dropped network apart from being thrown out by the server: `bootedIndex` 100, 127
+  and 152 are never retried (the sign-in "same account elsewhere" case would otherwise fight the player's other device).
+  A real drop keeps the 1.5-second wait and the three tries in a 180-second window, but a reconnect that actually gets
+  the player back into the world clears the tries and the window, so records from an old session cannot use up a new
+  one's budget. Attempts made while the page is hidden are skipped.
+
 ## Known problems
 
 Honest list, most important first.
