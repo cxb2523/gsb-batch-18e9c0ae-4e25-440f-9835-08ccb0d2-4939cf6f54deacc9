@@ -58,6 +58,41 @@ function pushItemSize( vec, itemSize, target ) {
 
 }
 
+// Resolve the attribute keys that should be generated for a single target. Attributes missing
+// from the source geometry can not be interpolated and attributes absent from a pre-existing
+// target geometry are dropped so targets with different attribute sets do not contaminate each
+// other. A target without any attributes (e.g. a freshly created Brush) is unconstrained. The
+// "position" attribute is always required to build a valid geometry.
+function getRelevantAttributes( referenceGeometry, targetGeometry, relevantAttributes ) {
+
+	const refAttributes = referenceGeometry.attributes;
+	const targetAttributes = targetGeometry.attributes;
+	const targetHasAttributes = Object.keys( targetAttributes ).length !== 0;
+
+	const result = [];
+	for ( let i = 0, l = relevantAttributes.length; i < l; i ++ ) {
+
+		const key = relevantAttributes[ i ];
+		if ( ! refAttributes[ key ] ) {
+
+			continue;
+
+		}
+
+		if ( key !== 'position' && targetHasAttributes && ! targetAttributes[ key ] ) {
+
+			continue;
+
+		}
+
+		result.push( key );
+
+	}
+
+	return result;
+
+}
+
 class AttributeData extends TypeBackedArray {
 
 	get count() {
@@ -89,18 +124,33 @@ export class GeometryBuilder {
 
 	}
 
-	initFromGeometry( referenceGeometry, relevantAttributes ) {
+	// Initialize the builder based on the source "referenceGeometry" while taking the target
+	// "targetGeometry" into account so every target produces attributes matching its own
+	// attribute set and TypedArray types. The returned list contains the attribute keys that
+	// will actually be populated and written to the target.
+	initFromGeometry( referenceGeometry, targetGeometry, relevantAttributes ) {
 
 		this.clear();
+
+		// resolve the set of attributes to generate so data is only read and written for
+		// attributes that exist on both source geometries and the target (when the target
+		// already has attributes to constrain the result)
+		const resolvedAttributes = getRelevantAttributes( referenceGeometry, targetGeometry, relevantAttributes );
 
 		// initialize and clear unused data from the attribute buffers and vice versa
 		const { attributeData } = this;
 		const refAttributes = referenceGeometry.attributes;
-		for ( let i = 0, l = relevantAttributes.length; i < l; i ++ ) {
+		const targetAttributes = targetGeometry.attributes;
+		for ( let i = 0, l = resolvedAttributes.length; i < l; i ++ ) {
 
-			const key = relevantAttributes[ i ];
+			const key = resolvedAttributes[ i ];
 			const refAttr = refAttributes[ key ];
-			const type = refAttr.array.constructor;
+
+			// prefer the target's attribute configuration so each target keeps its own
+			// TypedArray type, item size, and normalization
+			const targetAttr = targetAttributes[ key ];
+			const sourceAttr = targetAttr || refAttr;
+			const type = sourceAttr.array.constructor;
 			if ( ! attributeData[ key ] ) {
 
 				attributeData[ key ] = new AttributeData( type );
@@ -108,20 +158,22 @@ export class GeometryBuilder {
 			}
 
 			attributeData[ key ].setType( type );
-			attributeData[ key ].itemSize = refAttr.itemSize;
-			attributeData[ key ].normalized = refAttr.normalized;
+			attributeData[ key ].itemSize = sourceAttr.itemSize;
+			attributeData[ key ].normalized = sourceAttr.normalized;
 
 		}
 
 		for ( const key in attributeData ) {
 
-			if ( ! relevantAttributes.includes( key ) ) {
+			if ( ! resolvedAttributes.includes( key ) ) {
 
 				delete attributeData[ key ];
 
 			}
 
 		}
+
+		return resolvedAttributes;
 
 	}
 
@@ -301,7 +353,7 @@ export class GeometryBuilder {
 
 		let needsDisposal = false;
 		const { groupIndices, attributeData } = this;
-		const { attributes, index } = target;
+		const { attributes } = target;
 		for ( const key in attributeData ) {
 
 			const arr = attributeData[ key ];
@@ -309,7 +361,7 @@ export class GeometryBuilder {
 			const buffer = arr.array.buffer;
 
 			let attr = attributes[ key ];
-			if ( ! attr || attr.count < count || attr.array.type !== type ) {
+			if ( ! attr || attr.count < count || attr.array.constructor !== type ) {
 
 				// create the attribute if it doesn't exist yet
 				attr = new BufferAttribute( new type( length ), itemSize, normalized );
@@ -326,7 +378,7 @@ export class GeometryBuilder {
 
 		// remove or update the index appropriately
 		const indexCount = groupIndices.reduce( ( v, arr ) => arr.count + v, 0 );
-		if ( ! target.index || index.count < indexCount || index.array.type !== Uint32Array ) {
+		if ( ! target.index || target.index.count < indexCount || target.index.array.constructor !== Uint32Array ) {
 
 			target.setIndex( new BufferAttribute( new Uint32Array( indexCount ), 1 ) );
 			needsDisposal = true;
@@ -340,15 +392,21 @@ export class GeometryBuilder {
 		for ( let i = 0, l = Math.min( groupOrder.length, groupIndices.length ); i < l; i ++ ) {
 
 			const { index, materialIndex } = groupOrder[ i ];
-			const { count } = groupIndices[ index ];
-			const buffer = groupIndices[ index ].array.buffer;
-			if ( count !== 0 ) {
+			const groupData = groupIndices[ index ];
 
-				target.index.array.set( new Uint32Array( buffer, 0, count ), offset );
-				target.addGroup( offset, count, materialIndex );
-				offset += count;
+			// the builder may not have produced any triangles for this group so treat the
+			// missing slot as an empty group instead of throwing
+			if ( ! groupData || groupData.count === 0 ) {
+
+				continue;
 
 			}
+
+			const { count } = groupData;
+			const buffer = groupData.array.buffer;
+			target.index.array.set( new Uint32Array( buffer, 0, count ), offset );
+			target.addGroup( offset, count, materialIndex );
+			offset += count;
 
 		}
 

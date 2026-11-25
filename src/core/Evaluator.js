@@ -95,17 +95,30 @@ export class Evaluator {
 
 		}
 
-		// prepare the attribute data buffer information
+		// only the builders used by this call participate in the operation so builders left
+		// over from a larger previous batch can not retain stale attribute keys or groups
+		const activeBuilders = geometryBuilders.slice( 0, targetBrushes.length );
+
+		// reset the unused builders so data from a previous, larger batch does not linger on
+		// the evaluator between calls
+		for ( let i = activeBuilders.length; i < geometryBuilders.length; i ++ ) {
+
+			geometryBuilders[ i ].clear();
+
+		}
+
+		// prepare the attribute data buffer information per target so brushes with different
+		// attribute sets or TypedArray types do not contaminate one another
 		targetBrushes.forEach( ( brush, i ) => {
 
-			geometryBuilders[ i ].initFromGeometry( a.geometry, attributes );
-			GeometryUtils.trimAttributes( brush.geometry, attributes );
+			const relevantAttributes = activeBuilders[ i ].initFromGeometry( a.geometry, brush.geometry, attributes );
+			GeometryUtils.trimAttributes( brush.geometry, relevantAttributes );
 
 		} );
 
 		// run the operation to fill the list of attribute data
 		debug.init();
-		performOperation( a, b, operations, triangleSplitter, geometryBuilders, { useGroups } );
+		performOperation( a, b, operations, triangleSplitter, activeBuilders, { useGroups } );
 		debug.complete();
 
 		// get the materials and group ranges
@@ -138,7 +151,7 @@ export class Evaluator {
 		targetBrushes.forEach( ( brush, i ) => {
 
 			const targetGeometry = brush.geometry;
-			geometryBuilders[ i ].buildGeometry( targetGeometry, groups );
+			activeBuilders[ i ].buildGeometry( targetGeometry, groups );
 
 			// assign brush A's transform to the result so the geometry is in a stable position
 			a.matrixWorld.decompose( brush.position, brush.quaternion, brush.scale );
