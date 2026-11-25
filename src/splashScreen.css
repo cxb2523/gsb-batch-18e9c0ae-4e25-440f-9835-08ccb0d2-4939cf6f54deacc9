@@ -37,20 +37,42 @@
 			content: "v ";
 		}
 	}
-	button {
-		margin-top: 48px;
-		padding: 10px 16px;
-		font: 16px var( --gsui-font-monospace );
-
-		[ data-loaded ] &:not( :hover ) {
-			animation: .5s splashScreen-textAnim linear infinite alternate;
-		}
-		&::before { content: "downloading..." }
-		[ data-loaded ] &::before { content: "[ click to start ]" }
-		[ data-starting ] &::before { content: "starting..." }
-	}
 	[ data-alert ] {
 		display: none;
+	}
+	[ data-alert=loadFail ] {
+		align-items: center;
+		flex-direction: column;
+		gap: 10px;
+	}
+	&[ data-failed ] [ data-alert=loadFail ] {
+		display: flex;
+	}
+	&[ data-failed ] button[ data-action=start ] {
+		display: none;
+	}
+	button {
+		padding: 10px 16px;
+		font: 16px var( --gsui-font-monospace );
+	}
+	button[ data-action=start ] {
+		margin-top: 48px;
+
+		&::before {
+			content: "downloading...";
+		}
+	}
+	&[ data-loaded ] button[ data-action=start ]::before {
+		content: "[ click to start ]";
+	}
+	&[ data-loaded ]:not( [ data-starting ] ) button[ data-action=start ]:not( :hover ) {
+		animation: .5s splashScreen-textAnim linear infinite alternate;
+	}
+	&[ data-starting ] button[ data-action=start ]::before {
+		content: "starting...";
+	}
+	button[ data-action=retry ]::before {
+		content: "[ click to retry ]";
 	}
 }
 @keyframes splashScreen-textAnim {
