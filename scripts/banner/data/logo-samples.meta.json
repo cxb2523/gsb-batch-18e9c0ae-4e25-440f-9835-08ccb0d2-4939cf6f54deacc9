@@ -1,0 +1,39 @@
+{
+  "cache_version": 1,
+  "extra_inputs": {
+    "waveframe_source": "dcc33bff5a30dc0fc0d5376b0a50d06f0f2c5b1223e644cb8f27b621ad9e8b16"
+  },
+  "key": "413235daa06b4f2e9cd7da00db3ed451b6edab77888be8ba320fbc87f528e11e",
+  "logo_names": [
+    "waveframe",
+    "code",
+    "react"
+  ],
+  "logo_seed": 314259,
+  "logos": {
+    "code": "f9469116ad23141cc35e8f508e56074c917ec905151edfb2f0f1569a10085d34",
+    "react": "3c4b7f65753358c524371731585ae24e2f450289fcd1da20d64df7b24db88d09",
+    "waveframe": "2f751d185783968e9e8202a7bfac117cb7c2f817280037e3701f72b14e035d31"
+  },
+  "sampling": {
+    "alpha_threshold": 127,
+    "offset_x": 89,
+    "offset_y": 188,
+    "scale": 0.675
+  },
+  "shapes": {
+    "code": [
+      900,
+      2
+    ],
+    "react": [
+      900,
+      2
+    ],
+    "waveframe": [
+      900,
+      2
+    ]
+  },
+  "traveller_count": 900
+}
