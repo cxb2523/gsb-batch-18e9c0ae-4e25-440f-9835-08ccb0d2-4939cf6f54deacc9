@@ -1,0 +1,117 @@
+@import 'leaflet/dist/leaflet.css';
+@import 'leaflet.markercluster/dist/MarkerCluster.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.leaflet-control-attribution { font-size: 10px !important; opacity: 0.7; }
+
+/*
+  Hide the native scrollbar on in-app scroll containers. The UI is a phone frame,
+  and desktop Chromium reserves ~15px for a classic scrollbar inside it — visible
+  as an empty gutter down the right edge even when nothing overflows. Scrolling
+  itself is unaffected. (TourDetail's feed already asked for this class; it was
+  never defined.)
+*/
+.no-scrollbar {
+  scrollbar-width: none;      /* Firefox */
+  -ms-overflow-style: none;   /* legacy Edge */
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;              /* Chromium, Safari */
+}
+
+/* User location dot on map */
+@keyframes map-location-pulse {
+  0%   { transform: scale(1); opacity: 0.5; }
+  100% { transform: scale(3); opacity: 0; }
+}
+.map-location-pulse {
+  animation: map-location-pulse 1.8s ease-out infinite;
+}
+
+/*
+  Note: Base HTML/body/#root styles are now handled by GlobalStyles.tsx
+  in src/theme/GlobalStyles.tsx via styled-components.
+
+  Kept here only:
+  - Tailwind directives (required)
+  - Custom utility classes (safe-area-insets, ios-viewport-fix)
+  - Custom animations (audio-playing-loader, audio-spinner-ring)
+*/
+
+/* Utility class for iOS safe areas (used in legacy components if any) */
+@supports (padding: max(env(safe-area-inset-top), 0px)) {
+  .safe-area-insets {
+    padding-top: max(env(safe-area-inset-top), 0px);
+    padding-bottom: max(env(safe-area-inset-bottom), 0px);
+    padding-left: max(env(safe-area-inset-left), 0px);
+    padding-right: max(env(safe-area-inset-right), 0px);
+  }
+}
+
+/* Utility class for iOS viewport fix (used in legacy components if any) */
+@supports (-webkit-touch-callout: none) {
+  .ios-viewport-fix {
+    min-height: -webkit-fill-available;
+  }
+}
+
+/* Audio playing loader animation */
+.audio-playing-loader {
+  width: 3px;
+  height: 16px;
+  border-radius: 3px;
+  display: inline-block;
+  position: relative;
+  background: currentColor;
+  color: #FFF;
+  box-sizing: border-box;
+  animation: animloader 0.3s 0.3s linear infinite alternate;
+}
+
+.audio-playing-loader::after,
+.audio-playing-loader::before {
+  content: '';
+  width: 3px;
+  height: 16px;
+  border-radius: 3px;
+  background: currentColor;
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  left: 7px;
+  box-sizing: border-box;
+  animation: animloader 0.3s 0.45s linear infinite alternate;
+}
+
+.audio-playing-loader::before {
+  left: -7px;
+  animation-delay: 0s;
+}
+
+@keyframes animloader {
+  0% {
+    height: 16px;
+  }
+
+  100% {
+    height: 8px;
+  }
+}
+
+/* Smooth spin animation for audio spinner - Safari optimized */
+@keyframes spin-smooth {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.audio-spinner-ring {
+  animation: spin-smooth 1.5s linear infinite;
+  transform-origin: center;
+}

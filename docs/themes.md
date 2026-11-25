@@ -1,0 +1,532 @@
+# Custom themes
+
+Themes are TypeScript config objects in `src/theme/themes/`. Each follows the `ThemeConfig` interface in `src/theme/types.ts`.
+
+Two built-in themes: `default-light` and `default-dark`.
+
+> **Layout options** (stop card style, progress bar, fullscreen player, etc.) are configured in `metadata.json`, not the theme. See [adding-tours.md](./adding-tours.md#metadata-json).
+
+## Theme properties
+
+### `header`
+
+Top navigation bar with remaining time and progress (TourDetail only).
+
+```typescript
+header: {
+  backgroundColor: '#FFFFFF',
+  iconColor: '#6366F1',
+  textColor: '#111827',
+  timeFontSize: '14px',
+  timeFontWeight: '600',
+  hoverBackground: '#F3F4F6',       // Optional: button hover background
+  progressBar: {
+    backgroundColor: '#E5E7EB',
+    highlightColor: '#6366F1',
+  },
+}
+```
+
+#### Status bar background
+
+The narrow safe-area at the top of the screen is filled automatically:
+
+| Screen | Color source |
+|--------|-------------|
+| TourStart | `imageColor` in `metadata.json` |
+| TourDetail | `header.backgroundColor` from the theme |
+
+Both values also update `<meta name="theme-color">`.
+
+---
+
+### `mainContent`
+
+```typescript
+mainContent: {
+  backgroundColor: '#F9FAFB',
+}
+```
+
+---
+
+### `cards`
+
+All content cards (audio stops, email, rating, etc.).
+
+```typescript
+cards: {
+  backgroundColor: '#FFFFFF',
+  textColor: '#111827',
+  borderColor: '#E5E7EB',
+  borderRadius: '12px',
+  shadow: '0 2px 15px rgba(0,0,0,0.1)',
+  titleFontSize: '18px',
+  titleFontWeight: '600',
+  stopTitleFontSize: '18px',        // Optional: audio stop title (defaults to titleFontSize)
+  stopTitleFontWeight: '600',       // Optional
+  durationBadgeFontSize: '14px',
+  numberFontSize: '14px',
+  numberFontWeight: '600',
+  image: {
+    placeholderColor: '#E5E7EB',
+    durationBadgeBackground: 'rgba(0,0,0,0.6)',
+    durationBadgeText: '#FFFFFF',
+  },
+  thumbnail: {
+    borderRadius: '8px',
+    size: '56px',                   // Width and height of the square thumbnail
+  },
+}
+```
+
+---
+
+### `stepIndicators`
+
+```typescript
+stepIndicators: {
+  active: {
+    outlineColor: '#6366F1',
+    numberColor: '#6366F1',
+    backgroundColor: '#EEF2FF',
+  },
+  inactive: {
+    borderColor: '#E5E7EB',
+    numberColor: '#9CA3AF',
+    backgroundColor: '#F9FAFB',
+  },
+  // Any of the four marker states' backgroundColor can be overridden per tour
+  // via `mapMarkerColors` in metadata.json — see map.md#marker-colors
+  completed: {
+    backgroundColor: '#6366F1',
+    checkmarkColor: '#FFFFFF',
+  },
+}
+```
+
+---
+
+### `mapMarkers` (optional)
+
+Map pin styles for stop markers and the user location dot. If omitted, falls back to `stepIndicators` values for stop markers.
+
+> **Note:** The map tile style (provider, style ID, initial center/zoom) is configured in `metadata.json`, not the theme. See [map.md](./map.md) for those settings.
+
+```typescript
+mapMarkers: {
+  active: {
+    outlineColor: '#6366F1',
+    numberColor: '#FFFFFF',
+    backgroundColor: '#6366F1',
+    shadow: '0 2px 8px rgba(0,0,0,0.35)',  // Optional
+  },
+  inactive: {
+    borderColor: 'transparent',
+    numberColor: '#FFFFFF',
+    backgroundColor: '#9CA3AF',
+    numberFontSize: '12px',                // Optional
+    numberFontWeight: '700',               // Optional
+  },
+  completed: {
+    backgroundColor: '#6366F1',
+    checkmarkColor: '#FFFFFF',
+  },
+  cluster: {
+    backgroundColor: '#1A1A1A',
+    numberColor: '#FFFFFF',
+    borderColor: 'rgba(255,255,255,0.2)',  // Optional
+    shadow: '0 3px 10px rgba(0,0,0,0.35)', // Optional
+    fontSize: '18px',                      // Optional
+    fontWeight: '700',                     // Optional
+    size: 64,                              // Optional: visual diameter in px
+    maxClusterRadius: 48,                  // Optional: pixel radius for clustering
+  },
+  userLocation: {                          // Optional: "you are here" dot
+    dotColor: '#2563EB',
+    borderColor: '#FFFFFF',               // Optional: inner dot border
+  },
+  route: {                                 // Optional: route polyline (requires mapRoute in metadata.json; any field can be overridden per tour there)
+    completedColor: '#459825',             // color for visited segments
+    upcomingColor: '#888888',             // color for unvisited (dashed) segments
+    weight: 3,                            // line width in px
+    opacity: 0.85,                        // opacity for completed line (upcoming renders at 75% of this)
+    dashArray: '8 6',                     // SVG dash pattern for upcoming segment
+  },
+}
+```
+
+---
+
+### `buttons`
+
+```typescript
+buttons: {
+  primary: {
+    backgroundColor: '#6366F1',
+    textColor: '#FFFFFF',
+    hoverBackground: '#4F46E5',     // Optional
+    iconColor: '#FFFFFF',           // Optional
+    fontSize: '18px',
+    fontWeight: '600',
+    fontFamily: ['Inter', 'sans-serif'],  // Optional
+  },
+  secondary: {
+    backgroundColor: '#F9FAFB',
+    textColor: '#111827',
+    borderColor: '#E5E7EB',         // Optional
+    hoverBackground: '#F3F4F6',     // Optional
+    fontSize: '16px',
+    fontWeight: '500',
+    fontFamily: ['Inter', 'sans-serif'],  // Optional
+  },
+  download: {                       // "Download for offline" button
+    backgroundColor: 'transparent',
+    textColor: '#6366F1',
+    borderColor: '#6366F1',         // Optional
+    hoverBackground: 'rgba(99,102,241,0.1)',  // Optional
+    iconColor: '#6366F1',           // Optional
+    fontSize: '18px',
+    fontWeight: '600',
+    fontFamily: ['Inter', 'sans-serif'],  // Optional
+  },
+  transcription: {
+    backgroundColor: '#FFFFFF',
+    iconColor: '#6366F1',
+    hoverBackground: '#F3F4F6',     // Optional
+  },
+}
+```
+
+---
+
+### `typography`
+
+```typescript
+typography: {
+  fontFamily: {
+    sans: ['Inter', 'system-ui', 'sans-serif'],   // Required: body text
+    heading: ['Space Grotesk', 'Inter', 'sans-serif'],  // Optional: headlines, language selector
+    numbers: ['Space Grotesk'],                    // Optional: time, duration, progress
+  },
+}
+```
+
+Font sizes and weights are defined per component (see each section above), not here.
+
+**Fonts are self-hosted, nothing is loaded from Google.** The app bundles these
+families (`src/fonts/index.ts`, via `@fontsource`, weights 400-700; subsets latin,
+latin-ext, cyrillic, cyrillic-ext, greek and vietnamese where the package ships them,
+Space Grotesk only latin, latin-ext and vietnamese):
+
+| Name to use in `fontFamily` | Style |
+|---|---|
+| `Inter` | neutral sans (the default) |
+| `IBM Plex Sans` | humanist sans |
+| `Space Grotesk` | geometric, good for headings and numbers |
+| `JetBrains Mono` | monospace |
+
+A theme chooses a font by writing its name first in the stack, e.g.
+`heading: ['Space Grotesk', 'Inter', 'sans-serif']`; in a JSON custom theme or manifest,
+`"typography": { "fontFamily": { "heading": ["Space Grotesk", "sans-serif"] } }`.
+A name that is not bundled (and not installed on the visitor's device) silently falls
+back to the next entry, so end every stack with a generic family. To bundle another
+family: `bun add --exact @fontsource/<name>`, add its imports to `src/fonts/index.ts`.
+There is no font upload.
+
+---
+
+### `branding`
+
+```typescript
+branding: {
+  logoUrl: undefined,          // Optional: custom logo URL; shown above tour title on StartCard
+  showLogoBorder: true,        // Show rounded rectangle container around logo
+  logoSize: 'fit',             // 'fit' = constrained to 48×48px, 'original' = natural size
+}
+```
+
+---
+
+### `miniPlayer`
+
+```typescript
+miniPlayer: {
+  backgroundColor: '#FFFFFF',
+  textColor: '#111827',
+  titleFontSize: '16px',
+  titleFontWeight: '500',
+  transcriptionFontSize: '15px',
+  shadow: '0 -2px 10px rgba(0,0,0,0.08)',   // Optional
+  progressBar: {
+    backgroundColor: '#E5E7EB',
+    highlightColor: '#6366F1',
+  },
+  controls: {
+    playButtonBackground: '#6366F1',
+    playButtonIcon: '#FFFFFF',
+    otherButtonsBackground: '#F3F4F6',
+    otherButtonsIcon: '#6B7280',
+    otherButtonsHoverBackground: '#E5E7EB',  // Optional
+  },
+  minimized: {
+    playButtonIcon: '#6366F1',
+  },
+}
+```
+
+---
+
+### `sheets`
+
+Bottom sheets (language picker, rating, email collection).
+
+```typescript
+sheets: {
+  backgroundColor: '#FFFFFF',
+  handleColor: '#D1D5DB',
+  textColor: '#111827',
+  borderColor: '#E5E7EB',           // Optional
+  titleFontSize: '18px',
+  titleFontWeight: '700',
+  backdropColor: 'rgba(0,0,0,0.2)', // Optional: backdrop overlay
+  shadow: '0 -4px 20px rgba(0,0,0,0.1)',  // Optional
+}
+```
+
+---
+
+### `startCard`
+
+Tour start / welcome screen.
+
+```typescript
+startCard: {
+  titleFontSize: '30px',
+  titleFontWeight: '700',
+  titleLineHeight: '1.2',
+  metaFontSize: '14px',
+  metaFontWeight: '400',
+  metaColor: '#6B7280',
+  descriptionFontSize: '16px',
+  offlineMessage: {
+    backgroundColor: 'rgba(59,130,246,0.08)',
+    borderColor: 'rgba(59,130,246,0.25)',
+    textColor: '#3b82f6',
+  },
+  overlay: {                          // Optional: controls for start screen overlay (image/video bg)
+    buttonBackground: 'rgba(0,0,0,0.4)',
+    buttonColor: '#FFFFFF',
+    gradientTop: 'rgba(0,0,0,0.3)',
+    gradientBottom: 'rgba(0,0,0,0.6)',
+  },
+}
+```
+
+---
+
+### `loading`
+
+```typescript
+loading: {
+  spinnerColor: '#6366F1',
+  backgroundColor: '#F9FAFB',
+  messageFontSize: '16px',
+  messageFontWeight: '500',
+}
+```
+
+---
+
+### `status`
+
+```typescript
+status: {
+  success: '#10B981',
+  error: '#EF4444',
+  warning: '#F59E0B',
+}
+```
+
+---
+
+### `inputs`
+
+```typescript
+inputs: {
+  backgroundColor: '#FFFFFF',
+  textColor: '#111827',
+  borderColor: '#E5E7EB',
+  focusBorderColor: '#6366F1',
+  placeholderColor: '#9CA3AF',
+}
+```
+
+---
+
+### `richText`
+
+Rich text content in text/image-text stops.
+
+```typescript
+richText: {
+  blockquoteBorderColor: '#6366F1',
+  blockquoteBackgroundColor: 'rgba(99,102,241,0.05)',
+  linkColor: '#6366F1',
+}
+```
+
+---
+
+### `imageCaption`
+
+```typescript
+imageCaption: {
+  textColor: '#6B7280',
+  creditColor: '#9CA3AF',
+}
+```
+
+---
+
+### `hotspot`
+
+Pins and popovers on image-hotspot stops.
+
+```typescript
+hotspot: {
+  pinColor: '#6366F1',
+  pinPulseColor: 'rgba(99,102,241,0.3)',
+  pinBorderColor: '#FFFFFF',           // Optional
+  pinShadow: '0 2px 8px rgba(0,0,0,0.2)',  // Optional
+  popoverBackground: '#FFFFFF',        // Optional: defaults to tooltip.backgroundColor
+  popoverBorderColor: '#E5E7EB',       // Optional: defaults to tooltip.borderColor
+  popoverShadow: '0 4px 16px rgba(0,0,0,0.15)',  // Optional
+  popoverTitleColor: '#111827',        // Optional: defaults to tooltip.textColor
+  popoverTextColor: '#6B7280',         // Optional: defaults to colors.text.secondary
+}
+```
+
+---
+
+### `tooltip`
+
+```typescript
+tooltip: {
+  backgroundColor: '#1F2937',
+  textColor: '#F9FAFB',
+  borderColor: '#374151',
+}
+```
+
+---
+
+### `fullscreenPlayer` (optional)
+
+Fullscreen overlay player (enabled via `fullscreenPlayer: true` in metadata).
+
+```typescript
+fullscreenPlayer: {
+  artworkBorderRadius: '12px',          // Optional
+  artworkShadow: '0 8px 32px rgba(0,0,0,0.3)',  // Optional
+  adjacentArtworkOpacity: 0.5,          // Optional: opacity of prev/next artwork
+  infoButton: {                          // Optional
+    backgroundColor: 'rgba(0,0,0,0.3)',
+    iconColor: '#FFFFFF',
+    backdropBlur: '8px',
+  },
+  captionOverlay: {                      // Optional
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    borderRadius: '8px',
+    backdropBlur: '4px',
+  },
+  transcriptionTextOpacity: 0.8,        // Optional
+}
+```
+
+---
+
+### `colors`
+
+Semantic color tokens used across components.
+
+```typescript
+colors: {
+  text: {
+    primary: '#111827',    // Main headings, important text
+    secondary: '#6B7280',  // Subtitles, supporting text
+    tertiary: '#9CA3AF',   // Metadata, timestamps
+    inverse: '#CCCCCC',    // Text on dark backgrounds
+  },
+  border: {
+    light: '#F3F4F6',      // Subtle dividers
+    medium: '#E5E7EB',     // Card borders
+    dark: '#D1D5DB',       // Emphasized borders
+  },
+  background: {
+    primary: '#FFFFFF',    // Cards, modals
+    secondary: '#F9FAFB',  // Page background
+    tertiary: '#F3F4F6',   // Hover/disabled states
+  },
+}
+```
+
+---
+
+## Creating a theme
+
+### 1. Create theme file
+
+**`src/theme/themes/my-theme.ts`**
+
+```typescript
+import { ThemeConfig } from '../types';
+
+export const myTheme: ThemeConfig = {
+  id: 'my-theme',
+  name: 'My Theme',
+
+  header: {
+    backgroundColor: '#003B73',
+    iconColor: '#FFD700',
+    textColor: '#FFFFFF',
+    timeFontSize: '14px',
+    timeFontWeight: '600',
+    progressBar: {
+      backgroundColor: 'rgba(255,215,0,0.2)',
+      highlightColor: '#FFD700',
+    },
+  },
+
+  // ... all other required sections
+};
+```
+
+### 2. Register theme
+
+**`src/theme/themes/index.ts`**
+
+```typescript
+import { myTheme } from './my-theme';
+
+export const themes = {
+  'default-light': defaultLightTheme,
+  'default-dark': defaultDarkTheme,
+  'my-theme': myTheme,
+};
+```
+
+### 3. Use theme
+
+In `metadata.json`:
+
+```json
+{ "themeId": "my-theme" }
+```
+
+## Best practices
+
+- Use `px` values, not `rem` or Tailwind class names
+- Define an accent color constant and use it throughout for consistency
+- Ensure WCAG AA contrast (≥ 4.5:1) for all text/background pairs
+- Shadows should be subtle — avoid high opacity or large blur radii on light themes
