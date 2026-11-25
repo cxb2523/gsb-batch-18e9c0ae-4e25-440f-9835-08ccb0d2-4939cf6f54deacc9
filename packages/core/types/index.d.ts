@@ -147,6 +147,33 @@ export function drawShape(
   shape: ShapeRecord,
   opts: { theme: Theme; store: Store; zoom?: number; ghost?: boolean; onAssetLoad?: () => void }
 ): void
+
+/**
+ * Resolve an image shape's asset to a decoded HTMLImageElement. Returns the
+ * image when ready, otherwise null (draw a placeholder); concurrent calls for
+ * the same assetId share one load and `onAssetLoad` fires after success.
+ * Failed loads are evicted so a later call retries.
+ */
+export function assetImage(
+  store: Store | null | undefined,
+  assetId: string,
+  onAssetLoad?: (() => void) | { onLoad?: () => void; onAssetLoad?: () => void; onError?: (ev?: unknown) => void; onAssetError?: (ev?: unknown) => void },
+  onAssetError?: (ev?: unknown) => void
+): CanvasImageSource | null
+/** Evict one asset's cached decoded image (its record was removed/replaced). */
+export function invalidateAsset(assetId: string): void
+export const invalidateAssetImage: typeof invalidateAsset
+/** Evict every cached decoded image. */
+export function clearAssetCache(): void
+export const resetImageCache: typeof clearAssetCache
+export const resetAssetCache: typeof clearAssetCache
+/** Evict cached images for assets removed or src-replaced in a store diff. */
+export function syncAssetCache(diff: Diff | null | undefined): void
+/**
+ * Raw decoded-image cache (test/inspection escape hatch). Entries carry at
+ * least `{ img, ready }`; prefer the invalidate/clear helpers.
+ */
+export const imgCache: Map<string, { img: HTMLImageElement; ready: boolean; src?: string }>
 /** Point hit-test in page space. */
 export function hitShape(shape: ShapeRecord, px: number, py: number, tol: number, store: Store): boolean
 

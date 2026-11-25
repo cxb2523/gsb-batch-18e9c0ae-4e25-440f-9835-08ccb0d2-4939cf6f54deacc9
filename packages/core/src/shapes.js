@@ -200,16 +200,133 @@ function geoLabelLayout(shape) {
 
 // ---- image assets ----------------------------------------------------------
 
-const imgCache = new Map() // assetId -> { img, ready }
-export function assetImage(store, assetId, onReady) {
-  let e = imgCache.get(assetId)
-  if (e) return e.ready ? e.img : null
-  const asset = store.asset(assetId)
-  if (!asset) return null
+// assetId -> { src, img, ready, waiters }
+// Entries are bound to the asset `src` they actually loaded, so a record
+// whose src changed is recognized as a new picture instead of painting the
+// stale decoded Image forever. A failed load drops its entry, letting the
+// next draw retry rather than sticking on the placeholder permanently.
+// Exported as an escape hatch for tests/host tooling; prefer the
+// invalidateAsset/clearAssetCache helpers.
+export const imgCache = new Map()
+
+// Evict one asset's decoded image — call when its record is removed or its
+// src is replaced. Safe on missing ids.
+export function invalidateAsset(assetId) {
+  imgCache.delete(assetId)
+}
+export const invalidateAssetImage = invalidateAsset
+
+// Evict every decoded image (full document swaps / test reset).
+export function clearAssetCache() {
+  imgCache.clear()
+}
+export const resetImageCache = clearAssetCache
+export const resetAssetCache = clearAssetCache
+
+// Apply a store diff to the cache eagerly. Only ASSET records matter:
+// removing/updating an image shape must keep the pixels (an undo brings the
+// shape back), while removing an asset or changing its src drops them.
+export function syncAssetCache(diff) {
+  if (!diff) return
+  for (const [id, rec] of Object.entries(diff.removed || {})) {
+    if (rec && rec.typeName === 'asset') invalidateAsset(id)
+  }
+  for (const [id, pair] of Object.entries(diff.updated || {})) {
+    const from = Array.isArray(pair) ? pair[0] : null
+    const to = Array.isArray(pair) ? pair[1] : pair
+    if (to && to.typeName === 'asset' && (!from || from.src !== to.src)) invalidateAsset(id)
+  }
+}
+
+// Stores can be wired to eager diff invalidation through syncAssetCache;
+// assetImage itself re-validates the entry against the current record on
+// every draw, so raw Store / undo / loadSnapshot paths are correct even
+// without an explicit subscription.
+
+// Normalize the callback argument: the common form is a single onLoad
+// function; an optional onError is accepted positionally or via an options
+// object ({ onLoad, onError } | { onAssetLoad, onAssetError }).
+function normalizeAssetCallbacks(onAssetLoad, onAssetError) {
+  let load = onAssetLoad
+  let error = onAssetError
+  if (load && typeof load === 'object') {
+    const opts = load
+    load = opts.onLoad || opts.onAssetLoad
+    error = error || opts.onError || opts.onAssetError
+  }
+  return {
+    load: typeof load === 'function' ? load : null,
+    error: typeof error === 'function' ? error : null,
+  }
+}
+
+// Returns the decoded Image when ready, otherwise null (caller draws the
+// placeholder) and arranges for onAssetLoad to fire after a successful load.
+// Concurrent calls for the same assetId share one in-flight Image.
+export function assetImage(store, assetId, onAssetLoad, onAssetError) {
+  const cb = normalizeAssetCallbacks(onAssetLoad, onAssetError)
+  const canRead = !!store && typeof store.asset === 'function'
+  const asset = canRead ? store.asset(assetId) : null
+  let entry = imgCache.get(assetId)
+
+  // Entries belong to the document (Store) that loaded them: another store
+  // reusing the same id may point at different pixels, and a freshly built
+  // document must never inherit a prior document's decode.
+  if (entry && entry.store !== store) {
+    imgCache.delete(assetId)
+    entry = undefined
+  }
+
+  // Lifecycle backstop: the asset record is gone or its src was replaced, so
+  // any cached decode is stale. Done lazily here as well as through
+  // syncAssetCache, so raw Store / loadSnapshot paths stay correct even
+  // without an explicit diff subscription.
+  if (entry && canRead && (!asset || entry.src !== asset.src)) {
+    imgCache.delete(assetId)
+    entry = undefined
+  }
+
+  if (entry) {
+    if (entry.ready) return entry.img
+    // Same asset, load in flight: coalesce — never start a second load.
+    if (cb.load) entry.waiters.add(cb.load)
+    if (cb.error) entry.errorWaiters.add(cb.error)
+    return null
+  }
+
+  // Asset record missing (deleted while the shape remains): placeholder,
+  // no throw. Deliberately not cached, so an undo/snapshot that restores the
+  // record is picked up by a later draw.
+  if (!canRead || !asset || asset.src == null || asset.src === '') return null
+
   const img = new Image()
-  e = { img, ready: false }
-  imgCache.set(assetId, e)
-  img.onload = () => { e.ready = true; onReady && onReady() }
+  entry = {
+    store, src: asset.src, img, ready: false,
+    waiters: new Set(), errorWaiters: new Set(),
+  }
+  if (cb.load) entry.waiters.add(cb.load)
+  if (cb.error) entry.errorWaiters.add(cb.error)
+  imgCache.set(assetId, entry)
+
+  img.onload = () => {
+    // Superseded by an invalidation/replacement while loading: its entry
+    // owns the waiters now, ignore this stale decode.
+    if (imgCache.get(assetId) !== entry) return
+    entry.ready = true
+    const waiters = [...entry.waiters]
+    entry.waiters.clear()
+    entry.errorWaiters.clear()
+    for (const fn of waiters) fn()
+  }
+  img.onerror = (ev) => {
+    // Drop the dead entry so the next draw starts a fresh, retryable load,
+    // then notify error waiters (redraw stays on the placeholder; retrying is
+    // driven by a later draw, never an automatic loop).
+    if (imgCache.get(assetId) !== entry) return
+    const errorWaiters = [...entry.errorWaiters]
+    imgCache.delete(assetId)
+    for (const fn of errorWaiters) fn(ev)
+  }
   img.src = asset.src
   return null
 }

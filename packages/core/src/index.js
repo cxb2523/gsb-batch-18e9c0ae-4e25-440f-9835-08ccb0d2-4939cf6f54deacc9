@@ -10,6 +10,10 @@ export {
   SIZES, FONT_SIZES, FONTS,
 } from './palette.js'
 export { pageBounds, localBounds, drawShape, hitShape } from './shapes.js'
+export {
+  assetImage, invalidateAsset, clearAssetCache, syncAssetCache, imgCache,
+  resetImageCache, resetAssetCache, invalidateAssetImage,
+} from './shapes.js'
 export { strokeOutline, inkOptions } from './freehand.js'
 
 import { Editor } from './editor.js'
