@@ -2,6 +2,7 @@
 dist
 docs
 node_modules
+tests/.build
 yarn-error.log
 cypress/screenshots
 cypress/downloads

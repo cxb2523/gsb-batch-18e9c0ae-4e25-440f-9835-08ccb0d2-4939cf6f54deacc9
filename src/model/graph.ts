@@ -47,9 +47,52 @@ const BYPASS_INPUTS: Partial<Record<ModuleKind, string[]>> = {
   [ModuleKind.ATTEN]: ['in'],
 };
 
+const portRefKey = (ref: PortRef) => `${ref.id}\u0000${ref.port}`;
+
 /**
- * Removes a module. If it sat between a signal source and the output, the
- * source is re-routed straight to the output so the patch keeps sounding.
+ * Every Output input port reachable from `id` along the *audio* signal chain:
+ * cables are followed through intermediate modules only when they enter that
+ * module's audio input (the same `in` used for bypassing). A cable into a
+ * modulation port (a VCA's `cv`, a Delay's `time`, …) is not part of the signal
+ * path, so deleting a module that fed only CV must not splice its source into
+ * the speakers. Stops at Output modules; cycles are followed once per module.
+ */
+function reachableOutputPorts(graph: Graph, id: string, outputIds: Set<string>): PortRef[] {
+  const kindById = new Map(graph.modules.map((m) => [m.id, m.kind]));
+  const destinations = new Map<string, PortRef>();
+  const visited = new Set<string>([id]);
+  let frontier: string[] = [id];
+
+  while (frontier.length > 0) {
+    const next: string[] = [];
+    for (const sourceId of frontier) {
+      for (const conn of graph.connections) {
+        if (conn.from.id !== sourceId) continue;
+        if (outputIds.has(conn.to.id)) {
+          destinations.set(portRefKey(conn.to), { id: conn.to.id, port: conn.to.port });
+          continue;
+        }
+        const targetKind = kindById.get(conn.to.id);
+        if (!targetKind) continue;
+        const audioInputs = BYPASS_INPUTS[targetKind];
+        if (!audioInputs || !audioInputs.includes(conn.to.port)) continue;
+        if (visited.has(conn.to.id)) continue;
+        visited.add(conn.to.id);
+        next.push(conn.to.id);
+      }
+    }
+    frontier = next;
+  }
+
+  return [...destinations.values()];
+}
+
+/**
+ * Removes a module. If it sat between a signal source and the output — directly
+ * or through a chain of downstream modules — the source is re-routed straight
+ * to the Output port(s) the chain fed, so the patch keeps sounding. Each
+ * distinct source/Output-port pair is added at most once, and a module with no
+ * bypassable input simply loses its cables without leaving dangling refs.
  */
 export function deleteModule(graph: Graph, id: string): Graph {
   const module = findModule(graph, id);
@@ -58,20 +101,26 @@ export function deleteModule(graph: Graph, id: string): Graph {
   const outputIds = new Set(
     graph.modules.filter((m) => m.kind === ModuleKind.OUTPUT).map((m) => m.id)
   );
-  const outgoingToOutput = graph.connections.filter(
-    (conn) => conn.from.id === id && outputIds.has(conn.to.id)
-  );
   const bypassPorts = BYPASS_INPUTS[module.kind] ?? [];
   const bypassSources = graph.connections.filter(
     (conn) => conn.to.id === id && bypassPorts.includes(conn.to.port)
   );
 
   const remaining = graph.connections.filter((conn) => conn.from.id !== id && conn.to.id !== id);
-  for (const outConn of outgoingToOutput) {
-    for (const inConn of bypassSources) {
-      const candidate: Connection = { from: { ...inConn.from }, to: { ...outConn.to } };
-      if (!remaining.some((c) => sameConnection(c, candidate))) {
-        remaining.push(candidate);
+
+  if (bypassSources.length > 0) {
+    const destinations = reachableOutputPorts(graph, id, outputIds);
+    for (const source of bypassSources) {
+      // A self-patch through the deleted module has no surviving source.
+      if (source.from.id === id) continue;
+      for (const destination of destinations) {
+        const candidate: Connection = {
+          from: { ...source.from },
+          to: { ...destination },
+        };
+        if (!remaining.some((c) => sameConnection(c, candidate))) {
+          remaining.push(candidate);
+        }
       }
     }
   }

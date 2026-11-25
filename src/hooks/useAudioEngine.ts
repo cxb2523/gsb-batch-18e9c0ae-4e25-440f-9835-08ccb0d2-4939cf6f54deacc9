@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Graph, ModuleParams } from '../types/graph';
-import type { ScopeDataMessage, SetParamMessage, WorkletMessage } from '../types/messages';
+import type { Graph } from '../types/graph';
+import type { ScopeDataMessage, WorkletMessage } from '../types/messages';
 import { toEngineGraph } from '../model/graph';
+import {
+  diffParams,
+  mergeScopeFrames,
+  pruneScopeData,
+  seedParamCache,
+  type ParamCache,
+} from '../model/engineSync';
 
 export type StatusType = 'info' | 'success' | 'error';
 
@@ -27,13 +34,27 @@ export function useAudioEngine(graph: Graph) {
   latestGraph.current = engineGraph;
   // Params the engine currently holds, per module id. Used to diff parameter
   // edits into cheap setParam messages instead of a full graph rebuild.
-  const sentParams = useRef<Map<string, ModuleParams | undefined>>(new Map());
+  const sentParams = useRef<ParamCache>(new Map());
+  // Generation of the graph most recently sent to the engine. Scope frames
+  // tagged with an older generation belong to a graph that no longer exists
+  // and are dropped before they can repaint the new modules.
+  const generation = useRef(0);
 
   const postGraph = useCallback(() => {
     const node = modularNode.current;
     if (!node) return;
-    node.port.postMessage({ type: 'loadGraph', graph: latestGraph.current });
-    sentParams.current = new Map(latestGraph.current.modules.map((m) => [m.id, m.params]));
+    generation.current += 1;
+    const graphToSend = latestGraph.current;
+    node.port.postMessage({
+      type: 'loadGraph',
+      graph: graphToSend,
+      generation: generation.current,
+    });
+    // The engine now owns exactly these params; the next setParam diff must be
+    // measured against the new module set, not the pre-rebuild one.
+    sentParams.current = seedParamCache(graphToSend.modules);
+    // Drop scope traces for modules that are not part of the new graph.
+    setScopeData((prev) => pruneScopeData(prev, graphToSend.modules));
   }, []);
 
   // Anything the worklet has to rebuild for: the set of modules and the cables.
@@ -57,17 +78,14 @@ export function useAudioEngine(graph: Graph) {
       return;
     }
 
-    for (const module of engineGraph.modules) {
-      const previous = sentParams.current.get(module.id);
-      if (previous === module.params) continue;
-      for (const [param, value] of Object.entries(module.params ?? {})) {
-        if (value === undefined) continue;
-        if ((previous as Record<string, unknown> | undefined)?.[param] === value) continue;
-        const message: SetParamMessage = { type: 'setParam', id: module.id, param, value };
-        node.port.postMessage(message);
-      }
-      sentParams.current.set(module.id, module.params);
+    // `diffParams` compares every module against the cache; sending only the
+    // differences keeps oscillator phases and delay tails alive. The cache is
+    // then refreshed to the current params objects so unchanged modules
+    // short-circuit on the next render.
+    for (const message of diffParams(sentParams.current, engineGraph.modules)) {
+      node.port.postMessage(message);
     }
+    sentParams.current = seedParamCache(engineGraph.modules);
   }, [engineGraph, structureKey, postGraph]);
 
   const start = useCallback(async () => {
@@ -102,13 +120,7 @@ export function useAudioEngine(graph: Graph) {
           setStatus({ message: `Error: ${e.data.message}`, type: 'error' });
         } else if (e.data.type === 'scopeData') {
           const data = e.data as ScopeDataMessage;
-          setScopeData((prev) => {
-            const next = { ...prev };
-            for (const frame of data.frames) {
-              next[frame.id] = frame.samples;
-            }
-            return next;
-          });
+          setScopeData((prev) => mergeScopeFrames(prev, data, generation.current));
         }
       };
 

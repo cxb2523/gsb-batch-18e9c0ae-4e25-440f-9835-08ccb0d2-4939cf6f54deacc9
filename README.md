@@ -24,7 +24,11 @@ Open the printed URL, press **▶ Play**, then:
 - **Move modules** by dragging. Drag on empty canvas to box-select; a
   selection moves together.
 - **Delete modules** with the `×` in the header, or select and press
-  `Delete` / `Backspace`.
+  `Delete` / `Backspace`. If the module sat in the signal path between a source
+  and the Output — directly or through a chain of downstream modules — the
+  source is re-patched straight to the Output port(s) that chain fed, keeping
+  stereo channels intact, so the patch keeps sounding. A module with nothing to
+  bypass just loses its cables.
 - **Tweak parameters** with the sliders and selects inside each node. Changes
   go to the engine live; nothing is rebuilt, so oscillators keep their phase
   and delays keep their tails.
@@ -87,7 +91,12 @@ The UI is a plain model–view–controller split; the DOM is never the source o
   - `useGraphState.ts`: owns the graph and exposes the actions views dispatch.
   - `useAudioEngine.ts`: AudioWorklet lifecycle. Adding/removing modules or
     cables reloads the engine graph; parameter edits are diffed into `setParam`
-    messages; moving nodes never touches it.
+    messages; moving nodes never touches it. Each reload carries a generation
+    number: the param cache is reseeded from the new module set and scope
+    traces for deleted modules are dropped, so no state from the old graph
+    survives the rebuild.
+  - `model/engineSync.ts`: pure helpers behind the engine sync (param diffing,
+    scope pruning, generation-gated frame merging), unit-tested in `tests/`.
 - **View** — `src/components/`
   - `board/Board.tsx`, `DraggableNode.tsx`, `Edge.tsx`, `SelectionBox.tsx`: the
     SpaceNotes canvas, adapted to port-to-port cables.
@@ -104,6 +113,7 @@ npm run dev         # dev server
 npm run build       # type-check + production build (dist/)
 npm run preview     # serve dist/
 npm run lint        # eslint
+npm test            # node:test suites under tests/ (bundled with esbuild)
 npm run type-check  # app + worklet type-check
 ```
 

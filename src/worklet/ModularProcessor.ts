@@ -17,6 +17,12 @@ export class ModularProcessor extends AudioWorkletProcessor {
   private outputModule: OutputModule | null;
   private scopeTick: number;
   private readonly scopeStride: number;
+  /**
+   * Version of the graph currently loaded. The host sends a fresh number with
+   * every rebuild; frames produced by a superseded graph are tagged with the
+   * old number so the UI can discard them instead of painting stale traces.
+   */
+  private generation: number;
 
   constructor() {
     super();
@@ -25,6 +31,7 @@ export class ModularProcessor extends AudioWorkletProcessor {
     this.outputModule = null;
     this.scopeTick = 0;
     this.scopeStride = 12;
+    this.generation = 0;
 
     this.port.onmessage = (e) => this.handleMsg(e.data as WorkletMessage);
   }
@@ -36,21 +43,31 @@ export class ModularProcessor extends AudioWorkletProcessor {
     }
     if (msg.type === 'loadGraph') {
       try {
-        this.loadGraph(msg.graph);
-        this.port.postMessage({ type: 'graphLoaded', success: true });
+        this.loadGraph(msg.graph, msg.generation);
+        this.port.postMessage({ type: 'graphLoaded', success: true, generation: this.generation });
       } catch (err) {
         this.port.postMessage({
           type: 'error',
           message: err instanceof Error ? err.message : 'Unknown error',
+          generation: this.generation,
         });
       }
     }
   }
 
-  loadGraph(graph: Graph): void {
+  loadGraph(graph: Graph, generation?: number): void {
+    // Drop every trace of the previous graph: modules, DSP state (delay lines,
+    // oscillator phases) and the scope frame accumulator. Nothing from the old
+    // patch may leak into the new one.
     this.modules.clear();
     this.sortedModules = [];
     this.outputModule = null;
+    this.scopeTick = 0;
+    if (typeof generation === 'number') {
+      this.generation = generation;
+    } else {
+      this.generation += 1;
+    }
 
     for (const modDef of graph.modules) {
       const module = this.createModule(modDef);
@@ -294,7 +311,7 @@ export class ModularProcessor extends AudioWorkletProcessor {
           frames.push({ id: module.id, samples });
         }
         if (frames.length > 0) {
-          this.port.postMessage({ type: 'scopeData', frames });
+          this.port.postMessage({ type: 'scopeData', frames, generation: this.generation });
         }
       }
     }
