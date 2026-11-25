@@ -1,0 +1,675 @@
+import { type Object3D, Quaternion, Vector3 } from 'three';
+
+import { setWorldPosition } from '../core/transforms.ts';
+import type { LocomotionConfig } from '../locomotion/LocomotionConfig.ts';
+import type { Side } from '../rig/HumanRig.ts';
+import { createGroundHit, type GroundDetector } from '../terrain/GroundDetector.ts';
+
+/**
+ * State of the body, in world space.
+ * It is the starting point for future phases (center of mass, balance, momentum…).
+ */
+export interface BodyState {
+  /** Position of the character's root (on the ground). */
+  position: Vector3;
+  /** Velocidad horizontal actual (m/s). */
+  velocity: Vector3;
+  /** Magnitude of the velocity (m/s). */
+  speed: number;
+  /** Acceleration in the direction of travel (m/s², smoothed). */
+  acceleration: number;
+  /**
+   * Horizontal direction the body faces (unit): the orientation of the root. It is the direction of travel,
+   * except while it goes sideways (`facingOffset`, along a ledge with its back to the wall).
+   */
+  forward: Vector3;
+  /** Horizontal direction of travel (unit): `forward` turned back by `facingOffset`. */
+  travel: Vector3;
+  /** Current heading of travel relative to the initial orientation (rad, positive = turning left). */
+  heading: number;
+  /** Turn rate of the heading of travel (rad/s). */
+  angularVelocity: number;
+  /**
+   * How far the body faces from its direction of travel (rad, positive = left): 0 walking; ±π/2 going sideways
+   * along a ledge. The root is turned `heading + facingOffset`.
+   */
+  facingOffset: number;
+  /** Turn rate of the root (rad/s): that of the heading plus that of `facingOffset`. */
+  turnRate: number;
+  /** There is ground under the root. */
+  grounded: boolean;
+  /** Height of the ground under the root (m, world). */
+  groundHeight: number;
+  /** In the air (jump): the height follows gravity. */
+  airborne: boolean;
+  /** Vertical velocity in the air (m/s, positive = up). */
+  verticalVelocity: number;
+  /** Falling speed in the frame in which it lands (m/s); 0 the rest of the time. */
+  landingSpeed: number;
+  /** In the frame in which it lands: time elapsed since contact (s); 0 otherwise. */
+  timeSinceLanding: number;
+  /** Fraction of the weight on each foot (sums to 1). */
+  supportWeights: Record<Side, number>;
+  /** Center of support: average of the contact points of the feet, weighted by their load. */
+  supportCenter: Vector3;
+  /** Horizontal offset of the body (hips) relative to the root, towards the support. */
+  shift: Vector3;
+  /** Estimated center of mass (for now, the position of the hips). */
+  com: Vector3;
+}
+
+const UP = new Vector3(0, 1, 0);
+/** In the air: how far below it looks for the ground to land on (m). */
+const AIR_PROBE_DISTANCE = 50;
+/** Remaining turn above which it starts braking to turn (rad). */
+const TURN_SLOWDOWN_START = (20 * Math.PI) / 180;
+/**
+ * Slope (rise / run) the ground under the root may have between two frames on top of `maxStepUp` /
+ * `maxStepDown` before the change counts as a ledge: with a long frame, the root moves far and a steep slope
+ * also changes a lot.
+ */
+const LEDGE_SLOPE = 1;
+
+/**
+ * Motion of the body (kinematic version):
+ *  - speed that accelerates/brakes towards the desired one,
+ *  - heading that turns towards the desired one with limited angular velocity and acceleration,
+ *  - advance of the root in the character's direction,
+ *  - height of the root that smoothly follows the ground, without crossing a riser higher than `maxStepUp`
+ *    or a drop deeper than `maxStepDown` (it stops there; StairPlanner makes it brake before),
+ *  - prediction of the future advance (to plan the steps),
+ *  - weight distribution between the feet and lateral shift of the body towards the supporting foot
+ *    (damped spring),
+ *  - kinematic jump: initial vertical velocity + gravity, keeping the horizontal velocity; it lands when it
+ *    reaches whatever ground is below.
+ *    (It doesn't detect walls or ceilings: that would be a physics engine's job.)
+ */
+export class BodyController {
+  /** Velocidad deseada (m/s), entre 0 y config.runSpeed. */
+  targetSpeed = 0;
+  /** Desired heading (rad, relative to the initial orientation; positive = left). */
+  targetHeading = 0;
+  /** Additional speed limit (m/s), e.g. when crouching. */
+  speedLimit = Number.POSITIVE_INFINITY;
+  /**
+   * Multiplier of the turn speed and turn acceleration (`turnSpeed`, `turnAcceleration`), e.g. to turn
+   * around pivoting towards a destination behind (set by MoveToController). 1 = the configuration.
+   */
+  turnRateScale = 1;
+  /**
+   * Multiplier of the braking (`deceleration`, and it shortens its `speedEasing` ramp by the same amount),
+   * e.g. when braking to turn around (set by MoveToController). 1 = the configuration.
+   */
+  brakeScale = 1;
+  /**
+   * Same for the acceleration (`acceleration`, and it lengthens or shortens its ramp), e.g. when coming out
+   * of a turn.
+   */
+  accelerationScale = 1;
+  /**
+   * Height the root follows when walking, from the ground under it (world; NaN if there is none) and its
+   * position: by default, that ground. Over stairs, a smooth line over the treads (see StairPlanner), also
+   * where there is no ground under the root (over the gap between two treads without a riser).
+   */
+  groundLine: ((position: Vector3, ground: number) => number) | null = null;
+  /** Turn rate (rad/s) at the end of the last prediction (`predict`). */
+  predictedAngularVelocity = 0;
+  /**
+   * Desired `facingOffset` (rad): the body turns towards it at `turnSpeed`, without changing its direction of
+   * travel (set by LocomotionController along a ledge; 0 = facing where it goes).
+   */
+  facingTarget = 0;
+  /**
+   * Heading of travel to follow instead of `targetHeading` (rad; NaN = `targetHeading`): along a ledge, the
+   * direction of the ledge (set by LocomotionController).
+   */
+  headingOverride = Number.NaN;
+  /** Multiplier of `lateralShift` (1 = the configuration's; more along a ledge: the weight goes to each foot). */
+  shiftScale = 1;
+  readonly state: BodyState;
+
+  private readonly root: Object3D;
+  private readonly detector: GroundDetector;
+  private readonly config: LocomotionConfig;
+  private readonly forwardLocal: Vector3;
+  /** World orientation of the root with heading 0. */
+  private readonly baseRotation: Quaternion;
+  /** World position of the root used during an update. */
+  private readonly pos = new Vector3();
+  private readonly rootHit = createGroundHit();
+  private readonly q = new Quaternion();
+  private readonly qParent = new Quaternion();
+  private readonly qHeading = new Quaternion();
+  private readonly tmp = new Vector3();
+  private readonly lateral = new Vector3();
+  /** Current lateral shift (m) and its velocity (m/s), along the lateral axis. */
+  private shiftAmount = 0;
+  private shiftVelocity = 0;
+  /** Turn rate of `facingOffset` (rad/s). */
+  private facingRate = 0;
+  /**
+   * Current rate of change of the speed (m/s²): with `speedEasing` the acceleration grows and shrinks
+   * gradually.
+   */
+  private speedRate = 0;
+  /** Height the root followed in the last update (world; NaN after a jump, a teleport or at the start). */
+  private followed = Number.NaN;
+  /**
+   * Horizontal shift (world, m) added to the next advance on the ground, besides the velocity, and then
+   * cleared. The guard against ledges also applies to it.
+   */
+  readonly drift = new Vector3();
+  /**
+   * If the last `update` stopped at a ledge it can't cross (see `snapToGround`), the horizontal direction in
+   * which it was going (unit); zero otherwise.
+   */
+  readonly ledge = new Vector3();
+  /** Position last written to the root: if it is somewhere else, it was moved from outside. */
+  private readonly written = new Vector3(Number.NaN, 0, 0);
+  /** Ground right under the root in the last query (world; NaN if there was none). */
+  private rawGround = Number.NaN;
+
+  /**
+   * @param root    Root of the character (the one that moves). It can hang from any parent: position and
+   *                 orientation are computed in world space and converted to the parent's space.
+   * @param forward  "Forward" direction of the character in world space, in the initial pose.
+   */
+  constructor(root: Object3D, forward: Vector3, detector: GroundDetector, config: LocomotionConfig) {
+    this.root = root;
+    this.detector = detector;
+    this.config = config;
+
+    root.updateWorldMatrix(true, false);
+    this.baseRotation = root.getWorldQuaternion(new Quaternion());
+    this.forwardLocal = forward.clone().applyQuaternion(root.getWorldQuaternion(new Quaternion()).invert());
+
+    this.state = {
+      position: new Vector3(),
+      velocity: new Vector3(),
+      speed: 0,
+      acceleration: 0,
+      forward: new Vector3(),
+      travel: new Vector3(),
+      heading: 0,
+      angularVelocity: 0,
+      facingOffset: 0,
+      turnRate: 0,
+      grounded: true,
+      groundHeight: 0,
+      airborne: false,
+      verticalVelocity: 0,
+      landingSpeed: 0,
+      timeSinceLanding: 0,
+      supportWeights: { left: 0.5, right: 0.5 },
+      supportCenter: new Vector3(),
+      shift: new Vector3(),
+      com: new Vector3(),
+    };
+    this.refreshState();
+  }
+
+  /** Stops the body, restores the initial orientation and rests it on the ground. */
+  reset(): void {
+    this.state.speed = 0;
+    this.state.acceleration = 0;
+    this.speedRate = 0;
+    this.state.heading = 0;
+    this.state.angularVelocity = 0;
+    this.state.facingOffset = 0;
+    this.state.turnRate = 0;
+    this.facingRate = 0;
+    this.facingTarget = 0;
+    this.headingOverride = Number.NaN;
+    this.shiftScale = 1;
+    this.state.airborne = false;
+    this.state.verticalVelocity = 0;
+    this.state.landingSpeed = 0;
+    this.state.timeSinceLanding = 0;
+    this.targetHeading = 0;
+    this.applyHeading();
+    this.shiftAmount = 0;
+    this.shiftVelocity = 0;
+    this.state.shift.set(0, 0, 0);
+    this.readRoot();
+    this.snapToGround(1, AIR_PROBE_DISTANCE); // tras un teletransporte el suelo puede estar lejos
+    this.writeRoot();
+    this.refreshState();
+  }
+
+  /**
+   * Moves the body by `offset` (world) without changing its motion: the root (and with it the whole
+   * skeleton) and whatever the state stores in world space. See `ProceduralHuman.shiftOrigin`.
+   */
+  shift(offset: Vector3): void {
+    this.readRoot();
+    this.pos.add(offset);
+    this.writeRoot();
+    this.followed += offset.y;
+    const s = this.state;
+    s.supportCenter.add(offset);
+    s.com.add(offset);
+    s.groundHeight += offset.y;
+  }
+
+  /** Takes off with a vertical velocity (m/s). */
+  jump(verticalVelocity: number, elapsed = 0): void {
+    if (this.state.airborne) return;
+    this.state.airborne = true;
+    this.state.angularVelocity = 0;
+    this.facingRate = 0;
+    this.state.turnRate = 0;
+    // Parte de este frame ya transcurrió en el aire: la raíz ya subió algo.
+    const g = this.config.gravity;
+    this.state.verticalVelocity = verticalVelocity - g * elapsed;
+    this.readRoot();
+    this.pos.y += verticalVelocity * elapsed - 0.5 * g * elapsed * elapsed;
+    this.writeRoot();
+  }
+
+  /** Time until touching the ground under the root (s); 0 if it isn't in the air. */
+  timeToLand(): number {
+    const s = this.state;
+    if (!s.airborne) return 0;
+    const g = this.config.gravity;
+    const height = Math.max(s.position.y - s.groundHeight, 0);
+    return (s.verticalVelocity + Math.sqrt(s.verticalVelocity ** 2 + 2 * g * height)) / g;
+  }
+
+  /** Advances the body by `dt` seconds. */
+  update(dt: number): void {
+    this.state.landingSpeed = 0;
+    this.state.timeSinceLanding = 0;
+    this.ledge.set(0, 0, 0);
+    if (this.state.airborne) {
+      this.updateAirborne(dt);
+      return;
+    }
+
+    // Giro: el del rumbo y, aparte, el de hacia dónde mira respecto a él.
+    const turn = this.nextTurn(this.state.heading, this.state.angularVelocity, dt, this.state.speed);
+    this.state.heading = turn.heading;
+    this.state.angularVelocity = turn.angularVelocity;
+    const facing = this.nextFacing(this.state.facingOffset, this.facingRate, dt);
+    this.state.facingOffset = facing.offset;
+    this.facingRate = facing.rate;
+    this.state.turnRate = turn.angularVelocity + facing.rate;
+    this.applyHeading();
+
+    // Velocidad lineal
+    const previous = this.state.speed;
+    const next = this.nextSpeed(previous, this.speedRate, dt);
+    this.state.speed = next.speed;
+    this.speedRate = next.rate;
+    if (dt > 0) {
+      const raw = (this.state.speed - previous) / dt;
+      this.state.acceleration += (raw - this.state.acceleration) * (1 - Math.exp(-8 * dt));
+    }
+    this.refreshState();
+    this.readRoot();
+    // Movida desde fuera (un teletransporte): no hay de dónde medir un desnivel.
+    if (this.pos.distanceToSquared(this.written) > 1e-10) this.followed = Number.NaN;
+    const fromX = this.pos.x;
+    const fromZ = this.pos.z;
+    this.pos.addScaledVector(this.state.velocity, dt);
+    this.pos.x += this.drift.x;
+    this.pos.z += this.drift.z;
+    this.drift.set(0, 0, 0);
+    this.snapToGround(1 - Math.exp(-10 * dt), this.config.groundProbeDepth, fromX, fromZ);
+    this.writeRoot();
+  }
+
+  /** In the air: constant horizontal advance, gravity and landing. */
+  private updateAirborne(dt: number): void {
+    const s = this.state;
+    const p = this.pos;
+    this.refreshState();
+    this.readRoot();
+    p.addScaledVector(s.velocity, dt);
+    s.verticalVelocity -= this.config.gravity * dt;
+    p.y += s.verticalVelocity * dt;
+    s.acceleration = 0;
+    this.speedRate = 0;
+    // Aterriza donde sea: la altura que seguía antes del salto ya no sirve de referencia.
+    this.followed = Number.NaN;
+
+    this.tmp.set(p.x, p.y + this.config.groundProbeHeight, p.z);
+    const found = this.detector.castDown(this.tmp, AIR_PROBE_DISTANCE, this.rootHit);
+    // Dentro de un bloque más alto que groundProbeHeight (saltando contra él), su cara de arriba no es donde
+    // aterriza: sigue con el suelo de antes.
+    if (!found || this.rootHit.distance >= 0) {
+      s.grounded = found;
+      if (found) s.groundHeight = this.rootHit.point.y;
+    }
+    if (s.grounded && s.verticalVelocity <= 0 && p.y <= s.groundHeight) {
+      // Parte de este frame ya transcurrió tras el contacto (lo que el cuerpo se hundió).
+      s.timeSinceLanding = Math.min((s.groundHeight - p.y) / Math.max(-s.verticalVelocity, 1e-6), dt);
+      p.y = s.groundHeight;
+      s.landingSpeed = -s.verticalVelocity;
+      s.verticalVelocity = 0;
+      s.airborne = false;
+    }
+    this.writeRoot();
+  }
+
+  /**
+   * Weight distribution and lateral shift of the body towards the support.
+   *
+   *   center of support = Σ weight(foot) · contact point(foot) / Σ weight
+   *                       (in flight, with no feet on the ground: the position of the body)
+   *   target            = lateral component of (center of support − root) · lateralShift
+   *
+   * The shift follows the target with a critically damped spring, so that the sway is continuous even if
+   * the support switches feet abruptly.
+   */
+  updateWeightShift(dt: number, contacts: Record<Side, Vector3>, weights: Record<Side, number>): void {
+    const s = this.state;
+    s.supportWeights.left = weights.left;
+    s.supportWeights.right = weights.right;
+    const total = weights.left + weights.right;
+    if (total > 1e-6) {
+      s.supportCenter
+        .copy(contacts.left)
+        .multiplyScalar(weights.left / total)
+        .addScaledVector(contacts.right, weights.right / total);
+    } else {
+      // En vuelo (corriendo) no hay apoyo hacia el que desplazarse: centro = el propio cuerpo.
+      s.supportCenter.copy(s.position);
+    }
+
+    this.lateral.crossVectors(UP, s.forward).normalize();
+    const target = this.tmp.subVectors(s.supportCenter, s.position).dot(this.lateral) * this.config.lateralShift * this.shiftScale;
+
+    const w = this.config.lateralShiftResponse;
+    const accel = w * w * (target - this.shiftAmount) - 2 * w * this.shiftVelocity;
+    this.shiftVelocity += accel * dt;
+    this.shiftAmount += this.shiftVelocity * dt;
+    s.shift.copy(this.lateral).multiplyScalar(this.shiftAmount);
+  }
+
+  /** Is it turning, or does it still have turning to do? (Its heading or where it faces.) */
+  isTurning(): boolean {
+    return (
+      Math.abs(wrapAngle(this.headingTarget - this.state.heading)) > 0.01 ||
+      Math.abs(this.state.angularVelocity) > 0.01 ||
+      Math.abs(this.facingTarget - this.state.facingOffset) > 0.01 ||
+      Math.abs(this.facingRate) > 0.01
+    );
+  }
+
+  /** Heading of travel it turns towards: `headingOverride`, or else `targetHeading`. */
+  get headingTarget(): number {
+    return Number.isNaN(this.headingOverride) ? this.targetHeading : this.headingOverride;
+  }
+
+  /** Turn the root still has to make (rad, positive = left): that of the heading and that of `facingOffset`. */
+  turnRemaining(): number {
+    return wrapAngle(this.headingTarget - this.state.heading) + (this.facingTarget - this.state.facingOffset);
+  }
+
+  /**
+   * Turns the direction of travel round (half a turn) without turning the body: going sideways, it then goes the
+   * other way. Only stopped (it doesn't change the velocity).
+   */
+  reverseTravel(): void {
+    const s = this.state;
+    s.heading += Math.PI;
+    s.facingOffset = wrapAngle(s.facingOffset - Math.PI);
+    this.facingTarget = wrapAngle(this.facingTarget - Math.PI);
+    if (!Number.isNaN(this.headingOverride)) this.headingOverride = wrapAngle(this.headingOverride + Math.PI);
+    s.travel.negate();
+  }
+
+  /**
+   * Predicts the motion of the body over `duration` seconds, taking into account acceleration, braking and
+   * turning: displacement (it can be a curve), final velocity and how much the body will have turned (rad;
+   * its heading and where it faces, `facingOffset`). Returns the turn.
+   */
+  predict(duration: number, outDisplacement: Vector3, outVelocity: Vector3): number {
+    const substeps = 10;
+    const h = duration / substeps;
+    let speed = this.state.speed;
+    let rate = this.speedRate;
+    let heading = this.state.heading;
+    let angularVelocity = this.state.angularVelocity;
+    let offset = this.state.facingOffset;
+    let facingRate = this.facingRate;
+    outDisplacement.set(0, 0, 0);
+    for (let i = 0; i < substeps; i++) {
+      const next = this.nextSpeed(speed, rate, h, this.cappedTargetSpeed(heading));
+      const turn = this.nextTurn(heading, angularVelocity, h, speed);
+      const facing = this.nextFacing(offset, facingRate, h);
+      const midHeading = (heading + turn.heading) / 2;
+      this.dirAt(midHeading - this.state.heading, this.tmp);
+      outDisplacement.addScaledVector(this.tmp, ((speed + next.speed) / 2) * h);
+      speed = next.speed;
+      rate = next.rate;
+      heading = turn.heading;
+      angularVelocity = turn.angularVelocity;
+      offset = facing.offset;
+      facingRate = facing.rate;
+    }
+    const yaw = heading - this.state.heading;
+    this.dirAt(yaw, outVelocity).multiplyScalar(speed);
+    this.predictedAngularVelocity = angularVelocity + facingRate;
+    return yaw + offset - this.state.facingOffset;
+  }
+
+  /** Direction of travel after turning `yaw` rad relative to the current one. */
+  private dirAt(yaw: number, out: Vector3): Vector3 {
+    return out.copy(this.state.travel).applyAxisAngle(UP, yaw);
+  }
+
+  /**
+   * One integration step of `facingOffset` towards `facingTarget`: like the turn (`turnSpeed`,
+   * `turnAcceleration`), without the limit of the lateral acceleration (the direction of travel doesn't change).
+   */
+  private nextFacing(offset: number, rate: number, dt: number): { offset: number; rate: number } {
+    const error = this.facingTarget - offset;
+    if (error === 0 && rate === 0) return { offset, rate };
+    const maxSpeed = (this.config.turnSpeed * this.turnRateScale * Math.PI) / 180;
+    const maxAccel = (this.config.turnAcceleration * this.turnRateScale * Math.PI) / 180;
+    const desired = Math.sign(error) * Math.min(maxSpeed, Math.sqrt(2 * maxAccel * Math.abs(error)), 6 * Math.abs(error));
+    const w = moveTowards(rate, desired, maxAccel * dt);
+    // Al llegar, en él (sin quedarse a una milésima girando sin parar).
+    if (Math.abs(error) < 1e-4 && Math.abs(w) < 1e-3) return { offset: this.facingTarget, rate: 0 };
+    return { offset: offset + w * dt, rate: w };
+  }
+
+  /**
+   * One integration step of the turn: the desired angular velocity is limited by the maximum turn speed, by
+   * the maximum lateral acceleration at this speed (ω ≤ a / v: the faster it moves, the wider the curve)
+   * and by what still allows braking in time; the actual angular velocity approaches it with limited
+   * acceleration.
+   */
+  private nextTurn(heading: number, angularVelocity: number, dt: number, speed: number): { heading: number; angularVelocity: number } {
+    const maxSpeed = Math.min((this.config.turnSpeed * this.turnRateScale * Math.PI) / 180, this.config.maxLateralAcceleration / speed);
+    const maxAccel = (this.config.turnAcceleration * this.turnRateScale * Math.PI) / 180;
+    const error = wrapAngle(this.headingTarget - heading);
+    const desired = Math.sign(error) * Math.min(maxSpeed, Math.sqrt(2 * maxAccel * Math.abs(error)), 6 * Math.abs(error));
+    const w = moveTowards(angularVelocity, desired, maxAccel * dt);
+    return { heading: heading + w * dt, angularVelocity: w };
+  }
+
+  /**
+   * Orients the root (world) according to the current heading. Only updates the root's matrix: whatever
+   * hangs from it is updated once, when its position is written (`writeRoot`), which always follows.
+   */
+  private applyHeading(): void {
+    this.root.updateWorldMatrix(true, false);
+    const worldQuat = this.q.copy(this.baseRotation).premultiply(this.qHeading.setFromAxisAngle(UP, this.state.heading + this.state.facingOffset));
+    if (this.root.parent) this.root.quaternion.copy(this.root.parent.getWorldQuaternion(this.qParent).invert().multiply(worldQuat));
+    else this.root.quaternion.copy(worldQuat);
+    this.root.updateWorldMatrix(false, false);
+  }
+
+  /** Reads the world position of the root (respects it if it was moved from outside). */
+  private readRoot(): void {
+    this.root.updateWorldMatrix(true, false);
+    this.root.getWorldPosition(this.pos);
+  }
+
+  /** Writes the working world position to the root (converted to the parent's space). */
+  private writeRoot(): void {
+    // Actualiza los antepasados, la raíz y todo lo que cuelga de ella (una sola pasada).
+    setWorldPosition(this.root, this.pos);
+    this.state.position.copy(this.pos);
+    this.written.copy(this.pos);
+  }
+
+  /**
+   * Speed after `dt` seconds, accelerating or braking towards the desired one, and its rate of change.
+   * With `speedEasing` > 0 it follows an S-curve: the acceleration (or braking) grows gradually up to
+   * `acceleration` (or `deceleration`) and goes back to zero on arrival, so the speed never starts or stops
+   * changing abruptly. With 0, a constant rate.
+   */
+  private nextSpeed(speed: number, rate: number, dt: number, target = this.cappedTargetSpeed()): { speed: number; rate: number } {
+    const dv = target - speed;
+    const scale = dv > 0 ? this.accelerationScale : this.brakeScale;
+    const maxRate = (dv > 0 ? this.config.acceleration : this.config.deceleration) * scale;
+    // Con más (o menos) aceleración, la rampa también es más corta (o más larga): misma forma.
+    const easing = this.config.speedEasing / scale;
+    if (!(easing > 0) || !(dt > 0)) {
+      const next = moveTowards(speed, target, maxRate * dt);
+      return { speed: next, rate: dt > 0 ? (next - speed) / dt : 0 };
+    }
+    // Ritmo deseado: el máximo, salvo cerca del objetivo, donde baja lo justo para llegar con
+    // ritmo 0 (|ritmo| ≤ √(2·j·|dv|)) y, al final, de forma exponencial (≤ k·|dv|) para que la
+    // aceleración se apague sin salto; el ritmo real se acerca a él con cambio limitado (j).
+    const jerk = maxRate / easing;
+    const tail = 6 / easing;
+    const desired = Math.sign(dv) * Math.min(maxRate, Math.sqrt(2 * jerk * Math.abs(dv)), tail * Math.abs(dv));
+    // Al crecer la aceleración, cambio limitado a j; al apagarla (cola exponencial), hasta 2·j.
+    const easingOff = Math.sign(desired) === Math.sign(rate) && Math.abs(desired) < Math.abs(rate);
+    const nextRate = moveTowards(rate, desired, (easingOff ? 2 : 1) * jerk * dt);
+    const next = speed + nextRate * dt;
+    // Al cruzar el objetivo (o quedarse a una diezmilésima del cambio que da la rampa), quedarse en él.
+    // Umbral relativo (no en m/s fijos) para que un personaje escalado se mueva exactamente igual.
+    if ((target - next) * dv <= 0 || Math.abs(target - next) < 1e-4 * maxRate * easing) return { speed: target, rate: 0 };
+    return { speed: Math.max(next, 0), rate: nextRate };
+  }
+
+  /**
+   * Desired speed within the limits (0 … runSpeed, speedLimit), reduced according to the turn it still has
+   * to make from `heading` (intended direction): to change direction a lot it brakes and the curve
+   * tightens; once the turn is complete it regains its speed.
+   */
+  private cappedTargetSpeed(heading = this.state.heading): number {
+    const capped = Math.min(Math.max(this.targetSpeed, 0), this.config.runSpeed, this.speedLimit);
+    return capped * this.turnSpeedFactor(wrapAngle(this.headingTarget - heading));
+  }
+
+  /**
+   * Fraction of the desired speed with a remaining turn `error` (rad): 1 up to 20°, 1 − turnSlowdown at
+   * 180°.
+   */
+  private turnSpeedFactor(error: number): number {
+    const x = Math.min(Math.max((Math.abs(error) - TURN_SLOWDOWN_START) / (Math.PI - TURN_SLOWDOWN_START), 0), 1);
+    return 1 - this.config.turnSlowdown * x * x * (3 - 2 * x);
+  }
+
+  /**
+   * Distance it would travel before stopping if speed 0 were requested now, with the same braking curve the
+   * body uses (including the `speedEasing` smoothing and the current rate). It is computed by simulating
+   * that curve, so it always matches the real motion.
+   */
+  stoppingDistance(speed = this.state.speed): number {
+    if (!(this.config.speedEasing > 0)) return (speed * speed) / (2 * this.config.deceleration);
+    const h = 1 / 120;
+    let v = speed;
+    let rate = speed === this.state.speed ? this.speedRate : 0;
+    let distance = 0;
+    for (let i = 0; i < 2400 && v > 0; i++) {
+      const next = this.nextSpeed(v, rate, h, 0);
+      distance += ((v + next.speed) / 2) * h;
+      v = next.speed;
+      rate = next.rate;
+    }
+    return distance;
+  }
+
+  /** Recomputes direction, velocity and position from the root and the scalar speed. */
+  private refreshState(): void {
+    const s = this.state;
+    this.root.getWorldQuaternion(this.q);
+    s.forward.copy(this.forwardLocal).applyQuaternion(this.q).setY(0).normalize();
+    s.travel.copy(s.forward);
+    if (s.facingOffset !== 0) s.travel.applyAxisAngle(UP, -s.facingOffset);
+    s.velocity.copy(s.travel).multiplyScalar(s.speed);
+    this.root.getWorldPosition(s.position);
+  }
+
+  /**
+   * Brings the height of the working position towards the ground below it (blend 0–1), looking for it up to
+   * `depth` m below the root (groundProbeDepth by default). If the root has just moved from (`fromX`,
+   * `fromZ`) onto ground higher than `maxStepUp` or lower than `maxStepDown` (or with none), that is a ledge
+   * it can't cross: it goes back there and stops.
+   */
+  private snapToGround(blend: number, depth = this.config.groundProbeDepth, fromX = Number.NaN, fromZ = Number.NaN): void {
+    const p = this.pos;
+    let target = this.groundTarget(depth);
+    let ground = this.rawGround;
+    const moved = Math.hypot(p.x - fromX, p.z - fromZ);
+    // Primero, contra la altura de antes (sin raycast); si parece un desnivel, se confirma con el suelo de
+    // donde venía (el suelo pudo cambiar debajo, p. ej. una plataforma que sube).
+    if (moved > 0 && this.isLedge(this.followed, target, moved)) {
+      const toX = p.x;
+      const toZ = p.z;
+      p.x = fromX;
+      p.z = fromZ;
+      const back = this.groundTarget(depth);
+      if (this.isLedge(back, target, moved)) {
+        target = back;
+        ground = this.rawGround;
+        this.ledge.set(toX - fromX, 0, toZ - fromZ).normalize();
+        this.state.speed = 0;
+        this.state.velocity.set(0, 0, 0);
+        this.speedRate = 0;
+      } else {
+        p.x = toX;
+        p.z = toZ;
+      }
+    }
+    this.followed = target;
+    this.state.grounded = Number.isFinite(target);
+    if (this.state.grounded) {
+      this.state.groundHeight = Number.isNaN(ground) ? target : ground;
+      p.y += (target - p.y) * blend;
+    }
+  }
+
+  /**
+   * Height the root follows at the working position: the ground under it (also left in `rawGround`; NaN if
+   * there is none) or, over stairs, the line over the treads (also where there is no ground under the root,
+   * over the gap between two treads without a riser).
+   */
+  private groundTarget(depth: number): number {
+    const p = this.pos;
+    const { groundProbeHeight } = this.config;
+    this.tmp.set(p.x, p.y + groundProbeHeight, p.z);
+    const hit = this.detector.castDown(this.tmp, groundProbeHeight + depth, this.rootHit);
+    this.rawGround = hit ? this.rootHit.point.y : Number.NaN;
+    return this.groundLine ? this.groundLine(p, this.rawGround) : this.rawGround;
+  }
+
+  /**
+   * Going `distance` m (horizontal) from ground at height `from` to ground at `to` crosses a riser higher than
+   * `maxStepUp` or a drop deeper than `maxStepDown` (or there is no ground at `to`). Without a reference
+   * (`from` NaN), no.
+   */
+  private isLedge(from: number, to: number, distance: number): boolean {
+    if (!Number.isFinite(from)) return false;
+    if (!Number.isFinite(to)) return true;
+    const slack = distance * LEDGE_SLOPE;
+    return to - from > this.config.maxStepUp + slack || from - to > this.config.maxStepDown + slack;
+  }
+}
+
+/** Equivalent angle in (−π, π]. */
+export function wrapAngle(a: number): number {
+  return a - 2 * Math.PI * Math.floor((a + Math.PI) / (2 * Math.PI));
+}
+
+function moveTowards(current: number, target: number, maxDelta: number): number {
+  if (Math.abs(target - current) <= maxDelta) return target;
+  return current + Math.sign(target - current) * maxDelta;
+}
