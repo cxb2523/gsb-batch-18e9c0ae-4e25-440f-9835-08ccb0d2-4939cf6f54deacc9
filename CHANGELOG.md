@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.5 (candidate, not published)
+
+### Fixed
+
+- Apply the source/monochrome color policy at the renderer layer for both WebGL and Canvas2D. `setDocument()` decorates a shallow render document without touching the source entities, and `setOptions()` rebuilds the retained WebGL scene when the policy changes.
+- Keep pan, zoom and `fitScale` when switching color modes or reloading SHX references; SHX additions and removals rebuild the retained scene without resetting the view.
+- Drop retained GPU buffers and render/font state on `clear()` and `destroy()`, and no-op color or SHX changes before a drawing is loaded instead of fabricating an empty scene.
+- Re-assert the viewer's active color policy on unrelated `setCanvasOptions()` calls so theme/contrast changes do not silently revert to source colors.
+
 ## 0.8.4 (candidate, not published)
 
 ### Fixed

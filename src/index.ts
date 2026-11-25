@@ -12,8 +12,8 @@ export { extractCadBom, serializeCadBomCsv, serializeCadBomJson } from './core/b
 export { computeCadDocumentBounds, resolveCadFitBounds, resolveCadSavedViewBounds } from './core/bounds.js';
 export type { CadBoundsOptions } from './core/bounds.js';
 export { createCadSceneDocument } from './core/scene.js';
-export { createCadRenderDocument, readCadColorPolicy } from './core/colorPolicy.js';
-export type { CadColorMode, CadColorPolicy } from './core/colorPolicy.js';
+export { createCadRenderDocument, readCadColorPolicy, resolveCadColorPolicy, resolveCadDocumentColorPolicy, cadColorPolicySignature, mergeCadColorPolicy } from './core/colorPolicy.js';
+export type { CadColorMode, CadColorPolicy, CadColorPolicyOptions, CadResolvedColorPolicy } from './core/colorPolicy.js';
 export { applyByBlockLineTypeInheritance, createDashedCadPrimitives, createDashedCadSegments, resolveCadLinePattern, resolveCadLineTypeReference, transformCadLineTypeGlyph } from './core/linetype.js';
 export type { CadDashedPrimitives, CadLineTypeMarker, ResolvedCadLinePattern, ResolvedCadLinePatternRun } from './core/linetype.js';
 export { CadShxFontRegistry } from './core/shx.js';

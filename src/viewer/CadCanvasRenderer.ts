@@ -1,6 +1,7 @@
-import { applyByBlockColorInheritance, layerVisible, resolveCadColor, resolveFillColor, type CadColorContrastMode } from '../core/color.js';
+import { applyByBlockColorInheritance, layerVisible, resolveCadColor, resolveFillColor, type CadColorContrastMode, type ColorResolveOptions } from '../core/color.js';
 import { computeCadDocumentBounds, resolveCadFitBounds } from '../core/bounds.js';
 import { arcPoints, boundsValid, bulgeToPolylinePoints, clamp, ellipsePoints, emptyBounds, isFinitePoint, xy } from '../core/geometry.js';
+import { cadColorPolicySignature, createCadRenderDocument, mergeCadColorPolicy, resolveCadDocumentColorPolicy, resolveCadColorPolicy, type CadColorMode, type CadResolvedColorPolicy } from '../core/colorPolicy.js';
 import { paintCadText } from '../core/text.js';
 import { cadEntityWorldStrokeWidth, inferEntityKind, isCadPolylineClosed } from '../core/entity.js';
 import { applyByBlockLineTypeInheritance, createDashedCadPrimitives, resolveCadLinePattern, transformCadLineTypeGlyph, type CadLineTypeMarker } from '../core/linetype.js';
@@ -26,6 +27,11 @@ export interface CanvasViewerOptions {
   fitMode?: CadFitMode;
   contrastMode?: CadColorContrastMode;
   minColorContrast?: number;
+
+  /** Preserve authored colors or replace renderable CAD colors with one fixed color. */
+  colorMode?: CadColorMode;
+  /** CSS color used when `colorMode` is `monochrome`. Defaults to the active foreground. */
+  monochromeColor?: string;
 
   /** WebGL renderer: approximate curve tessellation cap for circles/arcs/ellipses. */
   maxCurveSegments?: number;
@@ -54,6 +60,11 @@ export interface ViewState {
   centerY: number;
   scale: number;
 }
+
+/** Fully defaulted renderer options; policy overrides stay optional. */
+export type ResolvedCanvasViewerOptions =
+  Required<Omit<CanvasViewerOptions, 'monochromeColor' | 'colorMode'>>
+  & Pick<CanvasViewerOptions, 'monochromeColor' | 'colorMode'>;
 
 export interface RenderStats {
   total: number;
@@ -84,7 +95,7 @@ export interface ViewChangeEvent {
   bounds: CadBounds;
 }
 
-const DEFAULT_OPTIONS: Required<CanvasViewerOptions> = {
+const DEFAULT_OPTIONS: ResolvedCanvasViewerOptions = {
   background: '#0b1020',
   foreground: '#ffffff',
   showUnsupportedMarkers: false,
@@ -98,6 +109,8 @@ const DEFAULT_OPTIONS: Required<CanvasViewerOptions> = {
   fitMode: 'auto',
   contrastMode: 'adaptive',
   minColorContrast: 2.4,
+  colorMode: undefined,
+  monochromeColor: undefined,
   maxCurveSegments: 96,
   spatialIndexCellCount: 72,
   maxVerticesPerBatch: 65536,
@@ -117,9 +130,12 @@ export class CadCanvasRenderer {
   }
   readonly canvas: HTMLCanvasElement;
   private readonly ctx: CanvasRenderingContext2D;
-  private readonly opts: Required<CanvasViewerOptions>;
+  private opts: ResolvedCanvasViewerOptions;
   private sourceDocument?: CadDocument;
   private document?: CadDocument;
+  /** Source document decorated with the active render color policy. */
+  private renderDocument?: CadDocument;
+  private colorPolicy: CadResolvedColorPolicy = { mode: 'source' };
   private bounds: CadBounds = emptyBounds();
   private view: ViewState = { centerX: 0, centerY: 0, scale: 1 };
   private fitScale = 1;
@@ -139,6 +155,7 @@ export class CadCanvasRenderer {
     this.canvas = canvas;
     this.ctx = ctx;
     this.opts = { ...DEFAULT_OPTIONS, ...options };
+    this.colorPolicy = resolveCadColorPolicy(undefined, this.opts);
     this.canvas.classList.add('cad-viewer-canvas');
     this.bindEvents();
     if (typeof ResizeObserver !== 'undefined') {
@@ -155,6 +172,7 @@ export class CadCanvasRenderer {
   clear(): void {
     this.sourceDocument = undefined;
     this.document = undefined;
+    this.renderDocument = undefined;
     this.bounds = emptyBounds();
     this.view = { centerX: 0, centerY: 0, scale: 1 };
     this.fitScale = 1;
@@ -163,13 +181,18 @@ export class CadCanvasRenderer {
   }
 
   setDocument(document: CadDocument): void {
+    // A render document can already carry a policy in metadata. Explicit
+    // renderer options win over it; the caller-owned source is never edited.
     this.sourceDocument = document;
-    this.document = createCadSceneDocument(document);
-    this.bounds = computeCadDocumentBounds(this.document, this.boundsOptions());
+    this.colorPolicy = resolveCadDocumentColorPolicy(document, this.opts);
+    this.applyColorPolicy();
+    this.bounds = computeCadDocumentBounds(this.document!, this.boundsOptions());
     this.fitToView();
   }
 
   refreshReferences(): void {
+    // Canvas2D resolves SHX glyphs while traversing entities, so a plain
+    // repaint picks up newly supplied references. The current view is untouched.
     this.render();
     this.emitViewChange();
   }
@@ -178,11 +201,17 @@ export class CadCanvasRenderer {
     return this.document;
   }
 
+  /** Render-only document view with the active color policy in metadata. */
+  getRenderDocument(): CadDocument | undefined {
+    return this.renderDocument;
+  }
+
   getSourceDocument(): CadDocument | undefined { return this.sourceDocument; }
 
   setOptions(options: CanvasViewerOptions): void {
     const refit = options.fitMode !== undefined && options.fitMode !== this.opts.fitMode;
-    Object.assign(this.opts, options);
+    this.opts = { ...this.opts, ...options };
+    this.syncColorPolicy(options);
     if (refit && this.document) {
       this.fitToView();
       return;
@@ -191,8 +220,40 @@ export class CadCanvasRenderer {
     this.emitViewChange();
   }
 
-  getOptions(): Required<CanvasViewerOptions> {
+  getOptions(): ResolvedCanvasViewerOptions {
     return { ...this.opts };
+  }
+
+  /** Rebuilds the render document from the source document with the active policy. */
+  private applyColorPolicy(): void {
+    if (!this.sourceDocument) {
+      this.renderDocument = undefined;
+      this.document = undefined;
+      return;
+    }
+    const renderDocument = createCadRenderDocument(this.sourceDocument, {
+      mode: this.colorPolicy.mode,
+      monochromeColor: this.colorPolicy.monochromeColor
+    });
+    this.renderDocument = renderDocument;
+    this.document = createCadSceneDocument(renderDocument);
+  }
+
+  /**
+   * Re-resolves the effective color policy from the current options. Returns
+   * true when it differs from the policy last applied to the render document.
+   * Leaves an unloaded renderer untouched.
+   */
+  private syncColorPolicy(options: CanvasViewerOptions = this.opts): boolean {
+    const next = mergeCadColorPolicy(this.colorPolicy, {
+      colorMode: options.colorMode,
+      monochromeColor: options.monochromeColor
+    });
+    const changed = cadColorPolicySignature(next) !== cadColorPolicySignature(this.colorPolicy);
+    this.colorPolicy = next;
+    if (!changed || !this.sourceDocument) return changed;
+    this.applyColorPolicy();
+    return true;
   }
 
   fitToView(padding = 0.92, mode: CadFitMode = this.opts.fitMode): void {
@@ -392,8 +453,9 @@ export class CadCanvasRenderer {
     const ctx = this.ctx;
     ctx.save();
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    const color = resolveCadColor(entity, this.document, { foreground: this.opts.foreground, background: this.opts.background, trueColorByteOrder: this.opts.trueColorByteOrder, contrastMode: this.opts.contrastMode, minColorContrast: this.opts.minColorContrast });
-    const fillColor = resolveFillColor(entity, this.document, { foreground: this.opts.foreground, background: this.opts.background, trueColorByteOrder: this.opts.trueColorByteOrder, contrastMode: this.opts.contrastMode, minColorContrast: this.opts.minColorContrast }) ?? color;
+    const options = this.colorOptions();
+    const color = resolveCadColor(entity, this.document, options);
+    const fillColor = resolveFillColor(entity, this.document, options) ?? color;
     ctx.strokeStyle = color;
     ctx.fillStyle = fill ? fillColor : color;
     ctx.globalAlpha = clamp(Number(entity.opacity ?? 1), 0, 1);
@@ -488,7 +550,7 @@ export class CadCanvasRenderer {
     if (block && depth < this.opts.maxInsertDepth) {
       const matrix = matrixFromInsert(e, block.basePoint ?? { x: 0, y: 0 });
       for (const child of block.entities) {
-        const inheritedColor = applyByBlockColorInheritance(child, e, this.document, { foreground: this.opts.foreground, background: this.opts.background, trueColorByteOrder: this.opts.trueColorByteOrder, contrastMode: this.opts.contrastMode, minColorContrast: this.opts.minColorContrast });
+        const inheritedColor = applyByBlockColorInheritance(child, e, this.document, this.colorOptions());
         const inherited = applyByBlockLineTypeInheritance(inheritedColor, e, this.document);
         this.drawEntityTracked(transformEntity(inherited, matrix), depth + 1);
       }
@@ -553,7 +615,7 @@ export class CadCanvasRenderer {
         this.ctx.closePath();
       }
     }
-    this.finishFillStroke(Boolean(resolveFillColor(e, this.document, { foreground: this.opts.foreground, background: this.opts.background, trueColorByteOrder: this.opts.trueColorByteOrder, contrastMode: this.opts.contrastMode, minColorContrast: this.opts.minColorContrast })));
+    this.finishFillStroke(Boolean(resolveFillColor(e, this.document, this.colorOptions())));
   }
 
   private drawSpline(e: CadEntity): void {
@@ -653,7 +715,7 @@ export class CadCanvasRenderer {
     const xScale = Number(e.xScale ?? 1);
     ctx.scale((generationFlag & 2 ? -1 : 1) * (Number.isFinite(xScale) && Math.abs(xScale) > 1e-9 ? Math.abs(xScale) : 1), generationFlag & 4 ? -1 : 1);
     const pixelHeight = Math.abs(height) * this.view.scale;
-    ctx.fillStyle = resolveCadColor(e, this.document, { foreground: this.opts.foreground, background: this.opts.background, trueColorByteOrder: this.opts.trueColorByteOrder, contrastMode: this.opts.contrastMode, minColorContrast: this.opts.minColorContrast });
+    ctx.fillStyle = resolveCadColor(e, this.document, this.colorOptions());
     ctx.globalAlpha = clamp(Number(e.opacity ?? 1), 0, 1);
     paintCadText(ctx, e, pixelHeight);
     ctx.restore();
@@ -756,6 +818,26 @@ export class CadCanvasRenderer {
 
   private boundsOptions() {
     return { maxInsertDepth: this.opts.maxInsertDepth, maxCurveSegments: this.opts.maxCurveSegments };
+  }
+
+  /**
+   * Shared color resolution input. The policy is passed explicitly so a
+   * renderer option change takes effect even if the cached render document has
+   * not been replaced yet.
+   */
+  private colorOptions(): ColorResolveOptions {
+    // Fall back to the render document's own policy when this instance was
+    // created without the full lifecycle (e.g. a renderer used as a mixin).
+    const policy = this.colorPolicy ?? resolveCadColorPolicy(this.document, this.opts);
+    return {
+      foreground: this.opts.foreground,
+      background: this.opts.background,
+      trueColorByteOrder: this.opts.trueColorByteOrder,
+      contrastMode: this.opts.contrastMode,
+      minColorContrast: this.opts.minColorContrast,
+      colorMode: policy.mode,
+      monochromeColor: policy.monochromeColor
+    };
   }
 
   private emitViewChange(): void {

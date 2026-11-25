@@ -53,7 +53,14 @@ export class CadViewer {
   private activeNativeLoader?: CadNativeRenderableLoader;
 
   constructor(options: CadViewerOptions = {}) {
-    this.options = { autoFit: true, colorMode: 'source', ...options };
+    // Top-level options are authoritative, but honor a policy supplied through
+    // canvasOptions when the matching top-level option was omitted.
+    this.options = {
+      ...options,
+      autoFit: options.autoFit ?? true,
+      colorMode: options.colorMode ?? options.canvasOptions?.colorMode ?? 'source',
+      monochromeColor: options.monochromeColor ?? options.canvasOptions?.monochromeColor
+    };
     this.externalShxGlyphResolver = options.canvasOptions?.shxGlyphResolver;
     this.shxGlyphResolver = {
       resolveShape: (shapeNumber, fontName) => this.referenceRegistry.resolveShape(shapeNumber, fontName)
@@ -91,6 +98,10 @@ export class CadViewer {
 
     this.renderer = createRenderer(options.renderer ?? 'auto', this.canvas, {
       ...options.canvasOptions,
+      // The viewer's color policy is authoritative: it is forwarded explicitly
+      // so canvasOptions cannot silently override it.
+      colorMode: this.getColorMode(),
+      monochromeColor: this.getMonochromeColor(),
       shxGlyphResolver: this.shxGlyphResolver
     });
     this.renderer.onStats = (stats) => this.options.onRenderStats?.(stats);
@@ -224,7 +235,14 @@ export class CadViewer {
   setCanvasOptions(options: CanvasViewerOptions): void {
     this.options.canvasOptions = { ...(this.options.canvasOptions ?? {}), ...options };
     if (options.shxGlyphResolver) this.externalShxGlyphResolver = options.shxGlyphResolver;
-    this.renderer.setOptions({ ...options, shxGlyphResolver: this.shxGlyphResolver });
+    // Re-assert the viewer's active policy so unrelated canvas option changes
+    // (theme, contrast, …) do not fall back to source colours.
+    this.renderer.setOptions({
+      ...options,
+      colorMode: this.getColorMode(),
+      monochromeColor: this.getMonochromeColor(),
+      shxGlyphResolver: this.shxGlyphResolver
+    });
     if (this.activeNativeLoader) {
       this.activeNativeLoader.setNativeOptions?.({
         ...this.mergeLoadOptions({}),
@@ -407,11 +425,14 @@ export class CadViewer {
       this.activeNativeLoader.setNativeOptions?.(this.mergeLoadOptions({}));
       return;
     }
-    const document = this.lastResult?.document;
-    if (!document) return;
-    const view = this.renderer.getViewState();
-    this.renderer.setDocument(this.createRenderDocument(document));
-    this.renderer.setViewState(view);
+    // The renderer applies the policy to its own source document. This keeps
+    // the parser-owned document untouched and retains the current pan/zoom
+    // across the policy rebuild. The renderer ignores this when nothing is
+    // loaded, so switching before a load cannot fabricate an empty scene.
+    this.renderer.setOptions({
+      colorMode: this.getColorMode(),
+      monochromeColor: this.getMonochromeColor()
+    });
   }
 
   private activateDocumentReferences(document: CadDocument): void {

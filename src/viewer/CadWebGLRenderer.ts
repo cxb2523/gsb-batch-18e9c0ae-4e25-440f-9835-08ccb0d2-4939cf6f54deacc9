@@ -1,5 +1,6 @@
 import { applyByBlockColorInheritance, layerVisible, resolveCadColor, resolveFillColor } from '../core/color.js';
 import { computeCadDocumentBounds, resolveCadFitBounds } from '../core/bounds.js';
+import { cadColorPolicySignature, createCadRenderDocument, mergeCadColorPolicy, resolveCadDocumentColorPolicy, resolveCadColorPolicy, type CadResolvedColorPolicy } from '../core/colorPolicy.js';
 import { arcPoints, boundsValid, bulgeToPolylinePoints, clamp, ellipsePoints, emptyBounds, includePoint, isFinitePoint, xy } from '../core/geometry.js';
 import { cadTextLayoutBounds, layoutCadText, paintCadText, parseCadText, type CadTextLayout, type ParsedCadText } from '../core/text.js';
 import { cadEntityWorldStrokeWidth, inferEntityKind, isCadPolylineClosed } from '../core/entity.js';
@@ -8,7 +9,7 @@ import { createCadSceneDocument } from '../core/scene.js';
 import { EMPTY_SHX_GLYPH_RESOLVER, type CadShxGlyph } from '../core/shx.js';
 import { matrixFromInsert, transformEntity } from '../core/transform.js';
 import type { CadBlock, CadBounds, CadDocument, CadEntity, CadFitMode, CadPathCommand, CadPoint2D, CadPoint3D } from '../core/types.js';
-import type { CanvasViewerOptions, RenderStats, ViewChangeEvent, ViewState } from './CadCanvasRenderer.js';
+import type { CanvasViewerOptions, RenderStats, ResolvedCanvasViewerOptions, ViewChangeEvent, ViewState } from './CadCanvasRenderer.js';
 import { captureCanvasLayers } from './captureCanvas.js';
 
 type GL = WebGLRenderingContext | WebGL2RenderingContext;
@@ -97,7 +98,7 @@ interface ProgramInfo {
   uPointSize: WebGLUniformLocation;
 }
 
-const DEFAULT_WEBGL_OPTIONS: Required<CanvasViewerOptions> = {
+const DEFAULT_WEBGL_OPTIONS: ResolvedCanvasViewerOptions = {
   background: '#0b1020',
   foreground: '#ffffff',
   showUnsupportedMarkers: false,
@@ -111,6 +112,8 @@ const DEFAULT_WEBGL_OPTIONS: Required<CanvasViewerOptions> = {
   fitMode: 'auto',
   contrastMode: 'adaptive',
   minColorContrast: 2.4,
+  colorMode: undefined,
+  monochromeColor: undefined,
   maxCurveSegments: 96,
   spatialIndexCellCount: 72,
   maxVerticesPerBatch: 65536,
@@ -134,9 +137,12 @@ export class CadWebGLRenderer {
   private readonly program: ProgramInfo;
   private readonly eventController = new AbortController();
   private readonly imageCache = new Map<string, HTMLImageElement>();
-  private opts: Required<CanvasViewerOptions>;
+  private opts: ResolvedCanvasViewerOptions;
   private sourceDocument?: CadDocument;
+  /** Source document decorated with the active render color policy. */
+  private renderDocument?: CadDocument;
   private document?: CadDocument;
+  private colorPolicy: CadResolvedColorPolicy = { mode: 'source' };
   private bounds: CadBounds = emptyBounds();
   private view: ViewState = { centerX: 0, centerY: 0, scale: 1 };
   private fitScale = 1;
@@ -160,6 +166,7 @@ export class CadWebGLRenderer {
     this.gl = gl;
     this.program = createProgramInfo(gl);
     this.opts = { ...DEFAULT_WEBGL_OPTIONS, ...options };
+    this.colorPolicy = resolveCadColorPolicy(undefined, this.opts);
     this.canvas.classList.add('cad-viewer-canvas', 'cad-viewer-webgl-canvas');
     this.createOverlayCanvas();
     this.bindEvents();
@@ -179,11 +186,18 @@ export class CadWebGLRenderer {
     this.resizeObserver?.disconnect();
     this.cancelScheduledRender();
     this.disposeScene();
+    // Drop the policy-decorated views so a destroyed renderer cannot retain
+    // scene text/glyph state or hand out a stale render document.
+    this.sourceDocument = undefined;
+    this.renderDocument = undefined;
+    this.document = undefined;
+    this.imageCache.clear();
     this.overlayCanvas?.remove();
   }
 
   clear(): void {
     this.sourceDocument = undefined;
+    this.renderDocument = undefined;
     this.document = undefined;
     this.bounds = emptyBounds();
     this.view = { centerX: 0, centerY: 0, scale: 1 };
@@ -195,23 +209,26 @@ export class CadWebGLRenderer {
 
   setDocument(document: CadDocument): void {
     this.sourceDocument = document;
-    this.document = createCadSceneDocument(document);
-    this.bounds = computeCadDocumentBounds(this.document, this.boundsOptions());
-    this.disposeScene();
-    const cpuScene = buildCpuScene(this.document, this.opts, this.bounds);
-    this.scene = uploadScene(this.gl, cpuScene);
-    this.stats = createStatsFromScene(this.scene, 0);
+    // A render document may already carry a color policy in metadata; explicit
+    // renderer options win over it. The source document itself is never edited.
+    this.colorPolicy = resolveCadDocumentColorPolicy(document, this.opts);
+    this.syncRenderDocument();
+    this.bounds = computeCadDocumentBounds(this.document!, this.boundsOptions());
+    this.rebuildScene();
     this.fitToView();
   }
 
   refreshReferences(): void {
-    if (!this.document) return;
+    if (!this.document) {
+      this.render();
+      this.emitViewChange();
+      return;
+    }
     const view = { ...this.view };
     const fitScale = this.fitScale;
-    this.disposeScene();
-    const cpuScene = buildCpuScene(this.document, this.opts, this.bounds);
-    this.scene = uploadScene(this.gl, cpuScene);
-    this.stats = createStatsFromScene(this.scene, 0);
+    this.syncRenderDocument();
+    this.bounds = computeCadDocumentBounds(this.document!, this.boundsOptions());
+    this.rebuildScene();
     this.view = view;
     this.fitScale = fitScale;
     this.render();
@@ -222,14 +239,34 @@ export class CadWebGLRenderer {
     return this.document;
   }
 
+  /** Render-only document view with the active color policy in metadata. */
+  getRenderDocument(): CadDocument | undefined {
+    return this.renderDocument;
+  }
+
   getSourceDocument(): CadDocument | undefined { return this.sourceDocument; }
 
   setOptions(options: CanvasViewerOptions): void {
     const rebuildRequired = requiresSceneRebuild(this.opts, options);
     const refit = options.fitMode !== undefined && options.fitMode !== this.opts.fitMode;
     this.opts = { ...this.opts, ...options };
-    if (rebuildRequired && (this.sourceDocument ?? this.document)) {
-      this.setDocument(this.sourceDocument ?? this.document!);
+    const policyChanged = this.syncColorPolicy(options);
+    if ((rebuildRequired || policyChanged) && this.sourceDocument) {
+      // The source document is authoritative: rebuild the render-only policy
+      // view and GPU scene without resetting pan/zoom.
+      const view = { ...this.view };
+      const fitScale = this.fitScale;
+      this.syncRenderDocument();
+      this.bounds = computeCadDocumentBounds(this.document!, this.boundsOptions());
+      this.rebuildScene();
+      if (refit) {
+        this.fitToView();
+      } else {
+        this.view = view;
+        this.fitScale = fitScale;
+        this.render();
+        this.emitViewChange();
+      }
       return;
     }
     if (refit && this.document) {
@@ -240,8 +277,50 @@ export class CadWebGLRenderer {
     this.emitViewChange();
   }
 
-  getOptions(): Required<CanvasViewerOptions> {
+  getOptions(): ResolvedCanvasViewerOptions {
     return { ...this.opts };
+  }
+
+  /** Re-derives the policy-decorated render document from the source document. */
+  private syncRenderDocument(): void {
+    if (!this.sourceDocument) {
+      this.renderDocument = undefined;
+      this.document = undefined;
+      return;
+    }
+    const renderDocument = createCadRenderDocument(this.sourceDocument, {
+      mode: this.colorPolicy.mode,
+      monochromeColor: this.colorPolicy.monochromeColor
+    });
+    this.renderDocument = renderDocument;
+    this.document = createCadSceneDocument(renderDocument);
+  }
+
+  /**
+   * Re-resolves the effective color policy by overlaying the supplied options on
+   * the currently applied policy. Returns true when it changed.
+   */
+  private syncColorPolicy(options: CanvasViewerOptions = this.opts): boolean {
+    const current = this.colorPolicy ?? { mode: 'source' as const };
+    const next = mergeCadColorPolicy(current, {
+      colorMode: options.colorMode,
+      monochromeColor: options.monochromeColor
+    });
+    const changed = cadColorPolicySignature(next) !== cadColorPolicySignature(current);
+    this.colorPolicy = next;
+    return changed;
+  }
+
+  /** Drops the retained GPU buffers and uploads a fresh scene. */
+  private rebuildScene(): void {
+    this.disposeScene();
+    if (!this.document) {
+      this.stats = { total: 0, drawn: 0, skipped: 0, byType: {}, unsupported: {}, renderElapsedMs: 0, backend: 'webgl', primitiveCount: 0, visiblePrimitiveCount: 0, culledPrimitiveCount: 0, gpuMemoryBytes: 0, buildElapsedMs: 0 };
+      return;
+    }
+    const cpuScene = buildCpuScene(this.document, this.opts, this.bounds, this.colorPolicy);
+    this.scene = uploadScene(this.gl, cpuScene);
+    this.stats = createStatsFromScene(this.scene, 0);
   }
 
   fitToView(padding = 0.92, mode: CadFitMode = this.opts.fitMode): void {
@@ -758,12 +837,12 @@ function createBuffer(gl: GL, data: Float32Array | Uint8Array): WebGLBuffer {
   return buffer;
 }
 
-function buildCpuScene(document: CadDocument, opts: Required<CanvasViewerOptions>, bounds: CadBounds): CpuScene {
+function buildCpuScene(document: CadDocument, opts: ResolvedCanvasViewerOptions, bounds: CadBounds, policy?: CadResolvedColorPolicy): CpuScene {
   const started = performance.now();
   const origin = boundsValid(bounds)
     ? { x: (bounds.minX + bounds.maxX) / 2, y: (bounds.minY + bounds.maxY) / 2 }
     : { x: 0, y: 0 };
-  const builder = new CpuSceneBuilder(document, opts, bounds, origin);
+  const builder = new CpuSceneBuilder(document, opts, bounds, origin, policy ?? resolveCadColorPolicy(document, opts));
   for (const entity of document.entities) builder.addEntityTracked(entity, 0);
   const scene = builder.finalize();
   scene.buildElapsedMs = performance.now() - started;
@@ -782,7 +861,13 @@ class CpuSceneBuilder {
   private readonly maxVerticesPerBatch: number;
   private primitiveCount = 0;
 
-  constructor(private readonly document: CadDocument, private readonly opts: Required<CanvasViewerOptions>, private readonly bounds: CadBounds, private readonly origin: CadPoint2D) {
+  constructor(
+    private readonly document: CadDocument,
+    private readonly opts: ResolvedCanvasViewerOptions,
+    private readonly bounds: CadBounds,
+    private readonly origin: CadPoint2D,
+    private readonly colorPolicy: CadResolvedColorPolicy = { mode: 'source' }
+  ) {
     const width = boundsValid(bounds) ? Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, 1e-9) : 1;
     this.tileSize = opts.enableSpatialIndex ? width / Math.max(8, opts.spatialIndexCellCount) : Number.POSITIVE_INFINITY;
     this.maxVerticesPerBatch = Math.max(4096, Math.floor(opts.maxVerticesPerBatch));
@@ -1173,7 +1258,18 @@ class CpuSceneBuilder {
   }
 
   private colorOptions() {
-    return { foreground: this.opts.foreground, background: this.opts.background, trueColorByteOrder: this.opts.trueColorByteOrder, contrastMode: this.opts.contrastMode, minColorContrast: this.opts.minColorContrast };
+    // Fall back to the render document's own policy when this scene builder was
+    // constructed without an explicit policy argument.
+    const policy = this.colorPolicy ?? resolveCadColorPolicy(this.document, this.opts);
+    return {
+      foreground: this.opts.foreground,
+      background: this.opts.background,
+      trueColorByteOrder: this.opts.trueColorByteOrder,
+      contrastMode: this.opts.contrastMode,
+      minColorContrast: this.opts.minColorContrast,
+      colorMode: policy.mode,
+      monochromeColor: policy.monochromeColor
+    };
   }
 
   private markSkipped(type: string): void {
@@ -1319,7 +1415,7 @@ function boundsIntersects(a: CadBounds, b: CadBounds): boolean {
   return a.minX <= b.maxX && a.maxX >= b.minX && a.minY <= b.maxY && a.maxY >= b.minY;
 }
 
-function requiresSceneRebuild(current: Required<CanvasViewerOptions>, next: CanvasViewerOptions): boolean {
+function requiresSceneRebuild(current: ResolvedCanvasViewerOptions, next: CanvasViewerOptions): boolean {
   return next.trueColorByteOrder !== undefined && next.trueColorByteOrder !== current.trueColorByteOrder
     || next.contrastMode !== undefined && next.contrastMode !== current.contrastMode
     || next.minColorContrast !== undefined && next.minColorContrast !== current.minColorContrast
