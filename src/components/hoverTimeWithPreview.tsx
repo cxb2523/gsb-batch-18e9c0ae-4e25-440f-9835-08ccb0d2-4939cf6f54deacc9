@@ -35,25 +35,41 @@ export const HoverTimeWithPreview: React.FC<Props> = ({
   previewThumbnails,
 }) => {
   const hoverTimeElement = useRef<HTMLDivElement>(null);
-  const preloadedThumbnails = useRef<PreviewThumbnail[]>(undefined);
+  /** Content keys of sprite collections that have already been warmed up. */
+  const preloadedKeys = useRef<Set<string>>(new Set());
   const hoverTimeClassName = isThumbActive ? 'hover-time active' : 'hover-time';
 
-  /** Warm up every sprite sheet on the first hover so scrubbing does not flicker. */
+  /**
+   * Content signature of the distinct sprite URLs in the current collection.
+   * Computed on every render (rather than memoized on the array reference) so
+   * an in-place collection change is observed as well.
+   */
+  const preloadKey = previewThumbnails
+    ? JSON.stringify([...new Set(previewThumbnails.map(({ url }) => url))])
+    : undefined;
+
+  /**
+   * Warm up every sprite sheet once the preview is first needed, and warm up
+   * collections whose URL content has changed. A given content key is only
+   * warmed once, so rerenders with the same collection (including new array
+   * identities) and hover toggles never create duplicate Images.
+   */
   useEffect(() => {
     if (
       !isThumbActive ||
       !previewThumbnails ||
-      preloadedThumbnails.current === previewThumbnails
+      preloadKey === undefined ||
+      preloadedKeys.current.has(preloadKey)
     ) {
       return;
     }
 
-    preloadedThumbnails.current = previewThumbnails;
+    preloadedKeys.current.add(preloadKey);
 
     new Set(previewThumbnails.map(({ url }) => url)).forEach((url) => {
       new Image().src = url;
     });
-  }, [isThumbActive, previewThumbnails]);
+  }, [isThumbActive, preloadKey, previewThumbnails]);
 
   const hoverTimePosition = getHoverTimePosition(
     seekHoverPosition,
