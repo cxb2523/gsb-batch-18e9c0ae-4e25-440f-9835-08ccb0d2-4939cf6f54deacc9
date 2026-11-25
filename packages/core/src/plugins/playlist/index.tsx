@@ -46,7 +46,18 @@ export interface PlaylistOptions {
  */
 export const playlist = definePlugin("playlist", (options: PlaylistOptions) => {
   const { start = 0, loop = false, countdown = 5 } = options;
+  // The single owner of "what should play next". Every switch — the countdown
+  // reaching zero, a manual next/previous, or a new queue — goes through
+  // `select`, which moves this token on, so a countdown started by an earlier
+  // entry can never fire a late select against the entry that replaced it.
   let timer: ReturnType<typeof setInterval> | undefined;
+  let generation = 0;
+
+  const clearCountdown = () => {
+    if (timer === undefined) return;
+    clearInterval(timer);
+    timer = undefined;
+  };
 
   return {
     state: () => ({
@@ -63,9 +74,13 @@ export const playlist = definePlugin("playlist", (options: PlaylistOptions) => {
     }),
     attrs: { "data-up-next": (state) => state.upNext },
     commands(context) {
+      // One stop for every path out of the up-next card. It clears the interval
+      // itself, so a call can never leave a timer running behind it.
       const stopCountdown = () => {
-        clearInterval(timer);
-        context.set({ remaining: null, upNext: false });
+        clearCountdown();
+        if (context.state().remaining !== null || context.state().upNext) {
+          context.set({ remaining: null, upNext: false });
+        }
       };
       const target = (index: number) => {
         const { length } = context.state().items;
@@ -75,10 +90,18 @@ export const playlist = definePlugin("playlist", (options: PlaylistOptions) => {
       const select = (index: number, play = true) => {
         const item = context.state().items[index];
         if (!item) return;
+        // Any switch supersedes the countdown and whatever switch came before it.
         stopCountdown();
+        generation += 1;
         context.set({ index });
         context.commands.setSource(item.src);
-        if (!play) return;
+        if (!play) {
+          // A play parked while an earlier item loaded mustn't start this one.
+          if (!context.isLocked("pause")) context.commands.pause();
+          return;
+        }
+        // Not awaited: play() has to stay inside the viewer's gesture, and the kernel
+        // parks it until the load finishes. A newer select's pause()/load cancels it.
         void context.commands.play();
         if (item.title) context.player.announce(item.title);
       };
@@ -106,20 +129,38 @@ export const playlist = definePlugin("playlist", (options: PlaylistOptions) => {
     },
     setup(context, scope) {
       const handle = () => context.player.plugin(playlist).commands;
-      scope.add(() => clearInterval(timer));
+
+      // Every cleanup path clears the interval, so it can never outlive the
+      // player, a source change, or the countdown it belonged to.
+      scope.add(() => {
+        clearCountdown();
+        generation += 1;
+      });
 
       // The queue decides what plays, so this wins over a `src` on the player.
       const item = context.state().items[context.state().index];
       if (item) context.commands.setSource(item.src);
 
+      // A source change (a new select, an external setSource, or a reload) makes
+      // any running countdown stale: the current item is no longer the one that ended.
+      context.watch(
+        scope,
+        (media) => media.source,
+        (_source, previous) => {
+          if (previous !== null) clearCountdown();
+        }
+      );
+
       context.watch(
         scope,
         (media) => media.ended,
         (ended) => {
-          clearInterval(timer);
+          clearCountdown();
           const next = handle().nextIndex();
           if (!ended || next === null) {
-            context.set({ remaining: null, upNext: false });
+            if (context.state().remaining !== null || context.state().upNext) {
+              context.set({ remaining: null, upNext: false });
+            }
             return;
           }
           if (countdown === 0) {
@@ -128,7 +169,14 @@ export const playlist = definePlugin("playlist", (options: PlaylistOptions) => {
           }
           context.set({ upNext: true, remaining: countdown });
           if (countdown === null) return;
+          // Pinned to this entry: a select, cancel, source change, or unmount moves
+          // the generation on, so this closure can never fire a late select.
+          const claimed = generation;
           timer = setInterval(() => {
+            if (claimed !== generation) {
+              clearCountdown();
+              return;
+            }
             const remaining = (context.state().remaining ?? 1) - 1;
             if (remaining > 0) context.set({ remaining });
             else handle().select(next);
