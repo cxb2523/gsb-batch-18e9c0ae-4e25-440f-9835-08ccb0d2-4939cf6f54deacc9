@@ -99,7 +99,8 @@ node tools/render.mjs --draft && node tools/encode.mjs --draft   # 之后在预�
 | `node tools/levels.mjs` | 自动平衡各时代的响度 → `audio/levels.json` |
 | `node tools/encode.mjs [--draft]` | 帧 + 音频 → `out/*.mp4` |
 | `node tools/cover.mjs [--aspect 4:3]` | 生成封面 → `out/pelican-test_cover.png` 或 `out/pelican-test_cover_4x3.png` |
-| `node tools/check.mjs` | 检查禁用 API、骑行与接缝约定、过框节拍表，以及确定性（同一帧两次渲染逐像素一致） |
+| `node tools/check.mjs` | 检查禁用 API、骑行与接缝约定、过框节拍表，以及确定性（同一帧两次渲染逐像素一致）。`--quick` 只跑前三项约定，不做双浏览器截图比对 |
+| `node tools/lifecycle-check.mjs` | 本地样例：同一场景并发初始化只执行一次、按距离卸载后重入可重新就绪、渲染不触碰已释放的烘焙缓存、接缝两侧共享骑手状态与镜头 |
 
 完整成片：`node tools/render.mjs && node tools/audio.mjs && node tools/encode.mjs` → `out/pelican-test_1080p60.mp4`。
 

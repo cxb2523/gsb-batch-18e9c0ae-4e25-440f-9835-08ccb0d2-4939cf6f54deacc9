@@ -19,10 +19,14 @@ const TILE = 1024;
 export class Film {
   constructor(scenes) {
     this.scenes = scenes;
-    this.inited = new Set();
+    this.inited = new Set();        // j whose scene is fully initialised and renderable
+    this.initing = new Map();       // j → shared in-flight init promise (concurrent callers await one run)
+    this.detached = new Map();      // j → init promise invalidated by an unload while still running
+    this.initGen = new Map();       // j → generation token, bumped on unload to invalidate a stale init
     this.tiles = new Map();          // j → { 1024: fb, 512: fb, 256: fb }
     this.errors = new Map();
     this.debug = false;
+    this._frameState = null;        // single-slot memo for frameState(t)
   }
 
   setup() {
@@ -38,6 +42,18 @@ export class Film {
   camera(t) {
     if (t >= TL.OUTRO_START) return OUT.outroCamera(t, storyCamera(t, this.scenes));
     return storyCamera(t, this.scenes);
+  }
+
+  /**
+   * The ONE camera + rider state every panel of a frame is composited through.
+   * Memoised for the latest t so repeated requests for the same frame observe
+   * reference-identical state; different t recomputes. Pure function of t otherwise.
+   */
+  frameState(t) {
+    if (this._frameState && this._frameState.t === t) return this._frameState;
+    const fs = { t, cam: this.camera(t), rider: this.rider(t) };
+    this._frameState = fs;
+    return fs;
   }
 
   /** Rider state, placement (in the owning panel) and pose at time t. */
@@ -73,29 +89,84 @@ export class Film {
   }
 
   // ------------------------------------------------------------ lifecycle
-  async initScene(j) {
-    if (this.inited.has(j)) return;
-    const sc = this.sceneOf(j);
-    K._state.scenePrefix = sc.id;
-    try {
-      if (sc.init) await sc.init(K, { index: j, scene: sc });
-    } catch (e) {
-      this.err(sc, e);
-      sc.loadError = String(e.message || e);
-      sc.render = sc.fallback || sc.render;
+  /**
+   * Ensure scene j is initialised and renderable.
+   *
+   * Concurrency contract: many callers may request the same scene at once —
+   * sc.init runs AT MOST ONCE per generation and every caller receives the same
+   * promise. After unloadScene() the next call starts a fresh generation and
+   * initialises again, so distance-based unload/re-entry keeps working.
+   */
+  initScene(j) {
+    if (this.inited.has(j)) return Promise.resolve();
+    const live = this.initing.get(j);
+    if (live) return live;                       // share the in-flight initialisation
+
+    const gen = this.initGen.get(j) || 0;
+    const staleTail = this.detached.get(j) || null;
+
+    const p = (async () => {
+      // Only the unusual unload-mid-init → immediate re-entry path has a stale run
+      // to wait for, so its resources are released before the new run starts.
+      if (staleTail) { try { await staleTail; } catch {} }
+      if (this.inited.has(j)) return;
+      const sc = this.sceneOf(j);
+      K._state.scenePrefix = sc.id;
+      try {
+        if (sc.init) await sc.init(K, { index: j, scene: sc });
+      } catch (e) {
+        this.err(sc, e);
+        sc.loadError = String(e.message || e);
+        sc.render = sc.fallback || sc.render;
+      }
+      // An unload happened during the await: this generation is stale. Release the
+      // GPU resources it just built and never publish it as ready, so a render can
+      // never observe a half-dead / released cache for an "inited" scene.
+      if ((this.initGen.get(j) || 0) !== gen) {
+        try { sc.dispose?.(K); } catch {}
+        K.dropBakes(sc.id);
+        return;
+      }
+      if (this.initing.get(j) === p) this.initing.delete(j);
+      this.inited.add(j);
+    })();
+
+    this.initing.set(j, p);
+    return p;
+  }
+
+  /**
+   * Tear one scene down: run its dispose hook, drop its keyed bake cache and
+   * clear the ready flag. Safe to call on a scene that is ready, initialising or
+   * never initialised, and idempotent. An in-flight init is invalidated by a
+   * generation bump and releases its own resources when it settles.
+   * Returns true when a ready scene was unloaded by this call.
+   */
+  unloadScene(j) {
+    this.initGen.set(j, (this.initGen.get(j) || 0) + 1);
+    const live = this.initing.get(j);
+    this.initing.delete(j);
+    const wasReady = this.inited.delete(j);
+    if (wasReady) {
+      // Ready scene: nothing is initialising, tear down synchronously.
+      const sc = this.sceneOf(j);
+      try { sc.dispose?.(K); } catch {}
+      K.dropBakes(sc.id);
+    } else if (live) {
+      // Initialising: detach the promise so an immediate re-entry can serialise
+      // behind the stale run; drop the bookkeeping once that run settles.
+      this.detached.set(j, live);
+      live.catch(() => {}).then(() => { if (this.detached.get(j) === live) this.detached.delete(j); });
     }
-    this.inited.add(j);
+    // Not ready and no live run: never initialised, so there is nothing to release.
+    // Either way j is no longer `inited`, hence renders skip it.
+    return wasReady;
   }
 
   unloadFar(center) {
     for (const j of [...this.inited]) {
       if (j < 0) continue;
-      if (Math.abs(j - center) > 3) {
-        const sc = this.sceneOf(j);
-        try { sc.dispose?.(K); } catch {}
-        K.dropBakes(sc.id);
-        this.inited.delete(j);
-      }
+      if (Math.abs(j - center) > 3) this.unloadScene(j);
     }
   }
 
@@ -216,8 +287,9 @@ export class Film {
   }
 
   drawStory(t) {
-    const cam = this.camera(t);
-    const R = this.rider(t);
+    // One camera + one rider state for the whole frame, shared by every panel
+    // (the two sides of each seam therefore place the same rig identically).
+    const { cam, rider: R } = this.frameState(t);
     const vis = this.visibleStory(cam);
     this.wallLight(cam, vis);
     for (const j of vis) {
