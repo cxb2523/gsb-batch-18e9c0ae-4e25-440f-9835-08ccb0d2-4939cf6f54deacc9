@@ -321,8 +321,8 @@ declare class Gapless5FileList {
     getPlaylistIndex: (index: any) => any;
     loadableTracks: () => Set<any>;
     updateLoading: () => void;
-    add: (index: any, audioPath: any) => void;
-    remove: (index: any) => void;
+    add: (playIndex: any, audioPath: any) => void;
+    remove: (playIndex: any) => void;
 }
 declare function Gapless5Source(parentPlayer: any, parentLog: any, inAudioPath: any): void;
 declare class Gapless5Source {
