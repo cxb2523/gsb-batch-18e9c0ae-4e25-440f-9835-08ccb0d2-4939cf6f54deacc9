@@ -39,6 +39,9 @@ interface TrajectoryPanelProps {
   mobilityHandover: HandoverAnalysis | null;
   solveError: string;
   backendOnline: boolean;
+  // Optional: click an "All Transmitters" row to focus that Tx's 3D rays.
+  playbackFocusTxId?: string | null;
+  onPlaybackFocusTx?: (txId: string | null) => void;
 }
 
 // 3GPP TS 38.331 timeToTrigger values (ms), abbreviated to the common ones.
@@ -74,6 +77,8 @@ export function TrajectoryPanel({
   mobilityHandover,
   solveError,
   backendOnline,
+  playbackFocusTxId,
+  onPlaybackFocusTx,
 }: TrajectoryPanelProps) {
   const [isSimulatingMobility, setIsSimulatingMobility] = useState(false);
   const [mobilityStep, setMobilityStep] = useState(0);
@@ -96,7 +101,12 @@ export function TrajectoryPanel({
     setMobilityStep(0);
     if (mobilitySteps.length > 0) {
       stopMobilityPlayback();
+      // The panel unmounts when leaving Trajectory mode, so a re-entry would
+      // otherwise show the step-1 metrics/scrubber without a matching 3D
+      // frame. Re-emit step 0 so scene rays and indicators agree.
+      applyMobilityFrame(0);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mobilitySteps]);
 
   useEffect(() => {
@@ -484,18 +494,38 @@ export function TrajectoryPanel({
                     <span className="text-[11px] text-slate-600 font-bold mb-0.5">All Transmitters · RSS @ this waypoint</span>
                     {perTx.map((t) => {
                       const isServing = t.txId === step.servingTxId;
+                      const isFocused = (playbackFocusTxId ?? step.servingTxId ?? null) === t.txId;
                       return (
-                        <div key={t.txId} className="flex items-center justify-between text-[12px] font-mono">
+                        <button
+                          type="button"
+                          key={t.txId}
+                          data-testid="mobility-pertx-row"
+                          data-tx-id={t.txId}
+                          data-serving={isServing ? 'true' : 'false'}
+                          data-emphasized={isFocused ? 'true' : 'false'}
+                          data-has-paths={t.numPaths > 0 ? 'true' : 'false'}
+                          title="在 3D 视图高亮该发射机射线 / focus this Tx's rays"
+                          onClick={() =>
+                            onPlaybackFocusTx?.(isFocused && playbackFocusTxId != null ? null : t.txId)
+                          }
+                          className={`flex items-center justify-between text-[12px] font-mono rounded px-1 py-0.5 -mx-1 text-left w-full border-0 cursor-pointer ${
+                            isFocused ? 'bg-[#f8f1ec]' : 'bg-transparent hover:bg-slate-50'
+                          }`}
+                        >
                           <span className={isServing ? 'font-bold text-[#cc785c]' : 'text-slate-700'}>
                             {isServing ? '▶ ' : '  '}{t.txName}
                           </span>
                           <span className="flex items-center gap-2">
-                            <span className={t.losStatus === 'LOS' ? 'text-[#5f7f5a]' : 'text-slate-400'}>{t.losStatus}</span>
+                            {t.numPaths > 0 ? (
+                              <span className={t.losStatus === 'LOS' ? 'text-[#5f7f5a]' : 'text-slate-400'}>{t.losStatus}</span>
+                            ) : (
+                              <span className="text-slate-400 italic" data-panel-no-path="" title="无路径 · No path from this Tx at this waypoint">无路径</span>
+                            )}
                             <span className={`font-bold ${t.receivedPowerDbm > -90 ? 'text-[#141413]' : 'text-slate-400'}`}>
                               {t.receivedPowerDbm > -200 ? `${t.receivedPowerDbm.toFixed(1)} dBm` : '—'}
                             </span>
                           </span>
-                        </div>
+                        </button>
                       );
                     })}
                   </div>

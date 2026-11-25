@@ -56,6 +56,11 @@ export interface MobilityStep {
   losStatus: 'LOS' | 'NLOS';
   // Rays from every transmitter to this waypoint (each tagged with its txId).
   paths: PropagationPath[];
+  // Same rays split per transmitter: txId -> that Tx's ray set for this step.
+  // Optional on the wire (the backend sends the tagged union in `paths`); the
+  // client normalizes every selected step through `withRaysByTx` so replay
+  // rendering/legend can consume one ray collection per Tx.
+  raysByTx?: Record<string, PropagationPath[]>;
   // Best-server transmitter + the per-Tx breakdown behind the scalar KPIs.
   servingTxId?: string | null;
   servingTxName?: string | null;

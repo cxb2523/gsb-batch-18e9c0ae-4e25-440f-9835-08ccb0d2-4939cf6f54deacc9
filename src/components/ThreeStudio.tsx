@@ -3,15 +3,21 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { Line2 } from 'three/examples/jsm/lines/Line2.js';
+import { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js';
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
 import { BuildingFootprint, GeoAnchor, Transmitter, Receiver, PropagationPath, ENUVector } from '../types';
 import { cn } from '../lib/utils';
 import { enuToLatLon, isPointInPolygon } from '../utils';
 import { RadioMapGrid } from '../types';
 import { ColormapName, sampleColormap } from '../lib/colormaps';
-import { Compass, Activity, Camera } from 'lucide-react';
+import { buildTxRayGroups } from '../lib/playbackRays';
+import type { TxRayGroup } from '../lib/playbackRays';
+import type { MobilityStep } from '../api';
+import { Compass, Activity, Camera, MousePointerClick } from 'lucide-react';
 
 // Sample the selected colormap at t in [0,1] into `out`.
 function colormapColor(name: ColormapName, t: number, out: THREE.Color): THREE.Color {
@@ -173,6 +179,11 @@ interface ThreeStudioProps {
   mobilityRxPosition: ENUVector | null;
   trajectoryPoints: { lat: number; lon: number; enu: { x: number; y: number; z: number } }[];
   setTrajectoryPoints: (pts: { lat: number; lon: number; enu: { x: number; y: number; z: number } }[]) => void;
+  // Active mobility replay step (carries every Tx's ray set + servingTxId).
+  playbackStep?: MobilityStep | null;
+  // Manual legend focus; null = emphasize the step's own serving transmitter.
+  playbackFocusTxId?: string | null;
+  onPlaybackFocusTxChange?: (txId: string | null) => void;
 }
 
 // Map ENU Vector to Three.js vector
@@ -209,7 +220,10 @@ export function ThreeStudio({
   setShowOutlines,
   mobilityRxPosition,
   trajectoryPoints,
-  setTrajectoryPoints
+  setTrajectoryPoints,
+  playbackStep,
+  playbackFocusTxId,
+  onPlaybackFocusTxChange
 }: ThreeStudioProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -249,6 +263,8 @@ export function ThreeStudio({
     mobilityRxPosition,
     trajectoryPoints,
     setTrajectoryPoints,
+    playbackStep,
+    playbackFocusTxId,
     onTxUpdate,
     onRxUpdate,
     setPlacementMode
@@ -280,11 +296,13 @@ export function ThreeStudio({
       mobilityRxPosition,
       trajectoryPoints,
       setTrajectoryPoints,
+      playbackStep,
+      playbackFocusTxId,
       onTxUpdate,
       onRxUpdate,
       setPlacementMode
     };
-  }, [buildings, anchor, tx, rx, txs, rxs, activeTxId, activeRxId, paths, matrixPaths, showRaysOnHeatmap, radioMap, rmColormap, rmAutoRange, rmVmin, rmVmax, placementMode, activeMode, cameraMode, showOutlines, pathDrawingMode, mobilityRxPosition, trajectoryPoints, setTrajectoryPoints, onTxUpdate, onRxUpdate, setPlacementMode]);
+  }, [buildings, anchor, tx, rx, txs, rxs, activeTxId, activeRxId, paths, matrixPaths, showRaysOnHeatmap, radioMap, rmColormap, rmAutoRange, rmVmin, rmVmax, placementMode, activeMode, cameraMode, showOutlines, pathDrawingMode, mobilityRxPosition, trajectoryPoints, setTrajectoryPoints, playbackStep, playbackFocusTxId, onTxUpdate, onRxUpdate, setPlacementMode]);
 
   useEffect(() => {
     if (!containerRef.current || !canvasRef.current) return;
@@ -831,8 +849,118 @@ export function ThreeStudio({
     }
 
     // 8. PROPAGATION RAY PATH LINES (LOS & bounces)
+
+    // Draw one Tx's ray set for a replay step. The whole group is parented to
+    // `pathsGroup`, so the existing clearGroup(pathsGroup) + dispose path owns
+    // every geometry/material created here — nothing is tracked elsewhere.
+    function addPlaybackTxRayGroup(group: TxRayGroup, resolution: { w: number; h: number }) {
+      const txGroup = new THREE.Group();
+      txGroup.name = `playback-tx-rays:${group.txId}`;
+      txGroup.userData = {
+        rayLayer: 'playback-tx-rays',
+        txId: group.txId,
+        color: group.cssColor,
+        emphasized: group.emphasized,
+        serving: group.serving,
+        hasPaths: group.hasPaths,
+      };
+
+      const strong = group.emphasized;
+      const lineOpacity = strong ? 1.0 : 0.3;
+      const markerOpacity = strong ? 0.95 : 0.4;
+
+      group.paths.forEach((path, pathIndex) => {
+        const points = path.points.map(enuToThree);
+        if (points.length === 0) return;
+
+        if (strong) {
+          // Real screen-space thick line (WebGL linewidth is ignored on most
+          // platforms for THREE.Line): a soft wide underlay + crisp core make
+          // the serving/focused Tx's rays bold and unmistakable.
+          const flat: number[] = [];
+          for (const p of points) flat.push(p.x, p.y, p.z);
+
+          const makeFatLine = (widthPx: number, opacity: number, role: 'halo' | 'core') => {
+            const geom = new LineGeometry();
+            geom.setPositions(flat);
+            const mat = new LineMaterial({
+              color: group.color,
+              linewidth: widthPx,
+              transparent: true,
+              opacity,
+              depthWrite: false,
+            });
+            mat.resolution.set(resolution.w, resolution.h);
+            const line = new Line2(geom, mat);
+            line.userData = {
+              rayLayer: 'playback-tx-rays',
+              txId: group.txId,
+              emphasized: true,
+              serving: group.serving,
+              kind: 'fat-line',
+              role,
+              pathId: path.id ?? pathIndex,
+            };
+            txGroup.add(line);
+          };
+          makeFatLine(9, 0.16, 'halo'); // glow/halo
+          makeFatLine(3.6, 0.98, 'core'); // bold core
+        } else {
+          // Other transmitters stay visible but visually weakened.
+          const geom = new THREE.BufferGeometry().setFromPoints(points);
+          const mat = new THREE.LineBasicMaterial({
+            color: group.color,
+            transparent: true,
+            opacity: lineOpacity,
+            depthWrite: false,
+          });
+          const line = new THREE.Line(geom, mat);
+          line.userData = {
+            rayLayer: 'playback-tx-rays',
+            txId: group.txId,
+            emphasized: false,
+            serving: group.serving,
+            kind: 'line',
+            pathId: path.id ?? pathIndex,
+          };
+          txGroup.add(line);
+        }
+
+        // Bounce/interaction markers — same Tx color, scaled by emphasis.
+        points.forEach((pt, pi) => {
+          if (pi >= points.length - 1) return;
+          const radius = strong ? 0.95 : 0.62;
+          const ringGeom = new THREE.OctahedronGeometry(radius, 1);
+          const ringMat = new THREE.MeshBasicMaterial({
+            color: group.color,
+            wireframe: true,
+            transparent: true,
+            opacity: markerOpacity,
+          });
+          const pMesh = new THREE.Mesh(ringGeom, ringMat);
+          pMesh.position.copy(pt);
+          pMesh.userData = {
+            rayLayer: 'playback-tx-rays',
+            txId: group.txId,
+            emphasized: strong,
+            serving: group.serving,
+            kind: 'interaction-marker',
+          };
+          txGroup.add(pMesh);
+        });
+      });
+
+      pathsGroup.add(txGroup);
+      return txGroup;
+    }
+
     function drawRayPaths3D() {
+      // Existing grouped teardown + GPU resource release path. Every ray
+      // geometry/material below is a descendant of pathsGroup, so this is the
+      // single place that prevents previous-step / previous-Tx residue and
+      // geometry/material leaks.
       clearGroup(pathsGroup);
+      pathsGroup.userData = {};
 
       const current = stateRef.current;
       // Rays draw in Link/Playback, and in Radio Coverage when the overlay toggle is on.
@@ -842,14 +970,36 @@ export function ThreeStudio({
         (current.activeMode === 'heatmap' && current.showRaysOnHeatmap);
       if (!allowRays) return;
 
-      // Playback must show the active per-step mobility rays. Matrix mode still
-      // draws every Tx/Rx pair in link/heatmap overlays.
-      const list = current.activeMode !== 'playback' && current.matrixPaths && current.matrixPaths.length > 0
+      // ── Multi-Tx mobility replay layer ────────────────────────────────────
+      // One child group per transmitter for THIS step; colors are categorical
+      // per Tx and the serving/focused Tx is bold + full opacity while the
+      // others remain drawn but dimmed. A Tx missing from the step yields an
+      // empty group (legend marks it "no path").
+      if (current.activeMode === 'playback') {
+        const host = containerRef.current;
+        const resolution = {
+          w: Math.max(1, host?.clientWidth ?? width),
+          h: Math.max(1, host?.clientHeight ?? height),
+        };
+        const groups = buildTxRayGroups({
+          step: current.playbackStep ?? { paths: current.paths },
+          txs: current.txs,
+          focusTxId: current.playbackFocusTxId,
+        });
+        pathsGroup.userData = { rayLayer: 'playback-root', stepIndex: current.playbackStep?.index ?? null };
+        groups.forEach((g) => addPlaybackTxRayGroup(g, resolution));
+        return;
+      }
+
+      // Link / matrix / heatmap-overlay rays keep the original path-type coloring.
+      // Matrix mode still draws every Tx/Rx pair in link/heatmap overlays.
+      const list = current.matrixPaths && current.matrixPaths.length > 0
         ? current.matrixPaths
         : current.paths;
 
       list.forEach(path => {
         const points = path.points.map(enuToThree);
+        if (points.length === 0) return;
         const geom = new THREE.BufferGeometry().setFromPoints(points);
 
         // Neon coloring: Link status green, reflections glowing orange splitters
@@ -864,6 +1014,7 @@ export function ThreeStudio({
         });
 
         const line = new THREE.Line(geom, mat);
+        line.userData = { rayLayer: 'standard-rays' };
         pathsGroup.add(line);
 
         // Stagger animated propagation wave rings moving along the wire!
@@ -874,11 +1025,110 @@ export function ThreeStudio({
             const ringMat = new THREE.MeshBasicMaterial({ color: color, wireframe: true });
             const pMesh = new THREE.Mesh(ringGeom, ringMat);
             pMesh.position.copy(pt);
+            pMesh.userData = { rayLayer: 'standard-rays' };
             pathsGroup.add(pMesh);
           }
         });
       });
     }
+
+    // Serializable inspection view of the ray layer (used by the local
+    // acceptance checks; harmless read-only debug handle). Includes the GPU
+    // resource uuids of the CURRENT layer so a test can prove the previous
+    // layer's geometry/material instances were disposed after a rebuild.
+    function getRayLayerSnapshot() {
+      const current = stateRef.current;
+      const txGroups = pathsGroup.children.map((child) => {
+        const ud = child.userData ?? {};
+        let rayCount = 0;
+        let logicalRayCount = 0;
+        let markerCount = 0;
+        let objectCount = 0;
+        let fatLineCount = 0;
+        const geometryUuids: string[] = [];
+        const materialUuids: string[] = [];
+        child.traverse((o) => {
+          objectCount += 1;
+          const ud2 = o.userData as { kind?: string; role?: string } | undefined;
+          const anyO = o as unknown as {
+            isLine?: boolean; isLine2?: boolean; isMesh?: boolean;
+            geometry?: THREE.BufferGeometry & { uuid: string };
+            material?: THREE.Material | THREE.Material[];
+            userData?: { kind?: string; role?: string };
+          };
+          if (ud2?.kind === 'interaction-marker') markerCount += 1;
+          if ((o as THREE.Line).isLine || anyO.isLine2) rayCount += 1;
+          if (ud2?.kind === 'fat-line') fatLineCount += 1;
+          // One logical ray = one thin line OR one bold core pass.
+          if (ud2?.kind === 'line' || (ud2?.kind === 'fat-line' && ud2.role === 'core')) {
+            logicalRayCount += 1;
+          }
+          if (anyO.geometry?.uuid) geometryUuids.push(anyO.geometry.uuid);
+          const mats = Array.isArray(anyO.material)
+            ? anyO.material
+            : anyO.material ? [anyO.material] : [];
+          for (const m of mats) if (m?.uuid) materialUuids.push(m.uuid);
+        });
+        return {
+          txId: (ud.txId as string) ?? null,
+          color: (ud.color as string) ?? null,
+          emphasized: Boolean(ud.emphasized),
+          serving: Boolean(ud.serving),
+          hasPaths: Boolean(ud.hasPaths),
+          rayCount,
+          logicalRayCount,
+          fatLineCount,
+          markerCount,
+          objectCount,
+          geometryUuids,
+          materialUuids,
+        };
+      });
+
+      const allGeometryUuids: string[] = [];
+      const allMaterialUuids: string[] = [];
+      pathsGroup.traverse((o) => {
+        const anyO = o as unknown as {
+          geometry?: THREE.BufferGeometry & { uuid: string };
+          material?: THREE.Material | THREE.Material[];
+        };
+        if (anyO.geometry?.uuid) allGeometryUuids.push(anyO.geometry.uuid);
+        const mats = Array.isArray(anyO.material)
+          ? anyO.material
+          : anyO.material ? [anyO.material] : [];
+        for (const m of mats) if (m?.uuid) allMaterialUuids.push(m.uuid);
+      });
+
+      return {
+        mode: current.activeMode,
+        layerKind: (pathsGroup.userData?.rayLayer as string) ?? null,
+        childCount: pathsGroup.children.length,
+        empty: pathsGroup.children.length === 0,
+        txGroups,
+        geometryUuids: allGeometryUuids,
+        materialUuids: allMaterialUuids,
+        rendererMemory: { ...renderer.info.memory },
+      };
+    }
+
+    // Expose the read-only snapshot + scene handles for local/automated
+    // acceptance of replay ray ownership and cleanup.
+    const studioApi = {
+      getRayLayerSnapshot,
+      scene,
+      camera,
+      controls,
+      renderer,
+      pathsGroup,
+      buildingGroup,
+      transmitterGroup,
+      receiverGroup,
+      THREE,
+    };
+    (window as unknown as { __SRTS_STUDIO__?: typeof studioApi }).__SRTS_STUDIO__ = studioApi;
+    (window as unknown as { __SRTS_RAY_LAYER__?: { snapshot: typeof getRayLayerSnapshot } }).__SRTS_RAY_LAYER__ = {
+      snapshot: getRayLayerSnapshot,
+    };
 
     // 9. DYNAMIC HEATMAP: Instanced colored grid squares for ultra performance
     function drawRadioMap3D() {
@@ -1099,6 +1349,9 @@ export function ThreeStudio({
         drawNodes3D();
       }
       if (first || c.paths !== p.paths || c.matrixPaths !== p.matrixPaths ||
+          c.playbackStep !== p.playbackStep ||
+          c.playbackFocusTxId !== p.playbackFocusTxId ||
+          c.txs !== p.txs ||
           c.activeMode !== p.activeMode || c.showRaysOnHeatmap !== p.showRaysOnHeatmap) {
         drawRayPaths3D();
       }
@@ -1177,6 +1430,15 @@ export function ThreeStudio({
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
+      // Fat ray materials own a screen-space resolution uniform.
+      pathsGroup.traverse((o) => {
+        const mat = (o as unknown as { material?: THREE.Material | THREE.Material[] }).material;
+        const mats = Array.isArray(mat) ? mat : mat ? [mat] : [];
+        for (const m of mats) {
+          const lm = m as THREE.Material & { isLineMaterial?: boolean; resolution?: { set: (w: number, h: number) => void } };
+          if (lm.isLineMaterial && lm.resolution) lm.resolution.set(w, h);
+        }
+      });
     });
     resizeObserver.observe(containerRef.current);
 
@@ -1195,9 +1457,32 @@ export function ThreeStudio({
       gridHelper.geometry.dispose();
       (gridHelper.material as THREE.Material).dispose();
       renderer.dispose();
+      // Drop inspection handles only if this instance still owns them
+      // (StrictMode remount / nav-tab switch hands them to a fresh instance).
+      const w = window as unknown as {
+        __SRTS_STUDIO__?: typeof studioApi;
+        __SRTS_RAY_LAYER__?: { snapshot: typeof getRayLayerSnapshot };
+      };
+      if (w.__SRTS_STUDIO__ === studioApi) delete w.__SRTS_STUDIO__;
+      if (w.__SRTS_RAY_LAYER__?.snapshot === getRayLayerSnapshot) delete w.__SRTS_RAY_LAYER__;
     };
   }, [buildings, performanceMode]);
 
+
+  // Legend + emphasis view-model for the replay ray layer. Computed in React
+  // (independent of the imperative three.js scene) so DOM tests and users can
+  // read Tx ownership / no-path state even before a frame paints.
+  const legendGroups = useMemo<TxRayGroup[]>(() => {
+    if (activeMode !== 'playback') return [];
+    return buildTxRayGroups({
+      step: playbackStep ?? null,
+      txs: txs ?? [],
+      focusTxId: playbackFocusTxId ?? null,
+    });
+  }, [activeMode, playbackStep, txs, playbackFocusTxId]);
+
+  const effectiveEmphasisTxId =
+    playbackFocusTxId ?? playbackStep?.servingTxId ?? null;
 
   return (
     <div id="three-studio-frame" className="relative flex-1 min-h-[420px] bg-slate-50 border border-slate-200 rounded overflow-hidden shadow-xl flex flex-col">
@@ -1362,6 +1647,116 @@ export function ThreeStudio({
           <span className="text-slate-400">|</span>
           <span>WebMesh</span>
         </div>
+
+        {/* Multi-Tx replay ray legend — color key + per-step path availability.
+            Clicking a row focuses (bold/highlights) that transmitter's rays;
+            clicking again returns to following the step's serving Tx. */}
+        {activeMode === 'playback' && legendGroups.length > 0 && (
+          <div
+            id="playback-tx-legend"
+            data-testid="playback-tx-legend"
+            data-ray-legend="tx"
+            data-step-index={playbackStep?.index ?? ''}
+            data-serving-tx-id={playbackStep?.servingTxId ?? ''}
+            data-emphasis-tx-id={effectiveEmphasisTxId ?? ''}
+            className="absolute top-16 right-4 w-64 max-h-[60%] overflow-y-auto bg-white/95 backdrop-blur-md border border-slate-200 rounded-lg shadow-lg z-10 p-2.5 flex flex-col gap-1"
+          >
+            <div className="flex items-center justify-between gap-2 px-0.5 pb-1 border-b border-slate-100">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-slate-600">
+                发射机射线图例 · Tx Rays
+              </span>
+              <MousePointerClick className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+            </div>
+            {legendGroups.map((g, i) => {
+              const isManualFocus =
+                playbackFocusTxId != null && playbackFocusTxId === g.txId;
+              return (
+                <button
+                  key={g.txId}
+                  type="button"
+                  id={`playback-legend-tx-${i}`}
+                  data-testid="playback-tx-legend-item"
+                  data-tx-id={g.txId}
+                  data-tx-name={g.txName}
+                  data-has-paths={g.hasPaths ? 'true' : 'false'}
+                  data-serving={g.serving ? 'true' : 'false'}
+                  data-emphasized={g.emphasized ? 'true' : 'false'}
+                  data-manual-focus={isManualFocus ? 'true' : 'false'}
+                  aria-pressed={g.emphasized}
+                  title={
+                    g.hasPaths
+                      ? `高亮 ${g.txName} 的射线 / focus ${g.txName} rays`
+                      : `${g.txName} 在本步无路径 / no path at this step`
+                  }
+                  onClick={() =>
+                    onPlaybackFocusTxChange?.(g.emphasized && isManualFocus ? null : g.txId)
+                  }
+                  className={cn(
+                    'flex items-center gap-2 rounded-md px-1.5 py-1 text-left transition border cursor-pointer',
+                    g.emphasized
+                      ? 'bg-slate-100 border-slate-300'
+                      : 'bg-transparent border-transparent hover:bg-slate-50',
+                    !g.hasPaths && 'opacity-70',
+                  )}
+                >
+                  <span
+                    className="w-3 h-3 rounded-sm shrink-0 border border-black/10"
+                    style={{
+                      backgroundColor: g.hasPaths ? g.cssColor : 'transparent',
+                      borderStyle: g.hasPaths ? 'solid' : 'dashed',
+                      borderColor: g.cssColor,
+                    }}
+                  />
+                  <span className="flex-1 min-w-0">
+                    <span
+                      className={cn(
+                        'block text-[12px] leading-tight truncate',
+                        g.emphasized ? 'font-bold text-slate-900' : 'font-medium text-slate-700',
+                      )}
+                    >
+                      {g.txName}
+                      <span className="ml-1 text-[10px] font-mono text-slate-400">{g.txId}</span>
+                    </span>
+                    <span className="block text-[10.5px] leading-tight">
+                      {!g.hasPaths ? (
+                        <span className="text-slate-400 italic" data-legend-no-path="">
+                          无路径 · No path
+                        </span>
+                      ) : g.serving ? (
+                        <span className="font-bold" style={{ color: g.cssColor }}>
+                          ● 服务中 · Serving{g.paths.length ? ` (${g.paths.length})` : ''}
+                        </span>
+                      ) : (
+                        <span className="text-slate-500">
+                          {g.paths.length} 条射线 · {g.paths.length} rays
+                        </span>
+                      )}
+                    </span>
+                  </span>
+                  {g.emphasized && (
+                    <span
+                      className="text-[9.5px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded text-white shrink-0"
+                      style={{ backgroundColor: g.cssColor }}
+                    >
+                      {isManualFocus ? 'Focus' : 'Serve'}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+            {playbackFocusTxId != null && (
+              <button
+                type="button"
+                id="playback-legend-follow-serving"
+                data-testid="playback-legend-follow-serving"
+                onClick={() => onPlaybackFocusTxChange?.(null)}
+                className="mt-0.5 text-[11px] font-bold text-[#cc785c] hover:underline cursor-pointer text-left px-1.5"
+              >
+                ↺ 跟随当前服务发射机 · Follow serving Tx
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

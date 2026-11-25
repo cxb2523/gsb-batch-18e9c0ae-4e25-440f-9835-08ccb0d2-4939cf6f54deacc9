@@ -26,6 +26,10 @@ export function DeviceRow({ label, list, activeId, onSelect, onRemove, onAdd, do
         return (
           <span
             key={d.id}
+            data-device-chip=""
+            data-device-label={label}
+            data-device-id={d.id}
+            data-active={active ? 'true' : 'false'}
             onClick={() => onSelect(d.id)}
             className={`group flex items-center gap-1 text-[12px] font-bold rounded px-2 py-1 cursor-pointer border transition ${
               active

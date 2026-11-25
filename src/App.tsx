@@ -23,6 +23,7 @@ import {
   fetchOSMBuildings,
 } from './utils';
 import { solveLink, solveRadioMap, solveMobility, checkBackend, MobilityExecution, MobilityStep, HandoverAnalysis, HandoverConfig } from './api';
+import { withRaysByTx } from './lib/playbackRays';
 import {
   clearAutosavedProject,
   loadAutosavedProject,
@@ -315,6 +316,9 @@ export default function App() {
     { lat: number; lon: number; enu: { x: number; y: number; z: number } }[]
   >(() => AUTOSAVED_PROJECT?.mobility.trajectoryPoints ?? []);
   const [activeMobilityStep, setActiveMobilityStep] = useState<MobilityStep | null>(null);
+  // Manual override for which Tx's replay rays are bold/highlighted. Null means
+  // "follow the current step's servingTxId"; selecting a new step resets it.
+  const [playbackFocusTxId, setPlaybackFocusTxId] = useState<string | null>(null);
 
   // Synchronize active Transmitter Lat/Lon ↔ ENU
   useEffect(() => {
@@ -364,6 +368,7 @@ export default function App() {
     setRadioMap(null);
     setMobilitySteps([]);
     setActiveMobilityStep(null);
+    setPlaybackFocusTxId(null);
   }, [
     buildings,
     activeTxId,
@@ -378,6 +383,16 @@ export default function App() {
     solverOptions,
     materialConfigs,
   ]);
+
+  // Trajectory-panel Tx chips act as the replay ray focus control. Their
+  // highlighted id follows the manual focus, else the step's serving Tx, else
+  // the editor-active Tx. We deliberately do NOT reassign activeTxId here:
+  // that retriggers the lat/lon↔ENU sync and would invalidate the all-Tx
+  // mobility solution via the input-staleness effect.
+  const trajectoryRowActiveTxId =
+    playbackFocusTxId ?? activeMobilityStep?.servingTxId ?? activeTxId;
+  const handleTrajectoryRowSelectTx = (id: string) =>
+    setPlaybackFocusTxId((cur) => (cur === id ? null : id));
 
   const handleSolve = async () => {
     setSolving(true);
@@ -679,6 +694,7 @@ export default function App() {
     setRadioMap(null);
     setMobilitySteps([]);
     setActiveMobilityStep(null);
+    setPlaybackFocusTxId(null);
     setMobilityExecution(null);
     setMobilityHandover(null);
     setSolveError('');
@@ -737,6 +753,7 @@ export default function App() {
     try {
       setActiveMobilityStep(null);
       setMobilitySteps([]);
+      setPlaybackFocusTxId(null);
       setMobilityExecution(null);
       setMobilityHandover(null);
       const sampledPath = sampleMobilityPath(intervalMs, speedKmh);
@@ -752,7 +769,7 @@ export default function App() {
         freqGhz, speedKmh, maxDepth, solverOptions, materialList, mobilityCombineMode,
         'auto', handoverConfig,
       );
-      const all = res.steps.map((step, index) => ({ ...step, index }));
+      const all = res.steps.map((step, index) => withRaysByTx({ ...step, index }));
       setMobilityExecution(res.execution);
       setMobilityHandover(res.handover ?? null);
 
@@ -773,10 +790,143 @@ export default function App() {
 
 
   const handleMobilityStepSelect = (step: MobilityStep) => {
-    setActiveMobilityStep(step);
-    setPaths(step.paths);
-    setMetrics(metricsFromMobilityStep(step));
+    // Make the per-Tx ray collection explicit on the step (derived from the
+    // txId-tagged union when the wire/fixture did not provide one).
+    const normalized = withRaysByTx(step);
+    setActiveMobilityStep(normalized);
+    setPaths(normalized.paths);
+    // A new step owns its serving cell: drop any manual Tx focus so highlight
+    // and KPI panel stay aligned unless the user explicitly re-focuses.
+    setPlaybackFocusTxId(null);
+    setMetrics(metricsFromMobilityStep(normalized));
   };
+
+  // Switch studio mode. Leaving Trajectory/playback must tear down the replay
+  // ray layer state; ThreeStudio's mode watcher then rebuilds pathsGroup empty
+  // (paths cleared), so no previous-step / previous-Tx rays survive exit.
+  const handleActiveModeChange = (mode: 'link' | 'heatmap' | 'playback') => {
+    if (mode !== 'playback' && activeMode === 'playback') {
+      setActiveMobilityStep(null);
+      setPlaybackFocusTxId(null);
+      setPaths([]);
+    }
+    setActiveMode(mode);
+  };
+
+  // Local acceptance / debug seam (`window.__SRTS_APP__`): seeds a multi-Tx
+  // replay from self-made fixture data without a backend and drives the exact
+  // same step-select / focus / exit handlers as the visible UI. Seeding is
+  // two-phase because the input-staleness effect clears solved mobility state
+  // when `txs` changes; `seedMobilityReplay` awaits that flush internally.
+  useEffect(() => {
+    type SeedTx = Partial<Transmitter> & { id: string };
+    type SeedStep = Partial<MobilityStep>;
+    interface SeedReplayFixture {
+      txs?: SeedTx[];
+      steps: SeedStep[];
+      trajectoryPoints?: { lat: number; lon: number; enu: { x: number; y: number; z: number } }[];
+      startIndex?: number;
+    }
+
+    const fullTx = (t: SeedTx, i: number): Transmitter => {
+      const enu = t.enu ?? { x: -60 + i * 120, y: 40 - (i % 2) * 90, z: 0 };
+      const ll = enuToLatLon(enu, anchor);
+      return {
+        id: t.id,
+        name: t.name ?? `Tx ${i + 1}`,
+        height: 12,
+        powerDbm: 30,
+        antennaArraySize: [8, 8],
+        beamsteeringAzimuth: 0,
+        beamsteeringElevation: 0,
+        ...t,
+        enu,
+        latitude: t.latitude ?? ll.lat,
+        longitude: t.longitude ?? ll.lon,
+      };
+    };
+
+    const fullStep = (s: SeedStep, i: number): MobilityStep => {
+      const paths = Array.isArray(s.paths) ? s.paths : [];
+      const base = {
+        index: i,
+        rxPosition: { x: 0, y: 0, z: 1.5 },
+        receivedPowerDbm: -60,
+        rmsDelaySpreadNs: 10,
+        rmsDelaySpreadValid: true,
+        numPaths: paths.length,
+        maxDopplerHz: 0,
+        losStatus: paths.some((p) => p.type === 'LOS') ? 'LOS' as const : 'NLOS' as const,
+        paths,
+        servingTxId: null,
+        ...s,
+      } as MobilityStep;
+      return withRaysByTx(base);
+    };
+
+    const api = {
+      // Phase 1 — devices + enter playback/3D scene.
+      seedDevices: (fixture: { txs?: SeedTx[]; activeTxId?: string }) => {
+        if (fixture.txs && fixture.txs.length > 0) {
+          const full = fixture.txs.map((t, i) => fullTx(t, i));
+          setTxs(full);
+          setActiveTxId(fixture.activeTxId ?? full[0].id);
+        }
+        setActiveNavTab('3d_scene');
+        setActiveMode('playback');
+      },
+      // Phase 2 — install steps after the staleness effect has flushed.
+      seedMobilitySteps: (fixture: {
+        steps: SeedStep[];
+        trajectoryPoints?: SeedReplayFixture['trajectoryPoints'];
+        startIndex?: number;
+      }) => {
+        const steps = fixture.steps.map((s, i) => fullStep(s, i));
+        setMobilitySteps(steps);
+        setTrajectoryPoints(
+          fixture.trajectoryPoints ??
+            steps.map((s) => ({ lat: 0, lon: 0, enu: { ...s.rxPosition } })),
+        );
+        const idx = fixture.startIndex ?? 0;
+        if (steps[idx]) handleMobilityStepSelect(steps[idx]);
+        return steps.length;
+      },
+      seedMobilityReplay: async (fixture: SeedReplayFixture) => {
+        api.seedDevices(fixture);
+        await new Promise((r) => window.setTimeout(r, 300));
+        const stepCount = api.seedMobilitySteps(fixture);
+        await new Promise((r) => window.setTimeout(r, 80));
+        return { txCount: fixture.txs?.length ?? 0, stepCount };
+      },
+      selectMobilityStep: (i: number) => {
+        const step = mobilitySteps[i];
+        if (!step) return false;
+        handleMobilityStepSelect(step);
+        return true;
+      },
+      setPlaybackFocus: (txId: string | null) => setPlaybackFocusTxId(txId),
+      exitPlayback: () => handleActiveModeChange('link'),
+      setMode: (m: 'link' | 'heatmap' | 'playback') => handleActiveModeChange(m),
+      getState: () => ({
+        activeMode,
+        activeNavTab,
+        stepCount: mobilitySteps.length,
+        activeStepIndex: activeMobilityStep?.index ?? null,
+        focusTxId: playbackFocusTxId,
+        servingTxId: activeMobilityStep?.servingTxId ?? null,
+        pathCount: paths.length,
+      }),
+      rayLayerSnapshot: () =>
+        (window as unknown as { __SRTS_RAY_LAYER__?: { snapshot: () => unknown } })
+          .__SRTS_RAY_LAYER__?.snapshot() ?? null,
+    };
+
+    (window as unknown as { __SRTS_APP__?: typeof api }).__SRTS_APP__ = api;
+    return () => {
+      const w = window as unknown as { __SRTS_APP__?: typeof api };
+      if (w.__SRTS_APP__ === api) delete w.__SRTS_APP__;
+    };
+  });
 
   // COVERAGE HEATMAP — real Sionna RadioMapSolver, best-server across all Tx.
   const handleRunHeatmap = async (resolution: number, height: number, samplesPerTx: number, seed: number) => {
@@ -837,7 +987,7 @@ export default function App() {
             onTxUpdate={handleTxUpdate}
             onRxUpdate={handleRxUpdate}
             activeMode={activeMode}
-            setActiveMode={setActiveMode}
+            setActiveMode={handleActiveModeChange}
             freqGhz={freqGhz}
             setFreqGhz={setFreqGhz}
             maxDepth={maxDepth}
@@ -910,8 +1060,8 @@ export default function App() {
           {activeMode === 'playback' && (
             <TrajectoryPanel
               txs={txs}
-              activeTxId={activeTxId}
-              onSelectTx={setActiveTxId}
+              activeTxId={trajectoryRowActiveTxId}
+              onSelectTx={handleTrajectoryRowSelectTx}
               onAddTx={addTx}
               onRemoveTx={removeTx}
               tx={tx}
@@ -936,6 +1086,8 @@ export default function App() {
               mobilityHandover={mobilityHandover}
               solveError={solveError}
               backendOnline={backendOnline}
+              playbackFocusTxId={playbackFocusTxId}
+              onPlaybackFocusTx={setPlaybackFocusTxId}
             />
           )}
         </div>
@@ -971,6 +1123,9 @@ export default function App() {
               mobilityRxPosition={activeMobilityStep?.rxPosition ?? null}
               trajectoryPoints={trajectoryPoints}
               setTrajectoryPoints={setTrajectoryPoints}
+              playbackStep={activeMobilityStep}
+              playbackFocusTxId={playbackFocusTxId}
+              onPlaybackFocusTxChange={setPlaybackFocusTxId}
             />
           )}
 
