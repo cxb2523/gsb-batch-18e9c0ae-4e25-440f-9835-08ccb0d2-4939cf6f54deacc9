@@ -12,6 +12,7 @@ const TRANSLATE_TIMEOUT_MS = 3000;
 const TRANSLATE_CONCURRENCY = 6;
 const TRANSLATE_BATCH = 12;
 const TRANSLATE_CACHE_MAX = 6000;
+const TRANSLATE_QUEUE_MAX = 64;
 
 const LANG_TO_TRANSLATE = {
   eng: 'en', en: 'en', zho: 'zh-CN', chi: 'zh-CN', zh: 'zh-CN', cht: 'zh-TW', chs: 'zh-CN',
@@ -42,6 +43,17 @@ function baseLang(code) {
 function translateCode(code) {
   const base = baseLang(code);
   return LANG_TO_TRANSLATE[base] || (/^[a-z]{2}$/.test(base) ? base : '');
+}
+
+// Cache bucket for a source language. Explicit/known codes map to their
+// translate code; anything unknown gets a language-qualified 'auto:<lang>'
+// bucket so a line of dialogue from one unknown-language track can never
+// overwrite the same text translated from another track.
+function translateBucket(code) {
+  const base = baseLang(code);
+  const mapped = translateCode(base);
+  if (mapped) return mapped;
+  return 'auto:' + (base || 'und');
 }
 
 function decodeEntities(text) {
@@ -127,7 +139,7 @@ async function readSubtitleFile(file) {
   return { ok: cues.length > 0, cues, name: require('node:path').basename(file), error: cues.length ? '' : '没有解析出字幕' };
 }
 
-function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, channels = {} } = {}) {
+function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, channels = {}, sessionFetchers = null } = {}) {
   const names = {
     cues: channels.cues || 'cf:m2:movy-sub-cues',
     translate: channels.translate || 'cf:m2:movy-sub-translate',
@@ -154,6 +166,15 @@ function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, 
   }
 
   function sessionList() {
+    // Tests and non-Electron hosts can inject fetchers instead of a session.
+    // Accept plain async functions or `{ fetch }`-shaped objects.
+    if (sessionFetchers) {
+      const injected = typeof sessionFetchers === 'function' ? sessionFetchers() : sessionFetchers;
+      if (Array.isArray(injected) && injected.length) {
+        return injected.map((item) => (typeof item === 'function' ? { fetch: item } : item))
+          .filter((item) => item && typeof item.fetch === 'function');
+      }
+    }
     const list = [];
     try {
       const { session } = require('electron');
@@ -205,6 +226,13 @@ function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, 
 
   function translateDiskPath() { return dir ? path.join(dir, 'translate.json') : ''; }
 
+  // Cache keys are "<source bucket>|<target>|<text>". Bucketing by the source
+  // language keeps the same sentence translated from an English track and from
+  // a Japanese track apart, both in memory and on disk.
+  function translationKey(bucket, to, text) {
+    return bucket + '|' + to + '|' + text;
+  }
+
   function loadTranslateDisk() {
     if (diskLoaded) return;
     diskLoaded = true;
@@ -212,19 +240,32 @@ function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, 
     if (!file) return;
     try {
       const data = JSON.parse(fsp.readFileSync(file, 'utf8'));
-      if (data && typeof data === 'object') {
-        for (const [key, value] of Object.entries(data)) {
-          if (translations.size >= TRANSLATE_CACHE_MAX) break;
-          if (typeof value === 'string' && value) translations.set(key, value);
+      // v1 was a flat { "<source>|<to>|<text>": value } map where unknown source
+      // languages collapsed to an empty bucket. Those entries are ambiguous, so
+      // they are skipped; only language-qualified keys are trusted.
+      const map = data && data.v === 2 && data.map && typeof data.map === 'object' ? data.map : (data && typeof data === 'object' && !Array.isArray(data) ? data : {});
+      const legacy = !(data && data.v === 2);
+      for (const [key, value] of Object.entries(map)) {
+        if (translations.size >= TRANSLATE_CACHE_MAX) break;
+        if (typeof value !== 'string' || !value) continue;
+        const parts = String(key).split('|');
+        if (parts.length < 3) continue;
+        const bucket = parts[0];
+        if (!bucket || bucket === 'auto' || bucket.startsWith('auto:')) {
+          if (legacy) continue;
         }
+        translations.set(key, value);
       }
+      // Rewriting in the new format drops unusable legacy entries on next save.
+      if (legacy && translations.size) saveTranslateDisk(true);
     } catch {  }
   }
 
   let saveTimer = null;
-  function saveTranslateDisk() {
-    if (saveTimer) return;
-    saveTimer = setTimeout(() => {
+  function saveTranslateDisk(immediate = false) {
+    if (saveTimer && !immediate) return;
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    const write = () => {
       saveTimer = null;
       const file = translateDiskPath();
       if (!file || !ensureDir()) return;
@@ -236,9 +277,11 @@ function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, 
           out[key] = value;
           count += 1;
         }
-        fsp.writeFileSync(file, JSON.stringify(out), 'utf8');
+        fsp.writeFileSync(file, JSON.stringify({ v: 2, savedAt: Date.now(), map: out }), 'utf8');
       } catch {  }
-    }, 2500);
+    };
+    if (immediate) { write(); return; }
+    saveTimer = setTimeout(write, 2500);
     if (saveTimer && typeof saveTimer.unref === 'function') saveTimer.unref();
   }
 
@@ -334,7 +377,13 @@ function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, 
   }
 
   function enqueueTranslate(texts, from, to) {
-    return new Promise((resolve) => { translateQueue.push({ texts, from, to, resolve }); pumpTranslate(); });
+    return new Promise((resolve) => {
+      // Bound the queue: drop the request instead of letting it grow forever
+      // when the user keeps switching tracks faster than translation finishes.
+      if (translateQueue.length >= TRANSLATE_QUEUE_MAX) { resolve([]); return; }
+      translateQueue.push({ texts, from, to, resolve });
+      pumpTranslate();
+    });
   }
 
   const PROBE_LANGS = ['zho', 'chi', 'zh', 'chs', 'cht', 'zho-Hans', 'eng', 'en', 'jpn', 'kor', 'spa', 'fre'];
@@ -437,34 +486,37 @@ function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, 
     }
   }
 
-  async function translate({ texts = [], from = '', to = 'zh-CN' } = {}) {
+  async function translate({ texts = [], from = '', to = 'zh-CN', lang = '' } = {}) {
     loadTranslateDisk();
-    const source = translateCode(from);
+    const source = translateCode(from || lang);
+    const bucket = translateBucket(from || lang) || 'auto';
+    const target = String(to || 'zh-CN');
+    const requestFrom = source || 'auto';
     const list = Array.isArray(texts) ? texts.filter((item) => typeof item === 'string' && item.trim()).slice(0, 200) : [];
     const result = {};
     const missing = [];
     for (const text of list) {
-      const key = source + '|' + to + '|' + text;
+      const key = translationKey(bucket, target, text);
       const hit = translations.get(key);
       if (hit) result[text] = hit;
       else missing.push(text);
     }
-    if (!missing.length) return { ok: true, map: result, fetched: 0 };
+    if (!missing.length) return { ok: true, map: result, fetched: 0, bucket };
     const chunks = [];
     for (let i = 0; i < missing.length; i += TRANSLATE_BATCH) chunks.push(missing.slice(i, i + TRANSLATE_BATCH));
-    const settled = await Promise.all(chunks.map(async (chunk) => ({ chunk, values: await enqueueTranslate(chunk, source || 'auto', to) })));
+    const settled = await Promise.all(chunks.map(async (chunk) => ({ chunk, values: await enqueueTranslate(chunk, requestFrom, target) })));
     let fetched = 0;
     for (const item of settled) {
       item.chunk.forEach((text, index) => {
         const value = item.values && item.values[index];
         if (!value) return;
         result[text] = value;
-        translations.set(source + '|' + to + '|' + text, value);
+        translations.set(translationKey(bucket, target, text), value);
         fetched += 1;
       });
     }
     if (fetched) saveTranslateDisk();
-    return { ok: fetched > 0, map: result, fetched };
+    return { ok: fetched > 0, map: result, fetched, bucket };
   }
 
   function register() {
@@ -520,7 +572,7 @@ function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, 
     }
   }
 
-  return { register, fetchCues, translate, discover, online, parseCues, channels: names, cacheDir: dir };
+  return { register, fetchCues, translate, discover, online, parseCues, channels: names, cacheDir: dir, flushTranslateDisk: () => saveTranslateDisk(true), stats: () => ({ translations: translations.size, queue: translateQueue.length, inflight: translateInflight }) };
 }
 
-module.exports = { createMovySubtitle, parseCues, translateCode };
+module.exports = { createMovySubtitle, parseCues, translateCode, translateBucket, translationKeyFor: (bucket, to, text) => bucket + '|' + to + '|' + text };

@@ -1,8 +1,10 @@
 import './movy-subtitle.css';
+import { createTranslationEngine, createTrackKey, isChineseLang, normalizeLang } from './subtitle-translation.mjs';
 
 const SETTINGS_KEY = 'cineflow:movy-sub:v1';
 const PLAYCTX_KEY = 'cineflow:movy-playctx:v1';
-const TRANS_KEY = 'cineflow:movy-sub-trans:v1';
+const TRANS_KEY = 'cineflow:movy-sub-trans:v2';
+const TRANS_KEY_LEGACY = 'cineflow:movy-sub-trans:v1';
 const CUE_WINDOW = 40;
 const TICK_MS = 220;
 
@@ -45,8 +47,7 @@ function langLabel(code, label) {
 }
 
 function isChinese(code, label) {
-  if (/中文|chinese/i.test(String(code || '') + ' ' + String(label || ''))) return true;
-  return ['zho', 'chi', 'zh', 'chs', 'cht', 'cmn'].includes(baseLang(code));
+  return isChineseLang(code, label);
 }
 
 function readJson(key, fallback) {
@@ -69,18 +70,33 @@ export function initMovySubtitle(deps = {}) {
 
   const diag = window.__cfSub = { opens: 0, fetches: 0, cues: 0, translates: 0, renders: 0, discover: 0, discovered: 0, online: 0, errors: [] };
   const bridge = () => (window.cineflowMovy && typeof window.cineflowMovy.subCues === 'function' ? window.cineflowMovy : null);
-
   let overlay = null; let primary = null; let secondary = null;
   let panel = null; let button = null;
   let video = null;
   let tracks = []; let activeTrack = null;
   let onlineTracks = []; let onlineBusy = false; let onlineTried = false;
-  let cues = []; let translations = new Map(); let translating = new Set();
-  let cueIndex = -1; let shownKey = '';
+  let cues = []; let cueIndex = -1; let shownKey = '';
   let tickTimer = 0; let loadToken = 0;
   let currentKey = ''; let currentSrc = '';
 
   const settings = { ...readJson(SETTINGS_KEY, {}), size: 1, offset: 0, bottom: 9, ai: false, aiTouched: false, trackUrl: '' };
+
+  const engine = createTranslationEngine({
+    translate: directTranslate,
+    fallback: mainTranslate,
+    windowSize: CUE_WINDOW,
+    concurrency: 5,
+    maxQueue: 160,
+    maxPerTrack: 1200,
+    maxTracks: 6,
+    persistDelay: 4000,
+    writeStore: (snapshot) => writeJson(TRANS_KEY, snapshot),
+    onUpdate: () => { tick(true); },
+    onCancel: () => { shownKey = ''; },
+  });
+  migrateLegacyTranslations();
+  engine.restore(readJson(TRANS_KEY, null));
+  engine.setEnabled(!!settings.ai);
 
   function persist() { writeJson(SETTINGS_KEY, settings); }
 
@@ -145,7 +161,12 @@ export function initMovySubtitle(deps = {}) {
       const act = event.target && event.target.closest ? event.target.closest('[data-sub-act]') : null;
       if (!act) return;
       const kind = act.dataset.subAct;
-      if (kind === 'ai') { settings.ai = !settings.ai; settings.aiTouched = true; persist(); renderPanel(); primeTranslate(); }
+      if (kind === 'ai') {
+        settings.ai = !settings.ai; settings.aiTouched = true; persist(); renderPanel();
+        engine.setEnabled(!!settings.ai);
+        if (settings.ai) primeTranslate();
+        else { shownKey = ''; tick(true); }
+      }
       if (kind === 'size+') { settings.size = Math.min(1.7, Number((settings.size + 0.1).toFixed(2))); persist(); applyGeometry(); renderPanel(); }
       if (kind === 'size-') { settings.size = Math.max(0.6, Number((settings.size - 0.1).toFixed(2))); persist(); applyGeometry(); renderPanel(); }
       if (kind === 'offset-') { settings.offset = Number((settings.offset - 0.2).toFixed(1)); persist(); renderPanel(); tick(true); }
@@ -231,8 +252,9 @@ export function initMovySubtitle(deps = {}) {
     const wanted = decodeURIComponent(String(url || ''));
     if (!wanted) {
       activeTrack = null; cues = []; cueIndex = -1; shownKey = '';
+      engine.clearTrack();
       if (primary) primary.textContent = '';
-      if (secondary) secondary.textContent = '';
+      if (secondary) { secondary.textContent = ''; secondary.classList.remove('is-on'); }
       settings.trackUrl = ''; persist(); renderPanel(); updateButton();
       return;
     }
@@ -261,6 +283,7 @@ export function initMovySubtitle(deps = {}) {
     updateButton();
     cues = list.slice().sort((a, b) => a.s - b.s);
     diag.cues = cues.length;
+    bindTranslationTrack(entry);
     primeTranslate();
     tick(true);
   }
@@ -291,11 +314,11 @@ export function initMovySubtitle(deps = {}) {
     const api = bridge();
     if (!api || !track) return;
     const token = ++loadToken;
-    cues = []; translating = new Set(); cueIndex = -1; shownKey = '';
+    cues = []; cueIndex = -1; shownKey = '';
     nativeLastIndex = -2;
     if (nativeTrack) nativeTrack.mode = 'hidden';
     clearNative();
-    hydrateTranslations();
+    bindTranslationTrack(track);
     if (primary) primary.textContent = '';
     if (secondary) secondary.textContent = '';
     diag.fetches += 1;
@@ -329,94 +352,62 @@ export function initMovySubtitle(deps = {}) {
     return time < cues[hit].e ? hit : -1;
   }
 
-  const translateQueue = [];
-  let translateActive = 0;
-
-  function hydrateTranslations() {
-    const saved = readJson(TRANS_KEY, {});
-    for (const [text, value] of Object.entries(saved)) {
-      if (typeof value === 'string' && value) translations.set(text, value);
-    }
+  function bindTranslationTrack(track) {
+    if (!track) { engine.clearTrack(); return; }
+    engine.setEnabled(!!settings.ai);
+    engine.setTrack(createTrackKey(track), track.lang || track.language || '');
   }
 
-  let saveTimer = 0;
-  function persistTranslations() {
-    if (saveTimer) return;
-    saveTimer = window.setTimeout(() => {
-      saveTimer = 0;
-      const out = {};
-      let count = 0;
-      for (const [text, value] of translations) {
-        if (count >= 4000) break;
-        out[text] = value;
-        count += 1;
-      }
-      writeJson(TRANS_KEY, out);
-    }, 4000);
+  // Old builds keyed translations by raw cue text only (no track/language), so a
+  // line could be reused across different subtitle languages. That format is
+  // ambiguous; drop it rather than risk showing the wrong translation.
+  function migrateLegacyTranslations() {
+    try {
+      if (window.localStorage.getItem(TRANS_KEY_LEGACY) !== null) window.localStorage.removeItem(TRANS_KEY_LEGACY);
+    } catch { /* ignore */ }
   }
 
-  async function translateOne(text, from) {
+  async function directTranslate(text, from, signal) {
     const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl='
       + encodeURIComponent(from || 'auto') + '&tl=zh-CN&q=' + encodeURIComponent(text);
-    const controller = typeof AbortController === 'function' ? new AbortController() : null;
-    const timer = window.setTimeout(() => { try { controller && controller.abort(); } catch {  } }, 2500);
-    try {
-      const response = await window.fetch(url, { mode: 'cors', signal: controller ? controller.signal : undefined });
-      if (!response.ok) throw new Error('HTTP ' + response.status);
-      const data = await response.json();
-      const pieces = Array.isArray(data && data[0]) ? data[0] : [];
-      return pieces.map((part) => (Array.isArray(part) ? String(part[0] || '') : '')).join('');
-    } finally { window.clearTimeout(timer); }
+    const timeout = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+      ? AbortSignal.timeout(2500) : null;
+    let merged = signal || undefined;
+    if (timeout && signal && typeof AbortSignal.any === 'function') merged = AbortSignal.any([signal, timeout]);
+    else if (!merged && timeout) merged = timeout;
+    const response = await window.fetch(url, { mode: 'cors', signal: merged });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const data = await response.json();
+    const pieces = Array.isArray(data && data[0]) ? data[0] : [];
+    return pieces.map((part) => (Array.isArray(part) ? String(part[0] || '') : '')).join('');
   }
 
-  async function translateViaMain(texts, from) {
+  async function mainTranslate(texts, from) {
     const api = bridge();
     if (!api || typeof api.subTranslate !== 'function') return {};
-    const result = await api.subTranslate({ texts, from, to: 'zh-CN' });
+    const result = await api.subTranslate({
+      texts,
+      from,
+      to: 'zh-CN',
+      lang: normalizeLang(from || ''),
+      trackKey: engine.currentTrackKey(),
+    });
     return (result && result.map) || {};
   }
 
   function pumpTranslate() {
-    while (translateActive < 5 && translateQueue.length) {
-      const job = translateQueue.shift();
-      translateActive += 1;
-      const from = (activeTrack && (activeTrack.lang || activeTrack.language)) || '';
-      translateOne(job.text, from)
-        .then((value) => { if (value) translations.set(job.text, value); })
-        .catch(async () => {
-          try {
-            const map = await translateViaMain([job.text], from);
-            if (map && map[job.text]) translations.set(job.text, map[job.text]);
-          } catch { diag.errors.push('translate-fallback'); }
-        })
-        .finally(() => {
-          translateActive -= 1;
-          translating.delete(job.text);
-          if (translations.size && translations.size % 12 === 0) persistTranslations();
-          pumpTranslate();
-          tick(true);
-        });
-    }
+    engine.queueCues(cues, cueIndex >= 0 ? cueIndex : 0, { window: CUE_WINDOW });
   }
 
   function primeTranslate() {
     if (!settings.ai || !activeTrack || !cues.length) return;
-    if (isChinese(activeTrack.language || activeTrack.lang, activeTrack.label)) return;
-    const center = cueIndex >= 0 ? cueIndex : 0;
-    const from = Math.max(0, center - 2);
-    const to = Math.min(cues.length, center + CUE_WINDOW);
-    let queued = 0;
-    for (let i = from; i < to; i += 1) {
-      const text = cues[i].t;
-      if (translations.has(text) || translating.has(text)) continue;
-      translating.add(text);
-      translateQueue.push({ text });
-      queued += 1;
-    }
-    if (!queued) return;
-    diag.translates += 1;
-    diag.ai = !!settings.ai;
+    if (isChineseLang(activeTrack.language || activeTrack.lang, activeTrack.label)) return;
+    const before = engine.stats().requests;
     pumpTranslate();
+    if (engine.stats().requests !== before) {
+      diag.translates += 1;
+      diag.ai = !!settings.ai;
+    }
   }
 
   function renderCue(index) {
@@ -428,7 +419,7 @@ export function initMovySubtitle(deps = {}) {
       return;
     }
     const cue = cues[index];
-    const translated = settings.ai ? translations.get(cue.t) || '' : '';
+    const translated = settings.ai ? engine.get(cue.t) : '';
     const key = cue.t + '|' + translated;
     if (key === shownKey) return;
     shownKey = key;
@@ -436,7 +427,7 @@ export function initMovySubtitle(deps = {}) {
     primary.textContent = cue.t;
     secondary.textContent = translated;
     secondary.classList.toggle('is-on', !!translated);
-    if (settings.ai && !translated && !translating.has(cue.t)) primeTranslate();
+    if (settings.ai && !translated && !engine.isPending(cue.t)) primeTranslate();
   }
 
   function tick(force) {
@@ -466,23 +457,55 @@ export function initMovySubtitle(deps = {}) {
     button.classList.toggle('is-on', !!activeTrack);
   }
 
+  // Listeners attached to the shared <video> element. They are detached on
+  // dispose too, so a closed player leaves no stray handlers behind.
+  const videoListeners = [];
+  function onVideo(el, type, handler) {
+    if (!el || !el.addEventListener) return;
+    el.addEventListener(type, handler);
+    videoListeners.push([el, type, handler]);
+  }
+  function removeVideoListeners() {
+    while (videoListeners.length) {
+      const [el, type, handler] = videoListeners.pop();
+      try { el.removeEventListener(type, handler); } catch { /* ignore */ }
+      try { el.__cfSubWatched = false; } catch { /* ignore */ }
+    }
+  }
+
   function attach() {
     const el = doc.querySelector('#resourcePlayer');
     buildOverlay();
     buildButton();
     if (el && el !== video) {
-      if (video && video.__cfSubBound) {  }
       video = el;
       video.__cfSubBound = true;
     }
     if (el && !el.__cfSubWatched) {
       el.__cfSubWatched = true;
-      el.addEventListener('emptied', () => { if (modalOpen()) watchSwitch(); });
-      el.addEventListener('loadedmetadata', () => { if (modalOpen()) watchSwitch(); });
+      onVideo(el, 'emptied', () => { if (modalOpen()) watchSwitch(); });
+      onVideo(el, 'loadedmetadata', () => { if (modalOpen()) watchSwitch(); });
     }
     if (!tickTimer) tickTimer = window.setInterval(() => { if (modalOpen()) tick(false); }, TICK_MS);
     updateButton();
     renderPanel();
+  }
+
+  function stopTicker() {
+    if (tickTimer) { window.clearInterval(tickTimer); tickTimer = 0; }
+  }
+
+  // Stop all background work tied to a play context: cue timer, queued/in-flight
+  // translations for the old track. Called when the player closes or switches.
+  function teardown() {
+    stopTicker();
+    engine.clearTrack();
+    // Persist whatever finished before the pending debounce fires, then let the
+    // debounce die with the play context instead of writing after close.
+    engine.flush();
+    if (panel && !panel.classList.contains('is-hidden')) panel.classList.add('is-hidden');
+    // Forget the last-opened context so reopening the same film reloads cues.
+    openFor.lastAt = 0;
   }
 
   function normalizeTracks(list) {
@@ -496,15 +519,17 @@ export function initMovySubtitle(deps = {}) {
     const api = bridge();
     if (!api) return;
     if (!context || !context.streamUrl || typeof api.subDiscover !== 'function') { huntOtherProviders(context); return; }
+    const gen = contextGen;
     diag.discover += 1;
     api.subDiscover({ streamUrl: context.streamUrl, subtitles: [] })
       .then((result) => {
+        if (gen !== contextGen) return;
         const found = normalizeTracks(result && result.tracks);
         diag.discovered = found.length;
-        if (!found.length) { huntOtherProviders(context); return; }
+        if (!found.length) { huntOtherProviders(context, gen); return; }
         applyTracks(found);
       })
-      .catch((error) => { diag.errors.push('discover: ' + String((error && error.message) || error)); huntOtherProviders(context); });
+      .catch((error) => { if (gen !== contextGen) return; diag.errors.push('discover: ' + String((error && error.message) || error)); huntOtherProviders(context, gen); });
   }
 
   function applyTracks(found) {
@@ -514,9 +539,9 @@ export function initMovySubtitle(deps = {}) {
     if (target) chooseTrack(encodeURIComponent(target.url));
   }
 
-  async function huntOtherProviders(context) {
+  async function huntOtherProviders(context, gen = contextGen) {
     const api = bridge();
-    if (!api || typeof api.sources !== 'function' || !context) { searchOnline(context); return; }
+    if (!api || typeof api.sources !== 'function' || !context) { searchOnline(context, gen); return; }
     const tried = new Set([String(context.provider || '')]);
     let all = [];
     try {
@@ -527,6 +552,7 @@ export function initMovySubtitle(deps = {}) {
     const pool = all.map((item) => (typeof item === 'string' ? item : (item && (item.name || item.id)) || ''))
       .filter((name) => name && !tried.has(name));
     for (const provider of pool) {
+      if (gen !== contextGen) return;
       try {
         diag.hunt = (diag.hunt || 0) + 1;
         const result = await api.sources({
@@ -538,15 +564,17 @@ export function initMovySubtitle(deps = {}) {
           seasonId: context.seasonId,
           episodeId: context.episodeId,
         });
+        if (gen !== contextGen) return;
         const found = normalizeTracks(result && result.subtitles);
         if (found.length) { diag.huntHit = provider; applyTracks(found); return; }
       } catch {  }
     }
+    if (gen !== contextGen) return;
     renderPanel();
-    searchOnline(context);
+    searchOnline(context, gen);
   }
 
-  async function searchOnline(context) {
+  async function searchOnline(context, gen = contextGen) {
     const api = bridge();
     if (onlineTried || !api || typeof api.subOnline !== 'function' || !context) return;
     onlineTried = true;
@@ -560,6 +588,7 @@ export function initMovySubtitle(deps = {}) {
         season: context.seasonId,
         episode: context.episodeId,
       });
+      if (gen !== contextGen) return;
       const list = (result && Array.isArray(result.tracks) ? result.tracks : []).map((item, index) => ({
         url: 'online:' + index + ':' + (item.source || '') + ':' + (item.lang || ''),
         lang: item.lang || '',
@@ -575,8 +604,10 @@ export function initMovySubtitle(deps = {}) {
         await chooseOnline(list.indexOf(best));
       }
     } catch (error) {
+      if (gen !== contextGen) return;
       diag.errors.push('online: ' + String((error && error.message) || error));
     }
+    if (gen !== contextGen) return;
     onlineBusy = false;
     renderPanel();
   }
@@ -586,6 +617,22 @@ export function initMovySubtitle(deps = {}) {
     return [context.tmdbId || '', context.seasonId || '', context.episodeId || '', context.streamUrl || '', context.title || ''].join('|');
   }
 
+  let contextGen = 0;
+
+  // Document-level listeners are tracked so dispose() can remove every one of
+  // them; nothing keeps running after the player layer is torn down.
+  const docListeners = [];
+  function onDoc(type, handler, capture) {
+    doc.addEventListener(type, handler, capture);
+    docListeners.push([type, handler, capture]);
+  }
+  function removeDocListeners() {
+    while (docListeners.length) {
+      const [type, handler, capture] = docListeners.pop();
+      try { doc.removeEventListener(type, handler, capture); } catch { /* ignore */ }
+    }
+  }
+
   function videoSrc() {
     const el = doc.querySelector('#resourcePlayer');
     return el ? String(el.currentSrc || el.src || '') : '';
@@ -593,11 +640,14 @@ export function initMovySubtitle(deps = {}) {
 
   function resetForSwitch() {
     loadToken += 1;
+    contextGen += 1;
+    engine.clearTrack();
     tracks = []; activeTrack = null; cues = []; cueIndex = -1; shownKey = ''; diag.cues = 0;
     onlineTracks = []; onlineBusy = false; onlineTried = false;
     nativeLastIndex = -2;
     clearNative();
     nativeTrack = null; nativeVideo = null;
+    if (overlay) overlay.classList.remove('is-dragging');
     if (primary && primary.textContent) primary.textContent = '';
     if (secondary) { secondary.textContent = ''; secondary.classList.remove('is-on'); }
     renderPanel();
@@ -628,12 +678,14 @@ export function initMovySubtitle(deps = {}) {
     onlineTracks = []; onlineTried = false; onlineBusy = false;
     const remembered = tracks.find((item) => item.url === settings.trackUrl);
     const target = remembered || pickDefaultTrack(tracks);
-    if (!settings.aiTouched && target && !isChinese(target.language || target.lang)) {
+    if (!settings.aiTouched && target && !isChineseLang(target.language || target.lang)) {
       settings.ai = true;
     }
+    engine.setEnabled(!!settings.ai);
     attach();
     if (!tracks.length) {
       activeTrack = null; cues = [];
+      engine.clearTrack();
       if (primary) primary.textContent = '';
       if (secondary) secondary.textContent = '';
       renderPanel();
@@ -644,7 +696,7 @@ export function initMovySubtitle(deps = {}) {
     if (target) chooseTrack(encodeURIComponent(target.url));
   }
 
-  doc.addEventListener('pointerdown', (event) => {
+  onDoc('pointerdown', (event) => {
     const grip = event.target && event.target.closest ? event.target.closest('.cf-sub-grip') : null;
     if (!grip || !modalOpen()) return;
     overlay && overlay.classList.add('is-dragging');
@@ -668,7 +720,7 @@ export function initMovySubtitle(deps = {}) {
     doc.addEventListener('pointerup', up);
   }, true);
 
-  doc.addEventListener('keydown', (event) => {
+  onDoc('keydown', (event) => {
     if (!modalOpen()) return;
     const tag = (event.target && event.target.tagName) || '';
     if (/input|textarea|select/i.test(tag) || (event.target && event.target.isContentEditable)) return;
@@ -713,7 +765,7 @@ export function initMovySubtitle(deps = {}) {
 
   function textFor(cue) {
     const base = String((cue && cue.t) || '').trim();
-    const zh = settings.ai ? translations.get(cue.t) || '' : '';
+    const zh = settings.ai ? engine.get(cue.t) : '';
     return zh && zh !== base ? base + '\n' + zh : base;
   }
 
@@ -769,7 +821,7 @@ export function initMovySubtitle(deps = {}) {
     }
   }
 
-  doc.addEventListener('dragover', (event) => {
+  onDoc('dragover', (event) => {
     if (!modalOpen()) return;
     const stage = event.target && event.target.closest ? event.target.closest('#playerStage') : null;
     if (!stage) return;
@@ -777,7 +829,7 @@ export function initMovySubtitle(deps = {}) {
     if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
   }, true);
 
-  doc.addEventListener('drop', async (event) => {
+  onDoc('drop', async (event) => {
     if (!modalOpen()) return;
     const stage = event.target && event.target.closest ? event.target.closest('#playerStage') : null;
     if (!stage) return;
@@ -794,13 +846,14 @@ export function initMovySubtitle(deps = {}) {
     } catch (error) { diag.errors.push('drop: ' + String((error && error.message) || error)); }
   }, true);
 
-  doc.addEventListener('fullscreenchange', placeOverlay, true);
-  doc.addEventListener('webkitfullscreenchange', placeOverlay, true);
+  onDoc('fullscreenchange', placeOverlay, true);
+  onDoc('webkitfullscreenchange', placeOverlay, true);
 
   const observer = new MutationObserver(() => {
     if (!modalOpen()) {
-      if (panel && !panel.classList.contains('is-hidden')) panel.classList.add('is-hidden');
-      if (cues.length || activeTrack || tracks.length) { resetForSwitch(); currentKey = ''; currentSrc = ''; }
+      const hadWork = cues.length || activeTrack || tracks.length || tickTimer;
+      teardown();
+      if (hadWork) { resetForSwitch(); currentKey = ''; currentSrc = ''; }
       return;
     }
     if (modalOpen() && watchSwitch()) return;
@@ -815,5 +868,44 @@ export function initMovySubtitle(deps = {}) {
   });
   observer.observe(doc.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
 
-  return () => { observer.disconnect(); window.clearInterval(tickTimer); };
+  exposeHooks();
+
+  return () => {
+    observer.disconnect();
+    stopTicker();
+    engine.dispose();
+    removeDocListeners();
+    removeVideoListeners();
+    if (panel && panel.parentElement) panel.parentElement.removeChild(panel);
+    if (button && button.parentElement) button.parentElement.removeChild(button);
+    if (overlay && overlay.parentElement) overlay.parentElement.removeChild(overlay);
+    panel = null; button = null; overlay = null;
+    window.__cfSubReady = false;
+  };
+
+  // Diagnostics hooks (already exposed via window.__cfSub). They mirror the
+  // exact code paths the panel buttons use, so they also drive acceptance tests.
+  function exposeHooks() {
+    diag.selectTrack = (url) => chooseTrack(encodeURIComponent(String(url || '')));
+    diag.toggleAi = () => {
+      settings.ai = !settings.ai; settings.aiTouched = true; persist(); renderPanel();
+      engine.setEnabled(!!settings.ai);
+      if (settings.ai) primeTranslate(); else { shownKey = ''; tick(true); }
+    };
+    diag.snapshot = () => ({
+      track: engine.currentTrackKey(),
+      lang: engine.currentLang(),
+      ai: settings.ai,
+      enabled: engine.isEnabled(),
+      cache: engine.size(),
+      pending: engine.pendingCount(),
+      queue: engine.queueLength(),
+      translating: engine.stats(),
+      primary: primary ? primary.textContent : '',
+      secondary: secondary ? secondary.textContent : '',
+      tracks: tracks.length,
+      tickRunning: !!tickTimer,
+    });
+    diag.engine = engine;
+  }
 }
