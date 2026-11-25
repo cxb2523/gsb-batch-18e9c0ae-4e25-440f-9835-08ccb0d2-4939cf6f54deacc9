@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, shrink-to-fit=no"
+    />
+    <meta charset="utf-8" />
+    <title>Bubbles!</title>
+    <meta property="og:title" content="Bubbles!" />
+    <meta property="og:url" content="https://ehmorris.com/bubbles" />
+    <meta name="description" content="Pop the bubbles!" />
+    <meta property="og:description" content="Pop the bubbles!" />
+    <meta
+      property="og:image"
+      content="https://ehmorris.com/bubbles/images/oembed.png"
+    />
+    <meta property="og:image:width" content="700" />
+    <meta property="og:image:height" content="700" />
+    <link
+      rel="icon"
+      type="image/png"
+      href="./images/favicon-16x16.png"
+      sizes="16x16"
+    />
+    <link
+      rel="icon"
+      type="image/png"
+      href="./images/favicon-32x32.png"
+      sizes="32x32"
+    />
+    <link
+      rel="icon"
+      type="image/png"
+      href="./images/favicon-180x180.png"
+      sizes="180x180"
+    />
+    <link
+      rel="icon"
+      type="image/png"
+      href="./images/favicon-270x270.png"
+      sizes="270x270"
+    />
+    <link rel="apple-touch-icon" href="./images/favicon-270x270.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <link rel="stylesheet" type="text/css" href="./index.css" />
+    <link rel="preload" as="fetch" href="/sounds/fireworks1.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/fireworks2.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/impact.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/level1.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/level2.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/lose.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/miss.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/pluck1.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/pluck2.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/pluck3.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/pluck4.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/pluck5.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/pluck6.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/pluck7.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/pluck8.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/pluck9.mp3" />
+    <link rel="preload" as="fetch" href="/sounds/silence.mp3" />
+  </head>
+  <body>
+    <div class="layout"><div id="canvas"></div></div>
+    <script type="module" src="./index.js"></script>
+    <script>
+      (function (h, o, u, n, d) {
+        h = h[d] = h[d] || {
+          q: [],
+          onReady: function (c) {
+            h.q.push(c);
+          },
+        };
+        d = o.createElement(u);
+        d.async = 1;
+        d.src = n;
+        n = o.getElementsByTagName(u)[0];
+        n.parentNode.insertBefore(d, n);
+      })(
+        window,
+        document,
+        "script",
+        "https://www.datadoghq-browser-agent.com/datadog-rum-v4.js",
+        "DD_RUM"
+      );
+      DD_RUM.onReady(function () {
+        DD_RUM.init({
+          clientToken: "pub29b4ec61338ff64383116ae4bf1b2e48",
+          applicationId: "4c09e9e3-7012-4576-bbeb-9a81a5c7b9e7",
+          site: "datadoghq.com",
+          sessionSampleRate: 100,
+          trackUserInteractions: true,
+        });
+      });
+    </script>
+  </body>
+</html>

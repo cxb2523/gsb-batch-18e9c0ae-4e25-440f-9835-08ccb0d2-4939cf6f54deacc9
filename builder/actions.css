@@ -1,0 +1,126 @@
+.actionsTop-button {
+  display: flex;
+  grid-gap: 8px;
+  padding: 16px 0;
+  width: 100%;
+  align-items: center;
+  justify-content: center;
+  height: 44px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease-in-out;
+  -webkit-backdrop-filter: blur(32px);
+  backdrop-filter: blur(32px);
+}
+
+.actionsTop-button:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.actionsTop-button:active {
+  transform: scale(0.98);
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.actionsTop-button--active {
+  transform: scale(0.98);
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.actionsTop-button:hover .actions-button-label {
+  transform: translateY(-2px);
+}
+
+.actionsTop-button:hover .actions-button-shortcut {
+  transform: translateY(-2px);
+}
+
+.actionsTop-button-label {
+  font-weight: 500;
+  transition: transform 0.15s ease-in-out;
+}
+
+.actionsTop-button-shortcut {
+  opacity: 0.65;
+  transition: transform 0.15s ease-in-out;
+}
+
+.actionsBottom {
+  display: flex;
+  width: 100%;
+  padding: 0 32px 32px;
+  box-sizing: border-box;
+  grid-gap: 16px;
+  position: fixed;
+  bottom: 0;
+}
+
+@media (max-width: 540px) {
+  .actionsBottom {
+    padding: 0 16px 16px;
+    grid-gap: 4px;
+  }
+}
+
+.actionsBottom-button {
+  display: flex;
+  grid-gap: 8px;
+  width: 100%;
+  padding: 16px;
+  align-items: center;
+  justify-content: center;
+  height: 44px;
+  background: rgba(255, 255, 255, 0.1);
+  color: inherit;
+  text-decoration: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease-in-out;
+  -webkit-backdrop-filter: blur(32px);
+  backdrop-filter: blur(32px);
+}
+
+@media (max-width: 540px) {
+  .actionsBottom-button {
+    padding: 16px 8px;
+  }
+}
+
+.actionsBottom-button:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.actionsBottom-button:active {
+  transform: scale(0.98);
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.actionsBottom-button--active {
+  transform: scale(0.98);
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.actionsBottom-button:hover .actions-button-label {
+  transform: translateY(-2px);
+}
+
+.actionsBottom-button:hover .actions-button-shortcut {
+  transform: translateY(-2px);
+}
+
+.actionsBottom-button-label {
+  font-weight: 500;
+  transition: transform 0.15s ease-in-out;
+}
+
+.actionsBottom-button-shortcut {
+  opacity: 0.65;
+  transition: transform 0.15s ease-in-out;
+}
+
+@media (max-width: 540px) {
+  .actionsBottom-button-shortcut {
+    display: none;
+  }
+}

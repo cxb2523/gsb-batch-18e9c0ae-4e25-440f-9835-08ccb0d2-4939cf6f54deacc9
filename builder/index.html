@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, shrink-to-fit=no"
+    />
+    <meta charset="utf-8" />
+    <title>Bubbles! Level Builder</title>
+    <link
+      rel="icon"
+      type="image/png"
+      href="../images/favicon-16x16.png"
+      sizes="16x16"
+    />
+    <link
+      rel="icon"
+      type="image/png"
+      href="../images/favicon-32x32.png"
+      sizes="32x32"
+    />
+    <link
+      rel="icon"
+      type="image/png"
+      href="../images/favicon-180x180.png"
+      sizes="180x180"
+    />
+    <link
+      rel="icon"
+      type="image/png"
+      href="../images/favicon-270x270.png"
+      sizes="270x270"
+    />
+    <link rel="apple-touch-icon" href="../images/favicon-270x270.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <link rel="stylesheet" type="text/css" href="./index.css" />
+  </head>
+  <body>
+    <div class="levelData" id="levelData"></div>
+    <div class="layout-meta">
+      <div class="layout-meta-row">
+        <div class="layout-meta-row-label">NAME</div>
+        <input id="layout-name" type="text" maxlength="40" />
+      </div>
+      <div class="layout-meta-row">
+        <div class="layout-meta-row-label">PAR</div>
+        <input id="layout-par" type="number" maxlength="3" />
+      </div>
+      <div class="layout-meta-row">
+        <div class="layout-meta-row-label">GRAVITY</div>
+        <input id="layout-gravity" type="range" min=".02" max=".1" step=".01" />
+      </div>
+    </div>
+    <div class="layout">
+      <div class="actionsTop-button" id="addRow">
+        <div class="actionsTop-button-label">Add Row</div>
+        <div class="actionsTop-button-shortcut">(R)</div>
+      </div>
+      <div class="layout-preview" id="layout-preview"></div>
+      <div class="actionsBottom">
+        <div class="actionsBottom-button" id="copyToClipboard">
+          <div class="actionsBottom-button-label">Clipboard</div>
+          <div class="actionsBottom-button-shortcut">(C)</div>
+        </div>
+        <a href="#" class="actionsBottom-button" id="submitLevel">
+          <span class="actionsBottom-button-label">Submit</span>
+          <span class="actionsBottom-button-label">↗︎</span>
+        </a>
+        <a href="#" class="actionsBottom-button" id="openPreview">
+          <span class="actionsBottom-button-label">Preview</span>
+          <span class="actionsBottom-button-label">↗︎</span>
+        </a>
+      </div>
+    </div>
+    <script type="module" src="./index.js"></script>
+  </body>
+</html>

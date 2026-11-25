@@ -1,0 +1,33 @@
+body {
+  --blue: #2d2d74;
+  --blue-background: #070729;
+  margin: 0;
+  overflow: hidden;
+  background: var(--blue-background);
+  font: 500 100vmin -apple-system, BlinkMacSystemFont, sans-serif;
+  touch-action: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.buttonHover {
+  cursor: pointer;
+}
+
+canvas {
+  background: var(--blue);
+  display: block;
+  margin: auto;
+  touch-action: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  box-shadow: 0 0 64px rgba(0, 0, 0, 0.4);
+}
+
+div {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
