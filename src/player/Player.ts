@@ -1,4 +1,5 @@
 import type { Node } from "../node/Node.ts";
+import { buildCapabilities } from "../node/capabilities.ts";
 import { Queue, type SerializedQueue } from "../queue/Queue.ts";
 import { FilterChain } from "../filters/FilterChain.ts";
 import {
@@ -220,6 +221,11 @@ export class Player<TTrack extends TrackData = TrackData> {
   private _voiceStateSent: boolean = false;
   private _paused: boolean = false;
   private _destroyed: boolean = false;
+  /**
+   * Serializes node migrations. Concurrent setNode() calls queue instead of
+   * interleaving ownership swaps, guaranteeing exactly one node holds the player.
+   */
+  private _migrationQueue: Promise<void> = Promise.resolve();
   private _loudnessNormalizer: boolean = false;
   private _ducking: boolean = false;
   private _fading: FadingSettings | null = null;
@@ -820,51 +826,297 @@ export class Player<TTrack extends TrackData = TrackData> {
     return this.currentTrack;
   }
 
-  /** Reassigns player to a new Lavalink node (for node failover / load balancing) */
-  public async setNode(node: Node): Promise<void> {
-    const oldNode = this._node;
-    this.removeNodeListeners();
-    this._node = node;
-    this.setupNodeListeners();
-    oldNode.playerCount = Math.max(0, oldNode.playerCount - 1);
-    node.playerCount += 1;
-
-    // The new node's session has never seen this player's voice credentials
-    this._voiceStateSent = false;
-
-    // Moving between server families can leave filters the target can't run
-    // (e.g. NodeLink extras onto a Lavalink node). Drop them gracefully — a
-    // failover the user didn't initiate must degrade, not throw.
-    this.dropUnsupportedFilters(node);
-
-    // Clean up player state on old node so it stops streaming audio
-    if (oldNode.state === "connected" && oldNode.rest.sessionId != null) {
-      await oldNode.rest.destroyPlayer(oldNode.rest.sessionId, this.guildId).catch(() => undefined);
+  /**
+   * Reassigns the player to another Lavalink/NodeLink node (node failover /
+   * load balancing) without advancing the queue.
+   *
+   * Migration is serialized and failure-atomic:
+   * 1. snapshot the pre-migration interpolated position, pause state, volume
+   *    and filters;
+   * 2. reject up-front when the target node/session is unusable and the player
+   *    has state that must be rebuilt there;
+   * 3. rebuild the full player state (voice credentials exactly once, current
+   *    track + resume position + pause + volume + filters) ON THE TARGET while
+   *    the old node is left untouched — a failed rebuild therefore rolls back
+   *    by simply never switching nodes, preserving playback;
+   * 4. commit local ownership (node listeners + playerCount) and only then
+   *    destroy the player on the old node, best-effort (a destroy failure never
+   *    fails the migration).
+   *
+   * Concurrent calls run one after another: the last target wins and every
+   * previous node gets its player destroyed. destroy() racing a migration is
+   * observed at every await checkpoint so no node is left holding playback.
+   */
+  public setNode(node: Node): Promise<void> {
+    if (this._destroyed) {
+      return Promise.reject(new PlayerError("Player is destroyed", this.guildId));
     }
 
-    if (this._status === "playing" && this.currentTrack != null) {
-      await this.playTrack(this.currentTrack, { position: this.position });
+    const migration = this._migrationQueue.then(() => this.runMigration(node));
+    // A rejected migration must not break the queue tail for later callers.
+    this._migrationQueue = migration.then(
+      () => undefined,
+      () => undefined,
+    );
+    return migration;
+  }
+
+  private async runMigration(target: Node): Promise<void> {
+    // A queued migration can start after destroy() has already torn this down.
+    if (this._destroyed) return;
+
+    const source = this._node;
+    if (target == null || target === source) return;
+
+    const current = this.queue.currentTrack;
+    const hasPlayback = current != null && (this._status === "playing" || this._status === "paused");
+
+    // Snapshot BEFORE the first await — this is the exact pre-migration
+    // interpolated position the new node must resume from. While paused the
+    // getter returns the frozen position, so paused migrations stay put.
+    const resumePosition = hasPlayback ? this.position : this._position;
+    const resumePaused = this._paused;
+
+    // The new node's session has never seen this player's voice credentials.
+    // Recover them from the global tracker for recreated players, mirroring
+    // resync()/playTrack(). Never block on the Discord handshake here: the
+    // credentials are attached to the rebuild PATCH when available.
+    if (!this.hasVoiceCredentials) {
+      const globalVoice = this.kumo?.voice?.getVoiceState?.(this.guildId);
+      if (
+        globalVoice != null &&
+        globalVoice.token != null &&
+        globalVoice.endpoint != null &&
+        globalVoice.sessionId != null
+      ) {
+        this.setVoiceState(globalVoice);
+      }
+    }
+    const hasVoice = this.hasVoiceCredentials;
+
+    // An idle player without voice credentials keeps everything client-side
+    // (applied on the next playTrack), so re-homing it cannot fail against an
+    // unreachable target and needs no rebuild PATCH.
+    const mustRebuildOnNode = hasPlayback || hasVoice;
+    if (mustRebuildOnNode) {
+      this.assertMigrationTargetReady(target);
+    }
+
+    // Compute the target-compatible filter payload without mutating the chain:
+    // if the rebuild fails and we stay on `source`, all filters survive.
+    const unsupported = this.unsupportedFilterNames(target);
+    const filterPayload = this.buildMigrationFilterPayload(unsupported);
+
+    // Detach source-node listeners before the rebuild await so a late
+    // trackEnd/playerUpdate on the departing node cannot interleave with the
+    // migration (the queue must not advance twice). On rollback they are
+    // re-attached because this._node still points at `source`.
+    this.removeNodeListeners();
+
+    if (mustRebuildOnNode) {
+      try {
+        await this.pushMigrationState(target, {
+          current: hasPlayback ? current : null,
+          position: resumePosition,
+          paused: resumePaused,
+          filterPayload,
+        });
+      } catch (error) {
+        if (this._destroyed) {
+          // destroy() already tears down `source` via this._node; only the
+          // player possibly created on `target` still needs cleanup.
+          await this.destroyNodePlayerQuietly(target);
+          return;
+        }
+        // Rollback — node identity, playerCount and filter chain were never
+        // changed; restore source listeners and surface the failure. The old
+        // node was never destroyed, so its playback continues untouched.
+        this.setupNodeListeners();
+        throw error;
+      }
+    }
+
+    if (this._destroyed) {
+      // destroy() won the race while the rebuild was in flight and destroyed
+      // the source player; remove anything we just created on the target.
+      await this.destroyNodePlayerQuietly(target);
+      return;
+    }
+
+    // Commit local ownership synchronously now that the target holds state.
+    this._node = target;
+    this.setupNodeListeners();
+    source.playerCount = Math.max(0, source.playerCount - 1);
+    target.playerCount += 1;
+
+    // Voice credentials were sent to the new session exactly once (inside the
+    // rebuild PATCH); mark it so playTrack()/sendVoiceUpdate() don't repeat it.
+    this._voiceStateSent = hasVoice;
+
+    if (hasPlayback) {
+      this._position = resumePosition;
+      this._positionTimestamp = Date.now();
+      this._paused = resumePaused;
+      if (resumePaused) {
+        this._status = "paused";
+      }
+    }
+
+    // The target accepted the state — only now permanently drop filters it
+    // cannot run (existing cross-family policy, with a debug line each).
+    this.dropUnsupportedFilters(target, unsupported);
+
+    // Remove the old node's player so it stops streaming audio. Best-effort:
+    // an old-node destroy failure must not interrupt/fail the migration. Keep
+    // the historical connected/session guard so a already-dead source node
+    // doesn't trigger doomed HTTP retries.
+    await this.destroyNodePlayerQuietly(source, true);
+  }
+
+  /**
+   * Ensures a migration target has a usable Lavalink/NodeLink session.
+   * "Not connected" and "missing session" are the two preconditions callers
+   * observe as a failed, rolled-back migration.
+   */
+  private assertMigrationTargetReady(target: Node): void {
+    const state = target?.state;
+    const sessionId = target?.rest?.sessionId;
+    // An omitted state (minimal hand-rolled mock) is treated as reachable as
+    // long as a session exists; an explicit non-connected state is a failure.
+    if ((state != null && state !== "connected") || sessionId == null) {
+      throw new PlayerNotConnectedError(
+        this.guildId,
+        `cannot migrate to node ${target?.id ?? "?"}: node is not connected or has no session`,
+      );
+    }
+  }
+
+  /** Names of active filters the target node cannot run. Nodes without
+   *  supportsFilter() fall back to their configured family's default caps and
+   *  finally to "supports everything" for minimal test mocks. */
+  private unsupportedFilterNames(target: Node): string[] {
+    let supportsFilter: (name: string) => boolean;
+    if (typeof target?.supportsFilter === "function") {
+      supportsFilter = (name) => target.supportsFilter(name);
     } else {
-      // Not playing — still register the player (voice + volume/filters) on the new node
-      await this.resync().catch(() => undefined);
+      const type = (target as { type?: unknown } | null)?.type;
+      if (type === "lavalink" || type === "nodelink") {
+        const caps = buildCapabilities(type, null);
+        supportsFilter = (name) => caps.filters.has(name);
+      } else {
+        supportsFilter = (): boolean => true;
+      }
+    }
+
+    const names: string[] = [];
+    for (const filter of this.filters.getAll()) {
+      if (!supportsFilter(filter.name)) names.push(filter.name);
+    }
+    return names;
+  }
+
+  /**
+   * Serializes the filter chain for the target node while omitting the
+   * top-level payload keys owned by {@link unsupported} filters. The chain
+   * itself is not mutated here (mutation happens on commit, after success).
+   */
+  private buildMigrationFilterPayload(unsupported: readonly string[]): FiltersObject | undefined {
+    const payload = this.filters.toPayload() as FiltersObject & Record<string, unknown>;
+    if (unsupported.length > 0) {
+      const blocked = new Set(unsupported);
+      for (const filter of this.filters.getAll()) {
+        if (!blocked.has(filter.name)) continue;
+        const serialized = filter.serialize() as Record<string, unknown>;
+        for (const key of Object.keys(serialized)) {
+          delete payload[key];
+        }
+      }
+    }
+    return Object.keys(payload).length > 0 ? (payload as FiltersObject) : undefined;
+  }
+
+  /**
+   * The single ordered state rebuild sent to a migration target: voice
+   * credentials (once), current track with the resume position/pause flag,
+   * volume, filters and NodeLink-only toggles. Mirrors the resync() payload so
+   * both rebuild paths stay consistent.
+   */
+  private async pushMigrationState(
+    target: Node,
+    state: {
+      current: TTrack | null;
+      position: number;
+      paused: boolean;
+      filterPayload?: FiltersObject;
+    },
+  ): Promise<void> {
+    const sessionId = target.rest.sessionId;
+    if (sessionId == null) {
+      throw new PlayerNotConnectedError(this.guildId);
+    }
+
+    const { token, endpoint, sessionId: voiceSessionId } = this._voiceState;
+    const hasVoicePayload =
+      this.hasVoiceCredentials && token != null && endpoint != null && voiceSessionId != null;
+    const hasFilterKeys = state.filterPayload != null && Object.keys(state.filterPayload).length > 0;
+
+    await target.rest.updatePlayer(sessionId, this.guildId, {
+      ...(hasVoicePayload
+        ? {
+            voice: {
+              token: token!,
+              endpoint: endpoint!,
+              sessionId: voiceSessionId!,
+              channelId: this._voiceChannelId,
+            },
+          }
+        : {}),
+      ...(state.current != null
+        ? {
+            track: { encoded: state.current.encoded },
+            position: state.position,
+            paused: state.paused,
+          }
+        : {}),
+      volume: this._volume,
+      filters: hasFilterKeys ? state.filterPayload : undefined,
+      ...(this._loudnessNormalizer ? { loudnessNormalizer: true } : {}),
+      ...(this._ducking ? { ducking: true } : {}),
+      ...(this._fading != null ? { fading: this._fading } : {}),
+      ...(this._crossfade != null ? { crossfade: this._crossfade } : {}),
+    });
+  }
+
+  /** Destroys this player on the given node, swallowing every error. */
+  private async destroyNodePlayerQuietly(node: Node, onlyWhenConnected = false): Promise<void> {
+    try {
+      // Skip only for an explicit non-connected state; a mock that omits state
+      // is still allowed to record the destroyPlayer call.
+      if (onlyWhenConnected && node.state != null && node.state !== "connected") return;
+      const sessionId = node.rest.sessionId;
+      if (sessionId == null) return;
+      await node.rest.destroyPlayer(sessionId, this.guildId);
+    } catch {
+      // Cleanup must never break migration or destroy() races.
     }
   }
 
   /**
-   * Removes any active filter the target node can't run, emitting a debug line
+   * Removes active filters the target node can't run, emitting a debug line
    * per dropped filter. Used on node moves so cross-family failover
-   * (NodeLink ↔ Lavalink) never sends an unknown filter that the node ignores
-   * or rejects.
+   * (NodeLink extras onto Lavalink) never sends an unknown filter that the node
+   * ignores or rejects. When {@link unsupported} names are precomputed they are
+   * used directly (the target may already have been validated).
    */
-  private dropUnsupportedFilters(node: Node): void {
-    for (const filter of this.filters.getAll()) {
-      if (!node.supportsFilter(filter.name)) {
-        this.filters.remove(filter.name);
-        this.events.emit(
-          "debug",
-          `Dropped filter "${filter.name}" on move to node ${node.id} (${node.type}) — unsupported there`,
-        );
-      }
+  private dropUnsupportedFilters(node: Node, unsupported?: readonly string[]): void {
+    const names = unsupported ?? this.unsupportedFilterNames(node);
+    for (const name of names) {
+      if (!this.filters.has(name)) continue;
+      this.filters.remove(name);
+      this.events.emit(
+        "debug",
+        `Dropped filter "${name}" on move to node ${node.id} (${node.type}) — unsupported there`,
+      );
     }
   }
 
