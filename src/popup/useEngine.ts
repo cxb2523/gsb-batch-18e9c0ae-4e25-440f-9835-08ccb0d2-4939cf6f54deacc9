@@ -20,7 +20,7 @@ import { planResetProfile, makeResetSnapshot, applyUndoReset, resetControls } fr
 import { NO_UNDO, armUndo, undoAfter, canUndo, type UndoEvent, type UndoSlot } from '@/lib/undo';
 import { fingerprintWorld, planArm, planUndo, type ResetUndoRecord } from '@/lib/undo-state';
 import { canResetChanges, planResetChanges, applyRestore, type RestoreWriters } from '@/lib/reset-changes';
-import { AUTO_GAIN_DEFAULT, outputGain } from '@/lib/auto-gain';
+import { AUTO_GAIN_DEFAULT, engineGain } from '@/lib/auto-gain';
 import { refreshFor } from '@/lib/storage-events';
 import { mirrorHost } from '@/lib/mirror-target';
 import { resolveSound } from '@/lib/sound-profile';
@@ -30,6 +30,7 @@ import {
   NO_BASELINE,
   previewForDrag,
   previewForBypass,
+  audibleFor,
   captureBaseline as latchBaseline,
   type Preview,
   type Baseline
@@ -146,8 +147,32 @@ export function useEngine() {
   });
   const autoGainRef = useRef(autoGain);
   autoGainRef.current = autoGain;
-  /** What to SEND. The stored gain is always the user's own; this is only ever a message payload. */
-  const sentGain = useCallback((userGain: number, bands: Band[]) => outputGain({ userGain, bands, on: autoGainRef.current }), []);
+
+  /**
+   * What to SEND to the engine for one tab — never what to store, and never a second source of
+   * truth for the curve.
+   *
+   * Two things can change the level the tab hears, and they must not be allowed to compute it
+   * independently:
+   *
+   *   Auto Gain   subtracts the curve's average lift from the user's volume.
+   *   Bypass      takes the equalizer out of the path, so there is no lift to subtract.
+   *
+   * The old code expressed bypass by handing a FLAT curve to Auto Gain and relying on a flat
+   * curve's zero compensation. That is an accident, not a rule: onGainLive had to remember the
+   * substitution while onBandsLive, applyPreset and enterBypass each spelled it out separately,
+   * and any push that passed the real curve while bypassed re-applied a duck the user was trying
+   * to compare against. Here the curve argument is always the one being heard or edited, and
+   * `bypassed` is passed as itself — so the flat-substitution cannot be forgotten or half-applied.
+   *
+   * `userGain` is always the stored/edited master. See engineGain's note: the result is a message
+   * payload only, and feeding it back into storage is the drift this separation exists to prevent.
+   */
+  const sentGain = useCallback(
+    (userGain: number, bands: Band[], bypassed: boolean) =>
+      engineGain({ userGain, bands, on: autoGainRef.current, bypassed }),
+    []
+  );
 
   // The "Full window" page runs as a GLOBAL-PROFILE editor: its own tab isn't capturable, so
   // instead of editing a real tab it edits the sound-everywhere profile (host '' → global).
@@ -332,20 +357,45 @@ export function useEngine() {
   const resolvedFor = useCallback((host: string) =>
     resolveSound(host, rulesRef.current, presetsRef.current, globalRef.current), []);
 
-  // Push every captured tab's resolved sound to the engine, and mirror the active tab's in
-  // the graph. Skips while the user is mid-drag (don't clobber a live edit).
+  // Push every captured tab's sound to the engine, and mirror the active tab's in the graph.
+  //
+  // ONE OWNER FOR "WHAT IS AUDIBLE". The active tab used to be special-cased by SKIPPING it while
+  // a preview or a drag was live, on the assumption that whoever opened the preview had already
+  // pushed the matching curve. That assumption is exactly what left the engine stale when the
+  // preview was still open and something ELSE changed the level — toggling Auto Gain mid-bypass or
+  // mid-drag. The toggle reached applyEverywhere, the active tab was skipped, and the tab kept
+  // playing the old compensation until the next commit. So the active tab is no longer skipped: it
+  // is sent `audibleFor(...)` — the same answer a bypass toggle, an Auto Gain toggle, a rule change
+  // and a storage refresh all get (see lib/edit-state.ts). Every other captured tab keeps receiving
+  // its resolved sound, so a rule or preset change still propagates while the user shapes this one.
   const applyEverywhere = useCallback(
     (tabsList: { id: number; host: string }[]) => {
       if (!hydratedRef.current) return;
-      // The guard is per tab, not global. A preview or a live drag owns the ACTIVE tab only —
-      // every other captured tab must still receive its resolved sound, so a rule or preset change
-      // keeps propagating while the user is shaping this one.
-      // AUDIO: a preview of any kind owns the active tab, so it is skipped. Unchanged.
-      const held = () => interacting.current || previewRef.current.has;
       for (const t of tabsList) {
-        if (t.id === activeIdRef.current && held()) continue;
+        if (t.id === activeIdRef.current) {
+          const bypassedHere = isBypassed(previewRef.current);
+          const r = resolvedFor(t.host);
+          const audible = audibleFor({
+            preview: previewRef.current,
+            interacting: interacting.current,
+            editing: { bands: bandsRef.current, gain: gainRef.current, presetName: activeRef.current },
+            resolved: { bands: r.bands, gain: r.gain, presetName: r.presetName }
+          });
+          // No activePreset in the payload: the engine only overwrites the label when it is
+          // defined, so under bypass the tab keeps naming the preset it is staged on while it
+          // plays muted-flat. When not bypassed the label tracks the buffer, so it is sent.
+          io.toOffscreen('applySettings', {
+            tabId: t.id,
+            eqFilters: audible.bands,
+            gain: sentGain(audible.gain, audible.bands, bypassedHere),
+            ...(bypassedHere ? {} : { activePreset: audible.presetName })
+          });
+          continue;
+        }
         const r = resolvedFor(t.host);
-        io.toOffscreen('applySettings', { tabId: t.id, eqFilters: r.bands, gain: sentGain(r.gain, r.bands), activePreset: r.presetName });
+        // Every tab but the active one plays its resolved sound; a preview/bypass belongs to the
+        // active tab alone, so `bypassed: false` is the correct answer here, not a default.
+        io.toOffscreen('applySettings', { tabId: t.id, eqFilters: r.bands, gain: sentGain(r.gain, r.bands, false), activePreset: r.presetName });
       }
       // BUFFER: a different question, and it used to share the flag above. A bypass has no claim
       // on the editing buffer — freezing it for a whole bypass session let the graph keep showing
@@ -802,10 +852,11 @@ export function useEngine() {
       }
       const id = activeIdRef.current;
       if (id == null) return;
-      // The eleven filters stop at the tab boundary while bypassed; the master volume below does
-      // not, because bypass is about the equalizer and not the user's volume.
+      // The eleven filters stop at the tab boundary while bypassed: the tab is already playing
+      // flat, so there is nothing to push and no level to re-render from a band drag. When not
+      // bypassed this is a normal live push, with the bypassed flag passed as itself.
       if (!sendsBandsToActiveTab(previewRef.current)) return;
-      send(() => io.toOffscreen('applySettings', { tabId: id, eqFilters: nb, gain: sentGain(gainRef.current, nb), activePreset: activeRef.current }));
+      send(() => io.toOffscreen('applySettings', { tabId: id, eqFilters: nb, gain: sentGain(gainRef.current, nb, false), activePreset: activeRef.current }));
     },
     [send, captureBaseline, recordJournal]
   );
@@ -835,7 +886,10 @@ export function useEngine() {
       }
       const id = activeIdRef.current;
       if (id == null) return;
-      send(() => io.toOffscreen('modifyGain', { tabId: id, gain: sentGain(g, isBypassed(previewRef.current) ? io.flatBands() : bandsRef.current), activePreset: activeRef.current }));
+      // The flag is passed as itself. The old call substituted a flat curve so Auto Gain's zero
+      // compensation for a flat curve would stand in for bypass — an accidental way to express
+      // "compensate nothing", which re-derived the same answer from the wrong input.
+      send(() => io.toOffscreen('modifyGain', { tabId: id, gain: sentGain(g, bandsRef.current, isBypassed(previewRef.current)), activePreset: activeRef.current }));
     },
     [send, captureBaseline, recordJournal]
   );
@@ -992,7 +1046,17 @@ export function useEngine() {
     const id = activeIdRef.current;
     // No activePreset in the payload: the engine only overwrites the label when it is defined, so
     // the tab keeps showing which preset it is on while muted-flat.
-    if (id != null) io.toOffscreen('applySettings', { tabId: id, eqFilters: io.flatBands(), gain: sentGain(gainRef.current, io.flatBands()) });
+    //
+    // The level here is the user's own, with a flat curve and `bypassed: true`. Auto Gain has
+    // nothing to compensate because the equalizer is out of the path; passing the flag says that
+    // directly instead of leaning on a flat curve's zero compensation to mean the same thing.
+    if (id != null) {
+      io.toOffscreen('applySettings', {
+        tabId: id,
+        eqFilters: io.flatBands(),
+        gain: sentGain(gainRef.current, io.flatBands(), true)
+      });
+    }
   }, [setPreview]);
   // --- bypass:on:end --------------------------------------------------------------------------
 
@@ -1030,6 +1094,10 @@ export function useEngine() {
     const next = !previous;
     autoGainRef.current = next;
     setAutoGain(next);
+    // Re-render every tab's level through the one owner of "what is audible". This is the path
+    // that used to leave the active tab behind: applyEverywhere skipped it whenever a preview or
+    // drag was live, so toggling Auto Gain mid-bypass (or mid-drag) changed nothing until the next
+    // commit landed — the tab kept playing the old compensation while the UI said otherwise.
     applyEverywhere(tabsRef.current);
     void io.writeAutoGainPreference(next).then((result) => {
       if (!result.ok) {
@@ -1535,7 +1603,7 @@ export function useEngine() {
         return;
       }
       const id = activeIdRef.current;
-      if (id != null) io.toOffscreen('applySettings', { tabId: id, eqFilters: nb, gain: sentGain(gainRef.current, nb), activePreset: name });
+      if (id != null) io.toOffscreen('applySettings', { tabId: id, eqFilters: nb, gain: sentGain(gainRef.current, nb, false), activePreset: name });
       commitTarget(nb, gainRef.current, name);
     },
     [showNotice, commitTarget, captureBaseline, sentGain]

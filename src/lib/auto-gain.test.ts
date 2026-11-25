@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { AUTO_GAIN_DEFAULT, compensationDb, outputGain } from './auto-gain';
+import { AUTO_GAIN_DEFAULT, compensationDb, engineGain, outputGain } from './auto-gain';
 import { flatBands } from './engine-io';
 import { masterGainToDb, MASTER_DB_MAX, MASTER_DB_MIN } from './audio';
 import type { Band } from './audio';
@@ -81,5 +81,66 @@ describe('what the engine is told to play', () => {
     const bands = all(6);
     const once = outputGain({ userGain: 1, bands, on: true });
     expect(outputGain({ userGain: 1, bands, on: true })).toBe(once);
+  });
+});
+
+// Bypass and Auto Gain, decided together. These used to be two independent level paths that
+// happened to agree because bypass handed Auto Gain a flat curve; a push that forgot the
+// substitution re-applied the compensation the user was comparing against. Passing `bypassed`
+// as an argument removes the opportunity to forget.
+describe('what a bypassed tab is told to play', () => {
+  it('plays the user volume unmodified, whatever the curve and whatever Auto Gain says', () => {
+    for (const bands of [FLAT, all(6), all(-6), shaped(12, -3, 6)]) {
+      for (const userGain of [1, 0.5, 2, 0.031, 8]) {
+        for (const on of [true, false]) {
+          expect(engineGain({ userGain, bands, on, bypassed: true })).toBe(userGain);
+        }
+      }
+    }
+  });
+
+  it('is exactly the Auto Gain rendering when not bypassed', () => {
+    for (const bands of [FLAT, all(6), all(-6), shaped(12, -3, 6)]) {
+      for (const userGain of [1, 0.5, 2]) {
+        for (const on of [true, false]) {
+          expect(engineGain({ userGain, bands, on, bypassed: false })).toBe(outputGain({ userGain, bands, on }));
+        }
+      }
+    }
+  });
+
+  it('returns the compensation the moment bypass ends, not a leftover one', () => {
+    // The comparison the user is making: bypassed is the user's level; leaving bypass must restore
+    // exactly the compensated level for the SAME curve and stored volume — no residual, no double.
+    const bands = all(6);
+    const userGain = 1.4;
+    const bypassed = engineGain({ userGain, bands, on: true, bypassed: true });
+    const playing = engineGain({ userGain, bands, on: true, bypassed: false });
+    expect(bypassed).toBe(userGain);
+    expect(masterGainToDb(playing)).toBeCloseTo(masterGainToDb(userGain) - 6, 6);
+  });
+
+  it('never leaves the master range while compensating', () => {
+    for (const bands of [all(30), all(-30), shaped(30, 30, 30, -30)]) {
+      for (const userGain of [1, 8, 0.01]) {
+        const db = masterGainToDb(engineGain({ userGain, bands, on: true, bypassed: false }));
+        expect(db).toBeLessThanOrEqual(MASTER_DB_MAX + 1e-9);
+        expect(db).toBeGreaterThanOrEqual(MASTER_DB_MIN - 1e-9);
+      }
+    }
+  });
+
+  it('is a pure function of its inputs — toggling back and forth cannot accumulate', () => {
+    // The sequence that used to drift: bypass on, off, on, off. If any step fed a compensated
+    // value back in, the next one would duck (or lift) again. Every step is rendered from the
+    // stored volume, so the answer at each stage is the same as the first time it was asked.
+    const bands = all(6);
+    const userGain = 1;
+    const expectedOn = engineGain({ userGain, bands, on: true, bypassed: false });
+    const expectedBypassed = engineGain({ userGain, bands, on: true, bypassed: true });
+    for (let i = 0; i < 5; i++) {
+      expect(engineGain({ userGain, bands, on: true, bypassed: false })).toBe(expectedOn);
+      expect(engineGain({ userGain, bands, on: true, bypassed: true })).toBe(expectedBypassed);
+    }
   });
 });

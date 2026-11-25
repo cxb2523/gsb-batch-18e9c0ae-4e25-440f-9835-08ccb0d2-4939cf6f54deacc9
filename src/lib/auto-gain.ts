@@ -46,3 +46,27 @@ export function outputGain(input: { userGain: number; bands: Band[]; on: boolean
   if (comp === 0) return input.userGain;
   return clampMasterGain(dbToMasterGain(masterGainToDb(clampMasterGain(input.userGain)) - comp));
 }
+
+/**
+ * The master gain a tab should actually PLAY: the one place Bypass and Auto Gain meet.
+ *
+ * They used to be two paths that each computed their own level. Auto Gain subtracted the curve's
+ * average lift from the master; Bypass worked around it by substituting a flat curve, whose
+ * compensation happens to be zero. That agreement was incidental — it held only while every
+ * caller remembered the substitution, and a later push that passed the real curve while bypassed
+ * would quietly reintroduce the duck the user was trying to compare against.
+ *
+ * So bypass is an argument, not a trick played on the curve:
+ *
+ *   bypassed  the equalizer is out of the path, so nothing is being lifted and there is nothing
+ *             to compensate — the tab hears the user's own volume, identically, whatever the
+ *             curve and whatever Auto Gain is set to.
+ *   otherwise the user's volume, with the curve's average lift subtracted when Auto Gain is on.
+ *
+ * `userGain` is always the STORED/edited master. The result is a message payload and must never
+ * be fed back into storage; see outputGain's note about the drift that causes.
+ */
+export function engineGain(input: { userGain: number; bands: Band[]; on: boolean; bypassed: boolean }): number {
+  if (input.bypassed) return input.userGain;
+  return outputGain(input);
+}

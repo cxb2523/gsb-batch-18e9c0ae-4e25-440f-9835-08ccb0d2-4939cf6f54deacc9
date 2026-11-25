@@ -82,16 +82,45 @@ export function previewForBypass(flat: Band[]): Preview {
 // so it is now asserted where the decision is actually taken. See invariants.test.ts,
 // "a save reads the editing buffer, never the preview override".
 //
-// engineBandsFor answered "what should the ACTIVE tab play". THAT QUESTION HAS NO SINGLE OWNER
-// TODAY. Three places decide it separately: applyEverywhere SKIPS the active tab while a preview
-// is on, onBandsLive sends the editing buffer, and toggleBypass sends flat. They agree only
-// because whoever set the preview already pushed the matching curve; nothing holds them together,
-// and a change that made bypass inaudible left the whole suite green.
-//
-// Giving that question one owner means making applyEverywhere send to the active tab instead of
-// skipping it, which is a change to how bypass works rather than a cleanup — so it belongs to the
-// bypass work, where it can be wired and proven in the same change. Until then, note that
-// `overrideBands` below is written by previewForBypass and read by nobody.
+// engineBandsFor answered "what should the ACTIVE tab play". audibleFor below is that question
+// answered in ONE place, which is what makes the bypass/Auto-Gain switch combinations consistent:
+// the same function decides for the initial push, a bypass toggle, an Auto Gain toggle, and a
+// storage refresh, so none of them can disagree about what is audible.
+
+/** What one tab should actually be playing, and the label that describes it. */
+export interface AudibleSound {
+  bands: Band[];
+  gain: number;
+  /** Provenance for the tab's "which preset" label. Under bypass it names the curve being edited. */
+  presetName: string;
+}
+
+/**
+ * What the ACTIVE tab should play, given the preview, a live gesture, the editing buffer and the
+ * sound storage resolves to for its host.
+ *
+ *   bypass on        the flat override · the user's own volume (no Auto Gain — nothing is lifted)
+ *   dragging         the editing buffer · the user's own volume
+ *   neither          the resolved sound (storage is ahead until a commit lands)
+ *
+ * Deliberately returns `editing.gain` rather than anything compensated: Auto Gain is a rendering
+ * applied on the way to the engine (see lib/auto-gain.ts), never a curve or volume that may be
+ * written back. Callers decide the bypassed flag; this function only names the three cases.
+ */
+export function audibleFor(input: {
+  preview: Preview;
+  interacting: boolean;
+  editing: AudibleSound;
+  resolved: AudibleSound;
+}): AudibleSound {
+  if (input.preview.has && input.preview.source === 'bypass') {
+    // The label travels with the curve the user is editing, not with the flat override — so the
+    // tab keeps naming the preset it is staged on while it plays unshaped.
+    return { bands: input.preview.overrideBands ?? input.editing.bands, gain: input.editing.gain, presetName: input.editing.presetName };
+  }
+  if (input.interacting || input.preview.source === 'drag') return input.editing;
+  return input.resolved;
+}
 
 /**
  * Latch once per popup session. Later mutations must not replace it, or a "restore what it was"

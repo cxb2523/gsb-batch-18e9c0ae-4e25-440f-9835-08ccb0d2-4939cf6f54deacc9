@@ -447,3 +447,147 @@ describe('useEngine storage and lifecycle integration', () => {
     expect(sync.RULES).toHaveLength(1);
   });
 });
+
+// Bypass and Auto Gain, across the switch orders that used to disagree. The compensation is a
+// rendering of the stored volume (lib/auto-gain.ts), and bypass is an argument to that rendering
+// (engineGain), not a flat curve substituted for the real one. These tests drive the popup's own
+// handlers and read what the engine was told, so a regression in the wiring shows up here.
+describe('Bypass and Auto Gain keep the engine at the right level', () => {
+  const comp = (db: number) => 10 ** (-db / 20); // the master gain for `db` of compensation
+
+  const readEngineBand = () => live[0].eqFilters[2].gain;
+
+  it('plays the user volume under bypass, and the compensated volume once bypass ends', async () => {
+    local.AUTO_GAIN = true;
+    local.DEFAULT_EQ.filters[2].g = 6; // one band at +6 dB, averaged over eleven → −6/11 dB
+    live[0].eqFilters = io.presetToBands(preset(6));
+    const hook = await setup();
+    expect(hook.result.current.autoGain).toBe(true);
+
+    act(() => hook.result.current.toggleBypass()); await settle();
+    expect(hook.result.current.bypassed).toBe(true);
+    expect(readEngineBand()).toBe(0); // flat curve: the equalizer is out of the path
+    expect(live[0].gain).toBeCloseTo(1); // the user's own volume, with NO compensation
+
+    act(() => hook.result.current.toggleBypass()); await settle();
+    expect(hook.result.current.bypassed).toBe(false);
+    expect(readEngineBand()).toBe(6);
+    expect(live[0].gain).toBeCloseTo(comp(6 / 11)); // the compensation is back, once, not twice
+    expect(local.DEFAULT_EQ.gain).toBe(1); // and storage never held the compensated value
+  });
+
+  it('does not drift across repeated bypass cycles under Auto Gain', async () => {
+    // The drift the separation exists to prevent: if a compensated value were ever stored, each
+    // cycle would duck a little further. Storage must be byte-identical after every round trip.
+    local.AUTO_GAIN = true;
+    local.DEFAULT_EQ.filters[2].g = 6;
+    live[0].eqFilters = io.presetToBands(preset(6));
+    const hook = await setup();
+    for (let i = 0; i < 5; i++) {
+      act(() => hook.result.current.toggleBypass()); await settle();
+      expect(live[0].gain).toBeCloseTo(1);
+      act(() => hook.result.current.toggleBypass()); await settle();
+      expect(live[0].gain).toBeCloseTo(comp(6 / 11));
+      expect(local.DEFAULT_EQ.gain).toBe(1);
+    }
+  });
+
+  it('re-renders the active tab when Auto Gain is toggled while bypassed', async () => {
+    // The defect this change fixes. applyEverywhere used to SKIP the active tab while a preview
+    // was live, so toggling Auto Gain mid-bypass changed nothing until the next commit landed.
+    // Under bypass the level is the user's own either way, so this also checks the toggle does not
+    // sneak a compensation in behind the flat curve.
+    local.AUTO_GAIN = false;
+    local.DEFAULT_EQ.filters[2].g = 6;
+    live[0].eqFilters = io.presetToBands(preset(6));
+    const hook = await setup();
+    act(() => hook.result.current.toggleBypass()); await settle();
+    expect(live[0].gain).toBeCloseTo(1);
+
+    act(() => hook.result.current.toggleAutoGain()); await settle();
+    expect(hook.result.current.autoGain).toBe(true);
+    expect(hook.result.current.bypassed).toBe(true);
+    expect(live[0].gain).toBeCloseTo(1); // still bypassed: no compensation
+
+    act(() => hook.result.current.toggleBypass()); await settle();
+    expect(live[0].gain).toBeCloseTo(comp(6 / 11)); // now audible, with the toggle that was set
+  });
+
+  it('re-renders the active tab when Auto Gain is toggled straight after a volume drag', async () => {
+    // Same stale-active-tab class, without bypass: a live drag is also a preview, so the toggle
+    // used to be dropped for the tab the user was actually listening to.
+    local.DEFAULT_EQ.filters[2].g = 6;
+    live[0].eqFilters = io.presetToBands(preset(6));
+    const hook = await setup();
+    act(() => hook.result.current.onGainLive(1.5)); await settle(40);
+    expect(live[0].gain).toBeCloseTo(1.5); // Auto Gain off: the user's own volume
+    act(() => hook.result.current.toggleAutoGain());
+    expect(live[0].gain).toBeCloseTo(1.5 * comp(6 / 11)); // applied immediately, not after commit
+    act(() => hook.result.current.toggleAutoGain());
+    expect(live[0].gain).toBeCloseTo(1.5); // and removed immediately, too
+  });
+
+  it('keeps a volume drag audible under bypass, and compensates it only after bypass ends', async () => {
+    local.AUTO_GAIN = true;
+    local.DEFAULT_EQ.filters[2].g = 6;
+    live[0].eqFilters = io.presetToBands(preset(6));
+    const hook = await setup();
+    act(() => hook.result.current.toggleBypass()); await settle();
+    act(() => hook.result.current.onGainLive(1.5)); await settle(40);
+    expect(live[0].gain).toBeCloseTo(1.5); // bypassed: the drag is heard, uncompensated
+    expect(readEngineBand()).toBe(0); // and the curve still does not play
+    act(() => hook.result.current.onCommit()); await settle(250);
+    expect(local.DEFAULT_EQ.gain).toBe(1); // the draft is not written under bypass
+
+    act(() => hook.result.current.toggleBypass()); await settle(60);
+    expect(live[0].gain).toBeCloseTo(1.5 * comp(6 / 11)); // the draft plays, compensated once
+    expect(local.DEFAULT_EQ.gain).toBeCloseTo(1.5); // and the user's volume — not the rendering — is stored
+  });
+
+  it('applies a preset chosen under bypass as a draft, then plays it compensated on release', async () => {
+    local.AUTO_GAIN = true;
+    const hook = await setup();
+    act(() => hook.result.current.toggleBypass()); await settle();
+    await act(async () => hook.result.current.applyPreset('Bass Boost')); await settle();
+    expect(hook.result.current.bypassed).toBe(true);
+    expect(readEngineBand()).toBe(0); // still flat while bypassed
+    expect(local.DEFAULT_EQ.filters[2].g).toBe(0); // draft: not written
+    expect(local.DEFAULT_EQ.gain).toBe(1);
+
+    act(() => hook.result.current.toggleBypass()); await settle(60);
+    const { BUILTIN_PRESETS } = await import('@/lib/builtins');
+    const bands = io.presetToBands(BUILTIN_PRESETS['Bass Boost']);
+    const avg = bands.reduce((s, b) => s + b.gain, 0) / bands.length;
+    expect(live[0].gain).toBeCloseTo(comp(avg)); // the preset's own compensation, computed once
+    expect(local.DEFAULT_EQ.gain).toBe(1); // still the user's volume
+  });
+
+  it('takes a storage refresh without re-introducing a compensation under bypass', async () => {
+    // A workspaceStatus broadcast runs applyEverywhere. With the active tab no longer skipped it
+    // is re-sent from audibleFor, which must still say "flat, user volume" while bypassed.
+    local.AUTO_GAIN = true;
+    local.DEFAULT_EQ.filters[2].g = 6;
+    live[0].eqFilters = io.presetToBands(preset(6));
+    const hook = await setup();
+    act(() => hook.result.current.toggleBypass()); await settle();
+    live[0].gain = 1;
+    act(broadcast); await settle();
+    expect(hook.result.current.bypassed).toBe(true);
+    expect(readEngineBand()).toBe(0);
+    expect(live[0].gain).toBeCloseTo(1);
+  });
+
+  it('keeps the other captured tabs on their resolved level while the active one is bypassed', async () => {
+    // A bypass belongs to the active tab alone. The push to every other tab passes bypassed:false,
+    // so a curve change keeps propagating to them even while this tab is muted-flat.
+    local.AUTO_GAIN = true;
+    sync = { RULES: [{ id: 'r1', patterns: ['other.com'], mode: 'preset', preset: 'Mine', enabled: true }], 'PRESETS.Mine': preset(6) };
+    live.push({ ...clone(live[0]), id: 2, host: 'other.com' });
+    const hook = await setup();
+    act(() => hook.result.current.toggleBypass()); await settle();
+    expect(live[1].eqFilters[2].gain).toBe(6); // other tab keeps its curve
+    expect(live[1].gain).toBeCloseTo(comp(6 / 11)); // and its compensation
+    expect(readEngineBand()).toBe(0); // active tab stays flat
+    expect(live[0].gain).toBeCloseTo(1); // and uncompensated
+  });
+});

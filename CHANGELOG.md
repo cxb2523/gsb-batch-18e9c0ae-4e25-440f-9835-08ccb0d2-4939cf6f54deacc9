@@ -6,6 +6,15 @@ All notable changes to Umbra EQ are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Bypass and Auto Gain no longer disagree about the level.** The stored master volume and the
+  level sent to the engine are rendered separately, once, with Bypass passed as its own input
+  rather than simulated by a flat curve. Bypass now plays the user's own volume (no leftover Auto
+  Gain compensation), and Auto Gain is restored once — not re-applied — when bypass ends. Toggling
+  Auto Gain mid-bypass or mid-drag now reaches the tab immediately instead of waiting for the next
+  commit, and repeated bypass cycles can no longer write a compensated value back to storage.
+
 ## [2.5.0] — 2026-11-08
 
 Prepared release candidate. Chrome Web Store publication is tracked separately in

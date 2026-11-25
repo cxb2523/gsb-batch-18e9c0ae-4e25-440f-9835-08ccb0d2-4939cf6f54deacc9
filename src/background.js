@@ -1,5 +1,5 @@
 import { resolveStoredSound } from './lib/sound-profile';
-import { outputGain } from './lib/auto-gain';
+import { engineGain } from './lib/auto-gain';
 
 // Service worker: owns the offscreen document lifecycle and tab capture.
 // All audio processing lives in offscreen.js (service workers have no Web Audio API).
@@ -218,7 +218,14 @@ async function settingsForUrl(url) {
   const [sync, local] = await Promise.all([chrome.storage.sync.get(null), chrome.storage.local.get(['DEFAULT_EQ', 'AUTO_GAIN'])]);
   const host = new URL(url).hostname.replace(/^www\./, '');
   const sound = resolveStoredSound(host, sync, local);
-  return { eqFilters: sound.bands, gain: outputGain({ userGain: sound.gain, bands: sound.bands, on: local.AUTO_GAIN === true }), activePreset: sound.presetName };
+  // Startup (a keyboard toggle or a same-origin navigation) has no bypass state of its own: bypass
+  // is a popup-session draft and dies with the popup. `bypassed: false` is the right answer here,
+  // and going through engineGain keeps this path and the popup on the same level arithmetic.
+  return {
+    eqFilters: sound.bands,
+    gain: engineGain({ userGain: sound.gain, bands: sound.bands, on: local.AUTO_GAIN === true, bypassed: false }),
+    activePreset: sound.presetName
+  };
 }
 
 async function stopCaptureTab(tabId) {

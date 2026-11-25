@@ -16,6 +16,7 @@ import navSrc from '../popup/components/BottomNav.tsx?raw';
 import bandInputSrc from './band-input.ts?raw';
 import resetSrc from './reset.ts?raw';
 import resetChangesSrc from './reset-changes.ts?raw';
+import editStateSrc from './edit-state.ts?raw';
 // `?raw` returns an empty string for CSS here — vitest stubs stylesheets — so this one is read
 // off disk. The popup's geometry is the kind of contract that is worth an exception: three
 // separate pieces of content moved the window before it was written down.
@@ -242,9 +243,10 @@ describe('cross-file invariants', () => {
     const enter = useEngineSrc.match(/--- bypass:on:start[\s\S]*?--- bypass:on:end/)?.[0] ?? '';
     expect(enter, 'entering bypass must send a flat curve').toContain('eqFilters: io.flatBands()');
     // Bypass must not mute: it silences the equalizer, not the user's volume. It goes through
-    // sentGain like every other push, which on a flat curve is the identity — Auto Gain has
-    // nothing to compensate for when nothing is being boosted.
+    // sentGain like every other push, with `bypassed: true` — so the level is the user's own, not
+    // a flat curve's zero compensation standing in for "nothing is boosted".
     expect(enter, 'and must keep the master volume it found').toContain('gainRef.current');
+    expect(enter, 'and must say it is bypassed rather than substituting a flat curve').toContain('true');
     expect(enter, 'bypass is not a mute').not.toMatch(/gain: 0[,\s}]/);
 
     // The live handlers each push their own message and never consulted the preview, so the guard
@@ -345,6 +347,31 @@ describe('cross-file invariants', () => {
     for (const w of ['commitTarget', 'writeDefaultEq', 'writeRules', 'recordJournal']) {
       expect(toggle, `switching Auto Gain must not call ${w}`).not.toContain(w);
     }
+  });
+
+  it('the engine level is rendered from the stored volume, with bypass passed as itself', () => {
+    // The two paths that used to compute this independently are now one. sentGain must go through
+    // engineGain — which takes `bypassed` as an argument — and never outputGain, which has no way
+    // to express "the equalizer is out of the path". Reaching for outputGain here would silently
+    // reintroduce the duck under bypass that a flat-curve substitution used to prevent by accident.
+    expect(useEngineSrc, 'sentGain must render through engineGain').toContain('engineGain({');
+    expect(useEngineSrc, 'sentGain must not reach for the bypass-blind outputGain').not.toMatch(/sentGain[\s\S]{0,40}outputGain\(/);
+
+    // The flat-curve substitution is gone from the volume handler, so a push can no longer express
+    // bypass by handing a flat curve to Auto Gain and hoping the two agree.
+    const gain = useEngineSrc.match(/const onGainLive = useCallback\([\s\S]*?\n  \);/)?.[0] ?? '';
+    expect(gain, 'the volume drag must pass the real curve with the bypassed flag').not.toContain('isBypassed(previewRef.current) ? io.flatBands()');
+
+    // The active tab must never be skipped on a level change: applyEverywhere is where a bypass
+    // toggle, an Auto Gain toggle, a rule change and a refresh all land, and skipping the active
+    // tab is exactly what left it playing the old compensation until the next commit.
+    const everywhere = useEngineSrc.match(/const applyEverywhere = useCallback\([\s\S]*?\n  \);/)?.[0] ?? '';
+    expect(everywhere, 'applyEverywhere not found').toBeTruthy();
+    expect(everywhere, 'the active tab must be sent audibleFor(...)').toContain('audibleFor(');
+    expect(everywhere, 'and never skipped with a blanket continue').not.toMatch(/held\(\)\s*\)\s*continue/);
+
+    // One answer for "what is audible" — see lib/edit-state.ts — so the four paths cannot drift.
+    expect(editStateSrc, 'audibleFor must own the answer').toContain('export function audibleFor(');
   });
 
   it('the peak meter reads the signal and changes nothing', () => {
