@@ -1,0 +1,108 @@
+# GitHub workflow runbook
+
+What each GitHub Actions workflow owns, and what to check before changing it.
+
+## Branch flow
+
+- `main` is the default branch and the stable line. Contributors (including forks) open pull requests against it; CI runs automatically and needs no secrets.
+- Feature pull requests are squash-merged, and merged branches are deleted automatically.
+- A stable release is a pull request from a `release/vX.Y.Z` branch that bumps `package.json`. Merging it into `main` publishes that version to npm `latest`.
+- Dependabot targets `main`.
+
+## Runner image
+
+All jobs pin `runs-on: ubuntu-24.04` instead of `ubuntu-latest`, so a newer image behind the `ubuntu-latest` label cannot change CI, benchmark baselines, or visual baselines unannounced. Move the pin deliberately, and re-baseline `benchmarks/thresholds.json` and the visual baselines when you do.
+
+## Shared setup
+
+`.github/actions/setup` is the one place that installs tooling. It reads the Bun version from `package.json#packageManager`, caches `~/.bun/install/cache`, and runs `bun install --frozen-lockfile`. Bump Bun by changing `packageManager` only.
+
+Keep permissions minimal: write scopes belong only to jobs that publish, deploy, or tag.
+
+## CI
+
+File: `.github/workflows/ci.yml`
+
+Runs on pull requests targeting `main`, when the release workflow is about to publish, and by manual dispatch. Ordinary pushes to `main` do not rerun it: branch protection requires an up-to-date, passing pull request first. Superseded runs on the same pull request are cancelled.
+
+| Job | Command | Covers |
+|---|---|---|
+| `checks` | `bun run check` | Typecheck, Oxlint, unit tests with coverage floors, library build, generated-docs freshness, doc snippet types, package exports, package contents, public API snapshot (`api/public-api.md`), bundle budgets. |
+| `typescript-floor` | `bun run build && bun run test:typescript-floor` | Packs the built package, installs the tarball into a temp consumer project with TypeScript 5.0.4 (the documented minimum) and the latest 5.x, and typechecks a file importing every `package.json#exports` entry with `skipLibCheck: false` under `bundler`, `node16`, and legacy `node10` resolution. Separate from `checks` because it installs TypeScript from npm and needs network. |
+| `changes` | — | Pull requests whose changed files are all under `docs/` or `changelogs/`, or are `.md` files, set `engine=false`, which skips the `browser` shards and `cross-browser`. Any other change, a failed or oversized file listing, `workflow_call`, and manual dispatch run everything. |
+| `browser` (matrix) | see below | The Chrome suites as five parallel shards on separate runners, so wall time is the slowest shard, not the sum. `fail-fast` is off so one failing shard does not hide another. The visual shards always upload `build/visual-tests` (screenshots, `actual/` baseline candidates rendered on the runner, `diff/` for failing baselines; kept 14 days). See [Visual pixel baselines](./local-development.md#visual-pixel-baselines). |
+| `website` | `bun run test:website` | Website UX tests against the dev server and the production build. Always runs, including for docs-only changes, because the site renders the markdown docs. |
+| `cross-browser` | `bun run test:cross-browser` | Firefox and WebKit (Playwright) smoke: WebGL2, non-blank render, hover/wheel/pan/box-zoom/reset. Browsers are installed with `bunx playwright install --with-deps firefox webkit` and cached in `~/.cache/ms-playwright`; the apt packages it pulls in are cached as `.deb` files in `~/playwright-debs`, and the install retries a stalled attempt (3 minutes each) from `archive.ubuntu.com`, because the runner's Azure Ubuntu mirror is sometimes slow enough to hang the job. The cache is only shared with pull requests once a run on `main` saved it (a release, or a manual `workflow_dispatch` of CI on `main` after the Playwright version changes); Firefox runs headed under `xvfb-run` to get software WebGL2. Uploads `build/cross-browser` when it fails. Unlike the other checks it is not part of `bun run ci` because it needs the Playwright browsers. |
+| `validate` | — | Passes only when every job above passed. Jobs skipped by `changes` count as passing, but a skip without a docs-only `changes` result, and any failed or cancelled shard, fails it. This is the single required status check for branch protection, so adding or splitting jobs does not require settings changes. |
+
+Browser shards (the `matrix.shard` values in `ci.yml`). Together they run exactly what `bun run test:browser` runs serially:
+
+| Shard | Command | Notes |
+|---|---|---|
+| `perf` | `bun run test:browser:perf` | Benchmark smoke plus the performance gate. Alone on its runner because it is timing sensitive. |
+| `visual-gl` | `bun run test:browser:visual-gl` | Visual cases in the `webgl2` and `shared` renderer modes. Uploads `visual-tests-visual-gl` (the pixel baselines come from this shard). |
+| `visual-fallback` | `bun run test:browser:visual-fallback` | Visual cases in the `canvas2d` and `auto-no-webgl` modes. Uploads `visual-tests-visual-fallback`. |
+| `interaction-a11y` | `bun run test:browser:ui` | Interaction (CDP input events) and axe accessibility tests. |
+| `stability` | `bun run test:stability` | Leak and stability suite. Alone on its runner because it is timing and memory sensitive. |
+
+Every job has a `timeout-minutes` cap so a hung browser fails in minutes, not after the 6-hour default. When you add a check, add it to `test:browser` and to one shard script (or a new matrix shard) so CI runs it; keep them in sync.
+
+`bun run ci` runs the `checks` and `browser` groups locally; run `bun run test:cross-browser` for the `cross-browser` job and `bun run test:typescript-floor` (after `bun run build`) for the `typescript-floor` job. Add new checks to the `check` or `test:browser` scripts in `package.json`, not to the workflow, so local and CI runs stay identical.
+
+## Release
+
+File: `.github/workflows/release.yml`
+
+Runs on pushes to `main` and by manual dispatch. Only a stable `x.y.z` version on `main` can publish:
+
+| Branch | Version in `package.json` | Result |
+|---|---|---|
+| `main` | `x.y.z` | Publishes to npm `latest`, creates a normal GitHub release, deploys Pages. |
+| `main` | any prerelease (for example `2.0.0-rc.1`) | Never published (a prerelease can not reach `latest`). Notice only; Pages still deploys. |
+| any other branch (manual dispatch) | any | Never published. Pages is not deployed. |
+
+There is no prerelease channel. If a 2.0 prerelease series is ever needed, add a generic channel to the `version` job (for example a `next` branch publishing `x.y.z-*` versions to an explicit non-`latest` npm tag with `gh release create --prerelease --latest=false`), and document and test it in the same change.
+
+1. `version`: reads `vX.Y.Z` from `package.json` and applies the table above. If the tag exists there is nothing to publish; if npm has the version but the tag is missing, it fails for manual investigation.
+2. `ci`: runs the full CI workflow (`workflow_call`), only when publishing.
+3. `release`: appends release benchmarks to `changelogs/vX.Y.Z.md` if missing.
+4. `release`: packs and publishes to npm with provenance through npm trusted publishing (OIDC), always with an explicit `--tag latest`. No npm token secret is used; the trusted publisher on npm is bound to this workflow file name (not to a branch).
+5. `release`: creates the tag and GitHub release from the changelog plus the commit list. The notes list commits since the last stable tag.
+6. `pages`: calls the Pages workflow, only for `main` pushes. This is the only Pages deploy for `main`: it runs right after `version` for ordinary merges and after the tag is created for releases, so a release deploys after its tag exists.
+
+Every other push to `main` skips CI and publishing and only deploys Pages, because its `package.json` version already has a tag.
+
+## Pages
+
+File: `.github/workflows/pages.yml`
+
+Called by the release workflow on every push to `main`, and by manual dispatch. It has no push trigger of its own. It builds the website from `main` at `/` with `bun run pages:build`, removes the visual and interaction fixtures, and adds a SPA fallback copy for `/previews`. A small `/next/index.html` redirects links to the former unreleased-site URL to the same page at the root. There is no per-release build or cache: the site always reflects `main`, so website changes never wait for a library release.
+
+Keep the assemble step in sync with website routes that need SPA fallbacks, such as `/previews`.
+
+## Cloudflare Pages Preview
+
+File: `.github/workflows/cloudflare-pages-preview.yml`
+
+Manual dispatch only. Builds the website for the selected branch and deploys it to the `blazeplot` Cloudflare Pages project, giving the branch a preview alias such as `fix-idempotent-chart-start.blazeplot.pages.dev`. It requires the `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` secrets and skips with a notice when they are absent.
+
+Do not dispatch it for unreviewed external-contributor branches: the job runs with Cloudflare credentials.
+
+## Workflow change checklist
+
+- Keep the minimum permissions each job needs.
+- Validate YAML before pushing; syntax errors only surface after push.
+- For release changes, read the full diff; publishing cannot be undone.
+- If package contents, exports, or publish behavior changed, run `bun run test:package` and `bun run test:exports`.
+
+## Common failures
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `bun install --frozen-lockfile` fails | `package.json` and `bun.lock` disagree | Run `bun install` and commit the lockfile. |
+| `checks` fails on generated docs | Public API changed without regenerating docs | Run `bun run docs:readme` and commit the result. |
+| Pages deploys but `/previews` 404s | Vite base or artifact assembly changed | Build `main` with the default base `/` and keep the SPA fallback copy in the assemble step. |
+| Release skips publish | Tag `vX.Y.Z` already exists | Expected on reruns. Bump the version for a new publish. |
+| Release skips publish with a "not published" notice | The version is a prerelease, or the push is not on `main` | Expected. Only stable `x.y.z` versions on `main` publish. |
+| Release fails because the npm version exists | npm published but tag is missing | Investigate manually; never overwrite npm. Release a patch if needed. |
+| Browser tests cannot find Chrome locally | Browser path detection | Set `BLAZEPLOT_BENCH_CHROME` or `CHROME_PATH`. |

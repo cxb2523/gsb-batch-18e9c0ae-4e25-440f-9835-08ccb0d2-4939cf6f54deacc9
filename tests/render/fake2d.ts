@@ -1,0 +1,77 @@
+export type Call = readonly [string, ...unknown[]];
+
+/** Records Path2D-style calls. */
+export class FakePath {
+  readonly calls: Call[] = [];
+  moveTo(x: number, y: number): void {
+    this.calls.push(["moveTo", x, y]);
+  }
+  lineTo(x: number, y: number): void {
+    this.calls.push(["lineTo", x, y]);
+  }
+  rect(...args: number[]): void {
+    this.calls.push(["rect", ...args]);
+  }
+  arc(...args: number[]): void {
+    this.calls.push(["arc", ...args]);
+  }
+  arcTo(...args: number[]): void {
+    this.calls.push(["arcTo", ...args]);
+  }
+  closePath(): void {
+    this.calls.push(["closePath"]);
+  }
+}
+
+/** Canvas 2D context double that records every call, for asserting on what an engine draws. */
+export class FakeContext2D extends FakePath {
+  fillStyle = "";
+  strokeStyle = "";
+  lineWidth = 0;
+  lineJoin = "";
+  lineCap = "";
+  lineDashOffset = 0;
+  dash: number[] = [];
+  lost = false;
+  setLineDash(segments: number[]): void {
+    this.dash = [...segments];
+  }
+  setTransform(...args: number[]): void {
+    this.calls.push(["setTransform", ...args]);
+  }
+  clearRect(...args: number[]): void {
+    this.calls.push(["clearRect", ...args]);
+  }
+  beginPath(): void {
+    this.calls.push(["beginPath"]);
+  }
+  stroke(): void {
+    // A dashed stroke is marked by a trailing `true`, so solid strokes record as before.
+    this.calls.push(this.dash.length > 0 ? ["stroke", this.strokeStyle, this.lineWidth, true] : ["stroke", this.strokeStyle, this.lineWidth]);
+  }
+  fill(path?: FakePath): void {
+    this.calls.push(["fill", this.fillStyle, path ? path.calls.length : -1]);
+  }
+  fillRect(...args: number[]): void {
+    this.calls.push(["fillRect", this.fillStyle, ...args]);
+  }
+  drawImage(...args: unknown[]): void {
+    this.calls.push(["drawImage", ...args]);
+  }
+  createImageData(width: number, height: number): ImageData {
+    return { width, height, data: new Uint8ClampedArray(width * height * 4) } as unknown as ImageData;
+  }
+  putImageData(...args: unknown[]): void {
+    this.calls.push(["putImageData", ...args]);
+  }
+  isContextLost(): boolean {
+    return this.lost;
+  }
+}
+
+/** A canvas double that hands out `ctx` for "2d" and supports events. */
+export function fakeCanvas2d(ctx: FakeContext2D): HTMLCanvasElement {
+  // Offscreen canvases the engine makes (the field image) get their own context, so they do not show up in `ctx.calls`.
+  const ownerDocument = { createElement: () => fakeCanvas2d(new FakeContext2D()) };
+  return Object.assign(new EventTarget(), { width: 100, height: 50, ownerDocument, getContext: (kind: string) => (kind === "2d" ? ctx : null) }) as unknown as HTMLCanvasElement;
+}

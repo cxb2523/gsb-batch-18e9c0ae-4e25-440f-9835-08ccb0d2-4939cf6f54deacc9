@@ -1,0 +1,204 @@
+import { readdir } from "node:fs/promises";
+import { readFileSync, statSync } from "node:fs";
+import { posix } from "node:path";
+
+interface Budget {
+  readonly label: string;
+  readonly path: string;
+  readonly maxBytes: number;
+}
+
+interface BundleSizeEntry extends Budget {
+  readonly sizeBytes: number;
+}
+
+interface SharedChunkBudget {
+  readonly label: string;
+  readonly pattern: RegExp;
+  readonly maxBytes: number;
+}
+
+interface SharedChunkResult {
+  readonly budget: SharedChunkBudget;
+  readonly entries: BundleSizeEntry[];
+}
+
+/** A budget for everything a consumer downloads to use one entry: the entry plus every chunk it imports statically. */
+interface GraphBudget {
+  readonly label: string;
+  readonly entry: string;
+  readonly maxBytes: number;
+}
+
+interface BundleSizeReport {
+  readonly entryChunks: BundleSizeEntry[];
+  readonly sharedChunks: SharedChunkResult[];
+  readonly graphs: BundleSizeEntry[];
+}
+
+// Budgets are the built size plus about 1.5% (at least 100 bytes), rounded up to 100 bytes.
+// Tighten them when a change shrinks a chunk; raise one only with a reason in the PR.
+// Legend, navigator, and selection grew a little (+130 to +220 bytes) because each now ships its own forced-colors CSS; the core chunk shrank by the same rules.
+const budgets: Budget[] = [
+  { label: "root entry", path: "dist/index.js", maxBytes: 21_100 },
+  { label: "linked entry", path: "dist/linked.js", maxBytes: 2_500 },
+  { label: "data entry", path: "dist/data.js", maxBytes: 1_800 },
+  { label: "export entry", path: "dist/export.js", maxBytes: 4_300 },
+  { label: "interactions plugin", path: "dist/plugins/interactions.js", maxBytes: 15_200 }, // +100 for localizable hint messages
+  { label: "annotations plugin", path: "dist/plugins/annotations.js", maxBytes: 15_400 }, // +200 for localizable annotation names
+  { label: "navigator plugin", path: "dist/plugins/navigator.js", maxBytes: 10_300 }, // +100 for localizable label and value text
+  { label: "selection plugin", path: "dist/plugins/selection.js", maxBytes: 8_800 },
+  { label: "legend plugin", path: "dist/plugins/legend.js", maxBytes: 4_800 },
+  { label: "tooltip plugin", path: "dist/plugins/tooltip.js", maxBytes: 4_300 },
+  { label: "crosshair plugin", path: "dist/plugins/crosshair.js", maxBytes: 10_800 }, // +1_200 layout-free pointer path (offsetX/Y, cached label and plot size) and skipped equal DOM writes
+  { label: "flamegraph plugin", path: "dist/plugins/flamegraph.js", maxBytes: 17_700 },
+  { label: "graph plugin", path: "dist/plugins/graph.js", maxBytes: 140_500 }, // +11_400 large graphs drawn by level from a kept segment set: edge ranking and doubling levels, the world-space length grids and summed-area tables, the view budget with a faded next level, the density of what is left read from the grid, styles shared by content, the dragged node cut out of the set, and the drag overlay made while idle; -300 the unused edge order (stride, inverse) left from sampling; +7_200 moved and dragged nodes taken out of the pair hierarchy, their edges drawn exactly as stars from where they are (own field and hull), flows drawn under the nodes (only the nodes a flow crosses move to the flow layer), the cut measuring what shows through without its own haze; +9_800 truth over approximation: the lines-per-pixel field (multigrid of piecewise linear profiles, exact single lines, hull clip), the error-driven two-pass cut, listed leaf lists split once at build, the pair hierarchy for large sparse graphs, and exact crossing tests in place of edge sampling; +36_600 dense graphs: the k-d tree and pair hierarchy with exact counts and per-leaf lists, the budgeted refinement that splits pairs where it shows, bands, the multigrid density field and its hull mask, the dragged node's star, the rule input, styled-edge sampling, and coarse-then-full frames (the aggregate's fixed per-level orders and sliced growth are in it too); +6_800 typed-array edges, shared edge style records, fill-budgeted edge sampling, moved-node grid updates, incidence index; +18_500 spatial grids, visible-only frames, the aggregate level of detail and its sliced builder; +2_200 dragged node lifted onto the overlay; +4_500 flow layer, overscan, and CSS-moved layers during pans and zooms; +2_300 dashed node borders and round flow dots; model, styles, painter, labels, icons, and navigation; the GPU programs live in the core graph
+  { label: "a11y plugin", path: "dist/plugins/a11y.js", maxBytes: 11_900 },
+];
+
+const sharedBudgets: SharedChunkBudget[] = [
+  // 155_184 bytes in 1.0.0-rc.3 (plugin host, chart semantics, forced colors); 151_515 after #152; 140_448 after the Chart split and histogram tree-shaking (#172).
+  // 169_000 bytes with render surfaces (the rect program, fillRects, createSurface; the flame graph no longer carries its own GLSL, so its entry shrank by about 4.7 KB). 166_315 bytes after the engines moved into the core graph: the default renderer is "auto", so the Chart always ships WebGL2 (the old 12 KB chunk, now inlined), Canvas 2D, and the shared WebGL2 context (about +15 KB over the 143_500 budget plus the separate WebGL2 chunk before).
+  { label: "shared Chart chunk (Chart + every engine)", pattern: /^Chart-.*.js$/, maxBytes: 220_000 }, // +9_300 kept segment sets (createSegmentSet, drawSegmentSet): the engine-neutral point and index store, a GLSL 3.00 program that reads points from a float texture, per-set GPU copies with row-wise point updates and release on dispose, and the Canvas 2D path; +300 fillField opacities in one reused byte stream on WebGL2, fillField forwarded by the shared context, Canvas 2D drops its field image on dispose; +2_200 fillField as one texture on WebGL2 (a program, its upload, and the draw), and translucent Canvas 2D segments stroked one by one so they add up where they cross; +1_700 fillField: a grid of opacities shaded bilinearly (one scaled image on Canvas 2D, triangles elsewhere) and translucent shape borders over the fill on WebGL2; +200 equal-area tiny dots and the open-path fill before batched dots; +1_600 Canvas 2D dot batching by color and continued dashed strokes; +9_000 (2.2 KB gzipped) for the fillShapes, strokeSegments, and fillTriangles render-surface primitives on every engine (three GLSL programs, interleaved instanced draws, Canvas 2D paths) that the graph plugin draws with; +300 more for the separate one-pass static summary tree (StaticMinMaxTree); +1_300 level-by-level tree refresh, single-pass X validation, one-pass theme merge (1M first render 30% faster); +3_100 bulk bucket extraction, bucket cache and in-place triangle staging (dense frames 2-4x faster); +720 batched first-frame plot-size read (SharedPlotSize); +1_000 Canvas 2D same-column rect merging and staged polyline replay (perf/c2dframe); +113 cached plot size in dataToPlot/clientToData, plotToData plugin coordinate; +2_210 initial-viewport auto-fit, viewport-misses-data warning, axis readout formatting; +400 shared chart stylesheet, forced-colors query, ResizeObserver, warm-canvas sizing skip, cached summary messages; +10_800 for the { x, y } and { values } series shorthands: StaticDataset, HistogramDataset and the binning code now live in this chunk (index.js re-exports them from here), so the chunk grows while index.js shrinks (net graph +1_900); +665 runtime guard that rejects chart-buffer options (capacity, xStep, ...) next to a dataset (rejectBufferOptions and its error text), plus the extra uniform-buffer onInvalidSample check; +400 for the Canvas 2D pixel-column polyline reducer (after trimming duplicated engine/painter code); +1_500 for the warm canvas pool and the idle release of the shared context (a disposed chart keeps its context and programs for the next one) and the layout/engine hook that hands a warm canvas to a new chart.
+  // Theme module shared by the core and plugins (rgbaCss): dark, light, and forced-colors themes.
+  { label: "shared theme chunk", pattern: /^theme-.*\.js$/, maxBytes: 12_400 }, // +100 literal color functions parsed as written, keeping alpha below 1/255 that computed styles round to 0; +34 for ThemeColor (RGBA tuple) support on every DOM color token; +5_300 for the CSS Color 4 codecs (oklab/oklch, lab/lch, color() spaces: 3.7 KB minified, 2.0 KB gzip; the rest is the unminified output's one-number-per-line matrices), the canvas pixel read-back, and the unparseable-color warning
+  { label: "lazy screenshot chunk", pattern: /^screenshot-.*\.js$/, maxBytes: 6_400 },
+  { label: "shared OverlayUtils chunk", pattern: /^OverlayUtils-.*\.js$/, maxBytes: 2_600 },
+  // Tooltip and crosshair helpers (pick markers, sync groups, long press), kept out of OverlayUtils so other plugins skip them.
+  { label: "shared PickOverlay chunk", pattern: /^PickOverlay-.*.js$/, maxBytes: 6_100 }, // +650 marker pool remembers its last writes; placeAbsoluteWithinBox takes a cached size
+];
+
+// The chart-only import graph: `import { Chart } from "blazeplot"` with no plugin, so it is what every consumer pays.
+// It holds the root entry, the Chart chunk (Chart, every rendering engine, the data engine), and the theme module.
+// 196_943 bytes (rc.8: 182_613 = index 20_845 + Chart 142_844 + WebGL2 11_955 + release 176 + theme 6_793). The engines moved into the core graph (WebGL2, Canvas 2D, and the shared context ship in the
+// root because the default renderer is "auto"), which is the whole +14.3 KB (+7.8%): Canvas 2D, the shared context, render surfaces, and engine-owned context loss.
+const graphBudgets: GraphBudget[] = [{ label: "chart-only import graph (index + Chart + engines + theme)", entry: "dist/index.js", maxBytes: 251_100 }]; // +9_300 kept segment sets (see the Chart chunk budget); +100 literal colors keep full alpha precision (see the theme chunk budget); +300 reused fillField bytes, shared fillField, Canvas 2D field release (see the Chart chunk budget); +2_200 WebGL2 field texture and translucent Canvas 2D strokes (see the Chart chunk budget); +1_700 fillField (see the Chart chunk budget); +200 equal-area dots; +1_600 Canvas 2D dot batching and continued strokes; +9_200 render-surface primitives for the graph plugin (see the Chart chunk budget); +5_400 CSS Color 4 codecs in the theme chunk and series style color labels; +1_300 level-by-level tree refresh, single-pass X validation, one-pass theme merge; +3_100 bulk bucket extraction, bucket cache and in-place triangle staging; +720 batched first-frame plot-size read (SharedPlotSize); +1_000 Canvas 2D rect merging and staged polyline replay; +507 hover path (cached plot size, plotToData, picker reuse, typed binary search); +2_419 initial-viewport auto-fit, viewport-misses-data warning, axis readout formatting; +1_700 shared chart stylesheet, forced-colors query, ResizeObserver, warm-canvas sizing skip, cached summary messages; +1_900 frame micro-optimizations (axis label format memo, Canvas 2D style cache, explicit WebGL2 projection fields); +700 theme: "auto" (matchMedia watcher and live switch); +2_300 runtime UX (see the Chart chunk budget); +1_900 net for the { x, y } and { values } series shorthands (StaticDataset, HistogramDataset, binning are now reached through Chart); +577 same runtime guard for buffer options next to a dataset; +220 lazy canvas sizing (engine hook, first-frame sizing, cached plot size), after the axis label and layout PRs took 213 back (-31, -182); +400 Canvas 2D polyline reducer; 199_900 before the warm canvas pool and the shared context idle release (+1_560: pool, idle-release helper, layout hook).
+
+/** Files `entry` imports statically, transitively (dynamic `import()` is excluded: it is not downloaded up front). */
+function staticGraph(entry: string): string[] {
+  const seen = new Set<string>();
+  const visit = (path: string): void => {
+    if (seen.has(path)) return;
+    seen.add(path);
+    const source = readFileSync(path, "utf8");
+    for (const match of source.matchAll(/(?:from|import)\s*"(\.\/[^"]+\.js)"/g)) visit(posix.join(posix.dirname(path), match[1]!));
+  };
+  visit(entry);
+  return [...seen];
+}
+
+export async function collectBundleSizeReport(): Promise<BundleSizeReport> {
+  const entryChunks = budgets.map((budget) => ({
+    ...budget,
+    sizeBytes: statSync(budget.path).size,
+  }));
+
+  const distFiles = await readdir("dist");
+  const sharedChunks = sharedBudgets.map((budget) => ({
+    budget,
+    entries: distFiles
+      .filter((file) => budget.pattern.test(file))
+      .map((file) => {
+        const path = posix.join("dist", file);
+        return { label: budget.label, path, maxBytes: budget.maxBytes, sizeBytes: statSync(path).size };
+      }),
+  }));
+
+  const graphs = graphBudgets.map((budget) => ({
+    label: budget.label,
+    path: budget.entry,
+    maxBytes: budget.maxBytes,
+    sizeBytes: staticGraph(budget.entry).reduce((total, file) => total + statSync(file).size, 0),
+  }));
+
+  return { entryChunks, sharedChunks, graphs };
+}
+
+export function bundleSizeFailures(report: BundleSizeReport): string[] {
+  const failures: string[] = [];
+  for (const entry of [...report.entryChunks, ...report.sharedChunks.flatMap((chunk) => chunk.entries), ...report.graphs]) {
+    if (entry.sizeBytes > entry.maxBytes) {
+      failures.push(`${entry.label} exceeds budget: ${entry.sizeBytes} > ${entry.maxBytes} bytes (${entry.path})`);
+    }
+  }
+
+  for (const chunk of report.sharedChunks) {
+    if (chunk.entries.length !== 1) failures.push(`Expected exactly one ${chunk.budget.label}, found ${chunk.entries.length}.`);
+  }
+
+  return failures;
+}
+
+export function renderBundleSizeMarkdown(report: BundleSizeReport): string {
+  const rows = [...report.entryChunks, ...report.sharedChunks.flatMap((chunk) => chunk.entries), ...report.graphs]
+    .map((entry) => `| ${markdownEscape(entry.label)} | \`${displayPath(entry.path)}\` | ${formatBytes(entry.sizeBytes)} |`);
+
+  const lines = [
+    "### Bundle size summary",
+    "",
+    "Generated from `dist/` after the package build.",
+    "",
+    "| Chunk | File | Size |",
+    "|---|---|---:|",
+    ...rows,
+  ];
+
+  for (const chunk of report.sharedChunks) {
+    if (chunk.entries.length !== 1) lines.push("", `> Expected exactly one ${chunk.budget.label}, found ${chunk.entries.length}.`);
+  }
+
+  return lines.join("\n");
+}
+
+async function main(): Promise<void> {
+  const options = parseArgs(process.argv.slice(2));
+  const report = await collectBundleSizeReport();
+
+  if (options.markdown) {
+    console.log(renderBundleSizeMarkdown(report));
+    return;
+  }
+
+  const failures = bundleSizeFailures(report);
+  for (const failure of failures) console.error(failure);
+
+  if (failures.length > 0) process.exit(1);
+  console.log(`Bundle size check passed for ${budgets.length} entry chunks and ${report.sharedChunks.length} shared chunks.`);
+}
+
+function parseArgs(args: readonly string[]): { markdown: boolean } {
+  const options = { markdown: false };
+  for (const arg of args) {
+    switch (arg) {
+      case "--markdown":
+        options.markdown = true;
+        break;
+      case "--help":
+      case "-h":
+        printHelpAndExit();
+        break;
+      default:
+        throw new Error(`Unknown argument: ${arg}`);
+    }
+  }
+  return options;
+}
+
+function printHelpAndExit(): never {
+  console.log(`Usage: bun scripts/bundle-size-check.ts [--markdown]\n\nChecks built dist chunk sizes against package budgets.\n\nOptions:\n  --markdown   Print a README-ready markdown summary instead of enforcing budgets\n`);
+  process.exit(0);
+}
+
+function displayPath(path: string): string {
+  return path.replace(/-[A-Za-z0-9_-]+\.js$/u, "-*.js");
+}
+
+function formatBytes(bytes: number): string {
+  return `${Math.round(bytes / 1024)} KiB`;
+}
+
+function markdownEscape(value: string): string {
+  return value.replaceAll("|", "\\|");
+}
+
+await main();

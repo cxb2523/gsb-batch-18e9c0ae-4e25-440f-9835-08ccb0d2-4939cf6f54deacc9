@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Cheap gate: decide whether this push publishes before spending time on CI.
+  version:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.version.outputs.publish }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      pages: ${{ steps.version.outputs.pages }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Read package version
+        id: version
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          # main publishes stable x.y.z versions to npm "latest". A prerelease version never
+          # publishes (so it can never take the "latest" dist-tag), and neither does any other branch.
+          # Pages deploys from main only.
+          if [ "$BRANCH" = main ]; then echo "pages=true" >> "$GITHUB_OUTPUT"; else echo "pages=false" >> "$GITHUB_OUTPUT"; fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${VERSION} is not a stable x.y.z version; prereleases are never published from this workflow."
+            exit 0
+          fi
+          if [ "$BRANCH" != main ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${VERSION} is not published from ${BRANCH}; only main publishes."
+            exit 0
+          fi
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "${TAG} already exists; nothing to publish."
+          elif npm view "blazeplot@${VERSION}" version >/dev/null 2>&1; then
+            echo "::error::blazeplot@${VERSION} is on npm but tag ${TAG} is missing."
+            exit 1
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Pull requests already passed CI on an up-to-date branch; rerun it only as a gate before publishing.
+  ci:
+    needs: version
+    if: needs.version.outputs.publish == 'true'
+    uses: ./.github/workflows/ci.yml
+    # pull-requests is read by CI's change-detection job; it is a no-op outside pull_request events.
+    permissions:
+      contents: read
+      pull-requests: read
+
+  release:
+    needs: [version, ci]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: ./.github/actions/setup
+
+      - name: Append release benchmark results
+        run: bun run release:benchmarks -- --if-missing
+
+      - name: Write release notes
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # Notes list commits since the last stable tag.
+          PREV_TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude 'v*-*' HEAD^ 2>/dev/null || true)
+          {
+            if [ -f "changelogs/v${VERSION}.md" ]; then cat "changelogs/v${VERSION}.md"; printf '\n\n'; fi
+            if [ -n "$PREV_TAG" ]; then
+              echo "## Commits"
+              echo
+              git log --no-merges "${PREV_TAG}..HEAD" --pretty=format:"- %s ([%h](https://github.com/${GITHUB_REPOSITORY}/commit/%H))"
+              echo
+            fi
+          } > release-notes.md
+
+      # CI ran in separate jobs, so build the package here before packing it.
+      - name: Build and pack
+        run: |
+          bun run build
+          bun pm pack
+          tar -tzf blazeplot-*.tgz | grep -qx 'package/dist/index.js' || { echo "::error::Packed tarball is missing dist/index.js"; exit 1; }
+
+      # Authenticates with npm trusted publishing (OIDC); no npm token secret is needed.
+      - name: Publish to npm
+        run: npm publish ./blazeplot-*.tgz --provenance --access public --tag latest
+
+      - name: Tag and create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file release-notes.md
+
+  # The only Pages deploy for main: right away for ordinary merges, after the new tag exists for releases.
+  pages:
+    needs: [version, release]
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.version.outputs.pages == 'true' && (needs.version.outputs.publish == 'false' || needs.release.result == 'success') }}
+    uses: ./.github/workflows/pages.yml
+    permissions:
+      contents: read
+      pages: write
+      id-token: write

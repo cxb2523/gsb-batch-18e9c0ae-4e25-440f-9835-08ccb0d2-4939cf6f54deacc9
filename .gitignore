@@ -1,0 +1,54 @@
+# dependencies (bun install)
+node_modules
+
+# output
+out
+dist
+build
+*.tgz
+
+# benchmark outputs: keep only the blessed latest reference files
+benchmarks/*
+!benchmarks/README.md
+!benchmarks/latest.json
+!benchmarks/latest.md
+!benchmarks/baseline-before-perf-pass.json
+!benchmarks/baseline-before-perf-pass.md
+!benchmarks/thresholds.json
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs
+_.log
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+
+# Finder (MacOS) folder config
+.DS_Store
+# local OpenClaw/agent workspace files
+.openclaw/
+HEARTBEAT.md
+IDENTITY.md
+SOUL.md
+TOOLS.md
+USER.md
+
+# local package-manager metadata created by fallback installs
+package-lock.json

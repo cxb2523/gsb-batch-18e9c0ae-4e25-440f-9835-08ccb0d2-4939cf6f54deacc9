@@ -1,0 +1,303 @@
+import { describe, it, expect } from "bun:test";
+import { RingBuffer } from "../../src/core/RingBuffer.ts";
+
+function at(buf: RingBuffer, index: number): { x: number; y: number } | null {
+  return index >= 0 && index < buf.length ? { x: buf.getX(index), y: buf.getY(index) } : null;
+}
+
+describe("RingBuffer", () => {
+  it("starts empty", () => {
+    const buf = new RingBuffer(10);
+    expect(buf.length).toBe(0);
+    expect(buf.range).toBeNull();
+  });
+
+  it("stores and retrieves pushed values", () => {
+    const buf = new RingBuffer(5);
+    buf.push(1, 10);
+    buf.push(2, 20);
+    expect(buf.length).toBe(2);
+    expect(at(buf, 0)).toEqual({ x: 1, y: 10 });
+    expect(at(buf, 1)).toEqual({ x: 2, y: 20 });
+  });
+
+  it("returns null for out-of-range index", () => {
+    const buf = new RingBuffer(5);
+    buf.push(1, 10);
+    expect(at(buf, -1)).toBeNull();
+    expect(at(buf, 1)).toBeNull();
+    expect(at(buf, 100)).toBeNull();
+  });
+
+  it("wraps around at capacity by default", () => {
+    const buf = new RingBuffer(3);
+    buf.push(1, 10);
+    buf.push(2, 20);
+    buf.push(3, 30);
+    buf.push(4, 40);
+    expect(buf.length).toBe(3);
+    expect(at(buf, 0)).toEqual({ x: 2, y: 20 });
+    expect(at(buf, 1)).toEqual({ x: 3, y: 30 });
+    expect(at(buf, 2)).toEqual({ x: 4, y: 40 });
+  });
+
+  it("drops new samples when overflow is drop-new", () => {
+    const buf = new RingBuffer(3, { overflow: "drop-new" });
+    buf.append([1, 2, 3, 4], [10, 20, 30, 40]);
+    buf.push(5, 50);
+
+    expect(buf.length).toBe(3);
+    expect(at(buf, 0)).toEqual({ x: 1, y: 10 });
+    expect(at(buf, 1)).toEqual({ x: 2, y: 20 });
+    expect(at(buf, 2)).toEqual({ x: 3, y: 30 });
+  });
+
+  it("throws atomically when overflow is error", () => {
+    const buf = new RingBuffer(3, { overflow: "error" });
+    buf.append([1, 2], [10, 20]);
+
+    expect(() => buf.append([3, 4], [30, 40])).toThrow(RangeError);
+    expect(buf.length).toBe(2);
+    expect(at(buf, 0)).toEqual({ x: 1, y: 10 });
+    expect(at(buf, 1)).toEqual({ x: 2, y: 20 });
+  });
+
+  it("handles multiple wraps", () => {
+    const buf = new RingBuffer(2);
+    for (let i = 0; i < 10; i++) buf.push(i, i * 10);
+    expect(buf.length).toBe(2);
+    expect(at(buf, 0)).toEqual({ x: 8, y: 80 });
+    expect(at(buf, 1)).toEqual({ x: 9, y: 90 });
+  });
+
+  it("reports correct range", () => {
+    const buf = new RingBuffer(100);
+    buf.push(10, 100);
+    buf.push(20, 200);
+    const r = buf.range;
+    expect(r).not.toBeNull();
+    expect(r!.start).toBe(10);
+    expect(r!.end).toBe(20);
+  });
+
+  it("clears correctly", () => {
+    const buf = new RingBuffer(10);
+    buf.push(1, 10);
+    buf.push(2, 20);
+    buf.clear();
+    expect(buf.length).toBe(0);
+    expect(buf.range).toBeNull();
+  });
+
+  it("handles single element", () => {
+    const buf = new RingBuffer(1);
+    buf.push(42, 100);
+    expect(buf.length).toBe(1);
+    expect(at(buf, 0)).toEqual({ x: 42, y: 100 });
+    buf.push(99, 200);
+    expect(buf.length).toBe(1);
+    expect(at(buf, 0)).toEqual({ x: 99, y: 200 });
+  });
+
+  it("rejects invalid capacity", () => {
+    expect(() => new RingBuffer(0)).toThrow(RangeError);
+    expect(() => new RingBuffer(-1)).toThrow(RangeError);
+    expect(() => new RingBuffer(1.5)).toThrow(RangeError);
+  });
+
+  it("searches logical x values after wrapping", () => {
+    const buf = new RingBuffer(4);
+    for (let i = 0; i < 6; i++) buf.push(i, i * 10);
+    expect(at(buf, 0)).toEqual({ x: 2, y: 20 });
+    expect(at(buf, 3)).toEqual({ x: 5, y: 50 });
+    expect(buf.lowerBoundX(3.5)).toBe(2);
+    expect(buf.upperBoundX(4)).toBe(3);
+  });
+
+  it("returns min/max y over logical ranges", () => {
+    const buf = new RingBuffer(6);
+    buf.append([0, 1, 2, 3, 4, 5], [5, -1, 8, 3, 2, 7]);
+
+    expect(buf.rangeMinMaxY(1, 5)).toEqual({ minY: -1, maxY: 8 });
+  });
+
+  it("marks non-finite y values as gaps and excludes them from min/max ranges", () => {
+    const buf = new RingBuffer(5);
+    buf.append([0, 1, 2, 3, 4], [5, NaN, -2, Infinity, 7]);
+
+    expect(buf.isGap(0)).toBe(false);
+    expect(buf.isGap(1)).toBe(true);
+    expect(buf.isGap(3)).toBe(true);
+    expect(buf.rangeMinMaxY(0, 5)).toEqual({ minY: -2, maxY: 7 });
+    expect(buf.rangeMinMaxY(1, 2)).toBeNull();
+  });
+
+  it("returns min/max y over wrapped logical ranges", () => {
+    const buf = new RingBuffer(4);
+    buf.append([0, 1, 2, 3, 4, 5], [10, 20, -5, 7, 4, 12]);
+
+    expect(Array.from({ length: buf.length }, (_, i) => buf.getY(i))).toEqual([-5, 7, 4, 12]);
+    expect(buf.rangeMinMaxY(0, 4)).toEqual({ minY: -5, maxY: 12 });
+    expect(buf.rangeMinMaxY(1, 3)).toEqual({ minY: 4, maxY: 7 });
+  });
+
+  it("answers range min/max like a brute-force scan across wraps, updates, and batch appends", () => {
+    const buf = new RingBuffer(150);
+    let x = 0;
+    let state = 3;
+    const next = (): number => {
+      state = (state * 1_103_515_245 + 12_345) % 2_147_483_648;
+      return Math.round((state / 2_147_483_648 - 0.5) * 2000) / 4;
+    };
+    const check = (): void => {
+      for (let start = 0; start < buf.length; start += 7) {
+        for (let end = start + 1; end <= buf.length; end += 11) {
+          let minY = Infinity;
+          let maxY = -Infinity;
+          for (let i = start; i < end; i++) {
+            const y = buf.getY(i);
+            if (!Number.isFinite(y)) continue;
+            minY = Math.min(minY, y);
+            maxY = Math.max(maxY, y);
+          }
+          expect(buf.rangeMinMaxY(start, end)).toEqual(minY <= maxY ? { minY, maxY } : null);
+        }
+      }
+    };
+
+    for (let i = 0; i < 90; i++) buf.push(x++, next());
+    check();
+    buf.append(Array.from({ length: 140 }, () => x++), Array.from({ length: 140 }, (_, i) => i % 13 === 0 ? NaN : next()));
+    check();
+    buf.updateY(10, 10_000);
+    buf.update(140, buf.getX(140), -10_000);
+    check();
+    for (let i = 0; i < 400; i++) buf.push(x++, next());
+    check();
+  });
+
+  it("stores Y as float32 by default and exactly with valuePrecision float64", () => {
+    const narrow = new RingBuffer(2);
+    const wide = new RingBuffer(2, { valuePrecision: "float64" });
+    narrow.push(0, 123_456_789.12);
+    wide.push(0, 123_456_789.12);
+    expect(narrow.getY(0)).not.toBe(123_456_789.12);
+    expect(wide.getY(0)).toBe(123_456_789.12);
+    expect(wide.rangeMinMaxY(0, 1)).toEqual({ minY: 123_456_789.12, maxY: 123_456_789.12 });
+  });
+
+  it("counts evicted samples so ordinalOffset + index stays stable", () => {
+    const buf = new RingBuffer(4);
+    buf.append([0, 1, 2], [0, 0, 0]);
+    expect(buf.ordinalOffset).toBe(0);
+    buf.append([3, 4, 5], [0, 0, 0]);
+    expect(buf.ordinalOffset).toBe(2);
+    expect(buf.getX(0)).toBe(2);
+    buf.push(6, 0);
+    expect(buf.ordinalOffset).toBe(3);
+    buf.append([7, 8, 9, 10, 11], [0, 0, 0, 0, 0]);
+    expect(buf.ordinalOffset).toBe(8);
+    expect(buf.getX(0)).toBe(8);
+    buf.clear();
+    expect(buf.ordinalOffset).toBe(12);
+  });
+
+  it("skips samples whose X goes backwards and warns once", () => {
+    const original = console.warn;
+    const warnings: string[] = [];
+    console.warn = (message: string) => {
+      warnings.push(message);
+    };
+    try {
+      const buf = new RingBuffer(8);
+      buf.append([0, 1, 2], [0, 0, 0]);
+      buf.push(2, 0);
+      expect(warnings).toHaveLength(0);
+      buf.push(1, 0);
+      buf.append([0, -1], [0, 0]);
+      expect(buf.update(0, 99, 0)).toBe(false);
+      expect(buf.length).toBe(4);
+      expect([0, 1, 2, 3].map((i) => buf.getX(i))).toEqual([0, 1, 2, 2]);
+      expect(buf.rejectedSamples).toBe(4);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("RingBuffer skipped a sample with X 1 after 2 (decreasing-x)");
+    } finally {
+      console.warn = original;
+    }
+  });
+
+  describe("non-finite X", () => {
+    function withWarnings(run: (warnings: string[]) => void): void {
+      const original = console.warn;
+      const warnings: string[] = [];
+      console.warn = (message: string) => {
+        warnings.push(message);
+      };
+      try {
+        run(warnings);
+      } finally {
+        console.warn = original;
+      }
+    }
+
+    it("push skips NaN and infinities and warns once", () => {
+      withWarnings((warnings) => {
+        const buf = new RingBuffer(4);
+        buf.push(NaN, 1);
+        buf.push(Infinity, 1);
+        buf.push(-Infinity, 1);
+        expect(buf.length).toBe(0);
+        expect(buf.ordinalOffset).toBe(0);
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]).toContain("non-finite X");
+      });
+    });
+
+    it("append compacts finite samples and does not count skipped ones", () => {
+      withWarnings((warnings) => {
+        const buf = new RingBuffer(3, { overflow: "error" });
+        buf.append([1, NaN, 2, Infinity, 3], [10, 20, 30, 40, 50]);
+        expect(buf.length).toBe(3);
+        expect([0, 1, 2].map((i) => [buf.getX(i), buf.getY(i)])).toEqual([[1, 10], [2, 30], [3, 50]]);
+        expect(() => buf.append([4], [1])).toThrow(RangeError);
+        expect(warnings).toHaveLength(1);
+      });
+    });
+
+    it("an all-invalid batch is a no-op even in error mode on a full buffer", () => {
+      withWarnings(() => {
+        const buf = new RingBuffer(1, { overflow: "error" });
+        buf.push(1, 1);
+        expect(() => buf.append([NaN], [1])).not.toThrow();
+        expect(() => buf.push(NaN, 1)).not.toThrow();
+        expect(buf.length).toBe(1);
+      });
+    });
+
+    it("wrap and drop-new accounting only counts finite samples", () => {
+      withWarnings(() => {
+        const wrap = new RingBuffer(2);
+        wrap.append([1, NaN, 2, 3, NaN], [1, 0, 2, 3, 0]);
+        expect(wrap.length).toBe(2);
+        expect(wrap.getX(0)).toBe(2);
+        expect(wrap.ordinalOffset).toBe(1);
+
+        const drop = new RingBuffer(2, { overflow: "drop-new" });
+        drop.append([1, NaN, 2, 3], [1, 0, 2, 3]);
+        expect(drop.length).toBe(2);
+        expect(drop.getX(1)).toBe(2);
+      });
+    });
+
+    it("update rejects a non-finite X and leaves the sample unchanged", () => {
+      withWarnings((warnings) => {
+        const buf = new RingBuffer(3);
+        buf.append([1, 2], [1, 2]);
+        expect(buf.update(1, NaN, 9)).toBe(false);
+        expect(buf.getX(1)).toBe(2);
+        expect(buf.getY(1)).toBe(2);
+        expect(warnings).toHaveLength(1);
+      });
+    });
+  });
+});

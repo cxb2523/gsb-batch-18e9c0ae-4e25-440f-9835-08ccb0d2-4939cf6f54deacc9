@@ -1,0 +1,399 @@
+import { devWarn } from "../core/deprecation.js";
+import type { RgbaColor, ThemeColor } from "../core/types.js";
+import { parseColorSpaceColor } from "./cssColor.js";
+
+/**
+ * Partial chart theme supplied by callers. Every `*Color` field takes a CSS color string or an RGBA
+ * tuple (0-1 channels). `chart.theme` reports DOM colors as CSS strings and canvas colors as RGBA tuples.
+ */
+export interface ChartTheme {
+  readonly backgroundColor?: ThemeColor;
+  readonly gridColor?: ThemeColor;
+  readonly axisColor?: ThemeColor;
+  readonly axisFont?: string;
+  readonly seriesColors?: readonly ThemeColor[];
+  readonly tooltipBackgroundColor?: ThemeColor;
+  readonly tooltipTextColor?: ThemeColor;
+  readonly tooltipFont?: string;
+  readonly legendBackgroundColor?: ThemeColor;
+  readonly legendBorderColor?: ThemeColor;
+  readonly legendTextColor?: ThemeColor;
+  readonly legendMutedTextColor?: ThemeColor;
+  readonly legendFont?: string;
+  readonly titleColor?: ThemeColor;
+  readonly titleFont?: string;
+  readonly subtitleColor?: ThemeColor;
+  readonly subtitleFont?: string;
+  readonly axisTitleColor?: ThemeColor;
+  readonly axisTitleFont?: string;
+  /** Box-zoom and selection rectangle fill. */
+  readonly selectionFillColor?: ThemeColor;
+  /** Box-zoom and selection rectangle border. */
+  readonly selectionStrokeColor?: ThemeColor;
+  /** Crosshair and ruler line color. */
+  readonly crosshairColor?: ThemeColor;
+  /** Outline of hover/crosshair point markers. */
+  readonly markerStrokeColor?: ThemeColor;
+  /** Keyboard focus ring around the chart root, legend items, navigator, and annotations. */
+  readonly focusRingColor?: ThemeColor;
+}
+
+/** Fully resolved chart theme with concrete RGBA values. */
+export interface ResolvedChartTheme {
+  readonly backgroundColor: RgbaColor;
+  readonly backgroundCssColor: string;
+  readonly gridColor: RgbaColor;
+  readonly axisColor: string;
+  readonly axisFont: string;
+  readonly seriesColors: readonly RgbaColor[];
+  readonly tooltipBackgroundColor: string;
+  readonly tooltipTextColor: string;
+  readonly tooltipFont: string;
+  readonly legendBackgroundColor: string;
+  readonly legendBorderColor: string;
+  readonly legendTextColor: string;
+  readonly legendMutedTextColor: string;
+  readonly legendFont: string;
+  readonly titleColor: string;
+  readonly titleFont: string;
+  readonly subtitleColor: string;
+  readonly subtitleFont: string;
+  readonly axisTitleColor: string;
+  readonly axisTitleFont: string;
+  readonly selectionFillColor: string;
+  readonly selectionStrokeColor: string;
+  readonly crosshairColor: string;
+  readonly markerStrokeColor: string;
+  readonly focusRingColor: string;
+}
+
+const DEFAULT_SERIES_COLORS: readonly RgbaColor[] = [
+  [0.3, 0.6, 1.0, 1.0],
+  [0.95, 0.35, 0.35, 1.0],
+  [0.2, 0.8, 0.4, 0.9],
+  [0.95, 0.72, 0.25, 1.0],
+  [0.72, 0.45, 0.95, 1.0],
+  [0.25, 0.85, 0.95, 1.0],
+];
+
+/** Default dark chart theme. */
+export const DEFAULT_CHART_THEME: ResolvedChartTheme = {
+  backgroundColor: [0.02, 0.02, 0.02, 1],
+  backgroundCssColor: "rgba(5, 5, 5, 1)",
+  gridColor: [0.22, 0.22, 0.22, 0.45],
+  axisColor: "#d4d4d4",
+  axisFont: "11px ui-monospace, monospace, sans-serif",
+  seriesColors: DEFAULT_SERIES_COLORS,
+  tooltipBackgroundColor: "rgba(10, 10, 10, 0.88)",
+  tooltipTextColor: "#e5e5e5",
+  tooltipFont: "11px/1.35 ui-monospace, monospace",
+  legendBackgroundColor: "rgba(10, 10, 10, 0.88)",
+  legendBorderColor: "transparent",
+  legendTextColor: "#e5e5e5",
+  legendMutedTextColor: "#888",
+  legendFont: "11px/1.35 ui-monospace, monospace",
+  titleColor: "#f8fafc",
+  titleFont: "600 14px system-ui, sans-serif",
+  subtitleColor: "#cbd5e1",
+  subtitleFont: "12px system-ui, sans-serif",
+  axisTitleColor: "#d4d4d4",
+  axisTitleFont: "12px system-ui, sans-serif",
+  selectionFillColor: "rgba(59, 130, 246, 0.18)",
+  selectionStrokeColor: "rgba(147, 197, 253, 0.95)",
+  crosshairColor: "rgba(148, 163, 184, 0.55)",
+  markerStrokeColor: "#f8fafc",
+  focusRingColor: "#60a5fa",
+};
+
+const LIGHT_SERIES_COLORS: readonly RgbaColor[] = [
+  [29 / 255, 78 / 255, 216 / 255, 1],
+  [185 / 255, 28 / 255, 28 / 255, 1],
+  [21 / 255, 128 / 255, 61 / 255, 1],
+  [180 / 255, 83 / 255, 9 / 255, 1],
+  [126 / 255, 34 / 255, 206 / 255, 1],
+  [14 / 255, 116 / 255, 144 / 255, 1],
+];
+
+/**
+ * Light chart theme. Pass it as `theme`, or spread it and override a few tokens. Text tokens
+ * meet a 4.5:1 and series, selection, crosshair, and focus colors a 3:1 contrast ratio against
+ * its background.
+ */
+export const LIGHT_CHART_THEME: ResolvedChartTheme = {
+  backgroundColor: [1, 1, 1, 1],
+  backgroundCssColor: "rgba(255, 255, 255, 1)",
+  gridColor: [0.06, 0.09, 0.16, 0.12],
+  axisColor: "#404040",
+  axisFont: DEFAULT_CHART_THEME.axisFont,
+  seriesColors: LIGHT_SERIES_COLORS,
+  tooltipBackgroundColor: "rgba(255, 255, 255, 0.96)",
+  tooltipTextColor: "#171717",
+  tooltipFont: DEFAULT_CHART_THEME.tooltipFont,
+  legendBackgroundColor: "rgba(255, 255, 255, 0.92)",
+  legendBorderColor: "#d4d4d4",
+  legendTextColor: "#171717",
+  legendMutedTextColor: "#525252",
+  legendFont: DEFAULT_CHART_THEME.legendFont,
+  titleColor: "#0a0a0a",
+  titleFont: DEFAULT_CHART_THEME.titleFont,
+  subtitleColor: "#404040",
+  subtitleFont: DEFAULT_CHART_THEME.subtitleFont,
+  axisTitleColor: "#404040",
+  axisTitleFont: DEFAULT_CHART_THEME.axisTitleFont,
+  selectionFillColor: "rgba(37, 99, 235, 0.14)",
+  selectionStrokeColor: "rgba(29, 78, 216, 0.95)",
+  crosshairColor: "rgba(64, 64, 64, 0.8)",
+  markerStrokeColor: "#0a0a0a",
+  focusRingColor: "#1d4ed8",
+};
+
+/** CSS system colors tried, in order, for series in forced-colors (high-contrast) mode. */
+const FORCED_SERIES_SYSTEM_COLORS = ["Highlight", "LinkText", "CanvasText", "VisitedText", "ActiveText", "GrayText"] as const;
+
+/**
+ * @internal Theme used while the OS forces a high-contrast palette (`forced-colors: active`).
+ * DOM overlays use CSS system colors directly; the WebGL canvas gets the same colors resolved to RGBA.
+ */
+export function forcedColorsTheme(base: ResolvedChartTheme, context?: Element): ResolvedChartTheme {
+  // System colors can resolve translucent (Chromium on Linux reports Highlight at 0.8 alpha);
+  // draw them opaque so high-contrast lines keep their full contrast against Canvas.
+  const resolveOpaque = (name: string, fallback: RgbaColor): RgbaColor => {
+    const [r, g, b] = resolveThemeColor(name, fallback, context);
+    return [r, g, b, 1];
+  };
+  const canvas = resolveOpaque("Canvas", base.backgroundColor);
+  const text = resolveOpaque("CanvasText", [1, 1, 1, 1]);
+  const gray = resolveOpaque("GrayText", text);
+  const seen = new Set<string>([rgbaCss(canvas)]);
+  const seriesColors: RgbaColor[] = [];
+  for (const name of FORCED_SERIES_SYSTEM_COLORS) {
+    const color = resolveOpaque(name, text);
+    const key = rgbaCss(color);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    seriesColors.push(color);
+  }
+  if (seriesColors.length === 0) seriesColors.push(text);
+  return {
+    ...base,
+    backgroundColor: canvas,
+    backgroundCssColor: "Canvas",
+    gridColor: [gray[0], gray[1], gray[2], 0.6],
+    axisColor: "CanvasText",
+    seriesColors,
+    tooltipBackgroundColor: "Canvas",
+    tooltipTextColor: "CanvasText",
+    legendBackgroundColor: "Canvas",
+    legendBorderColor: "CanvasText",
+    legendTextColor: "CanvasText",
+    legendMutedTextColor: "GrayText",
+    titleColor: "CanvasText",
+    subtitleColor: "CanvasText",
+    axisTitleColor: "CanvasText",
+    selectionFillColor: "transparent",
+    selectionStrokeColor: "Highlight",
+    crosshairColor: "CanvasText",
+    markerStrokeColor: "CanvasText",
+    focusRingColor: "Highlight",
+  };
+}
+
+/** Merge a partial theme with defaults and resolve CSS colors. */
+export function resolveChartTheme(theme: ChartTheme | undefined, context?: Element): ResolvedChartTheme {
+  if (!theme) return DEFAULT_CHART_THEME;
+
+  const backgroundColor = resolveThemeColor(theme.backgroundColor, DEFAULT_CHART_THEME.backgroundColor, context, "theme.backgroundColor");
+  const seriesColors = theme.seriesColors?.length
+    ? theme.seriesColors.map((color, index) => resolveThemeColor(
+      color,
+      DEFAULT_CHART_THEME.seriesColors[index % DEFAULT_CHART_THEME.seriesColors.length]!,
+      context,
+      `theme.seriesColors[${index}]`,
+    ))
+    : DEFAULT_CHART_THEME.seriesColors;
+
+  // RGBA tuples become CSS strings for DOM tokens; background, grid, and series colors are resolved below.
+  // One pass over the caller's keys, without the entry arrays a chained `Object.entries` would build.
+  const merged: Record<string, unknown> = { ...DEFAULT_CHART_THEME };
+  for (const key of Object.keys(theme)) {
+    const value = (theme as Record<string, unknown>)[key];
+    if (value !== undefined) merged[key] = Array.isArray(value) ? rgbaCss(value as unknown as RgbaColor) : value;
+  }
+  return {
+    ...(merged as unknown as ResolvedChartTheme),
+    backgroundColor,
+    backgroundCssColor: themeColorToCss(theme.backgroundColor, DEFAULT_CHART_THEME.backgroundCssColor),
+    gridColor: resolveThemeColor(theme.gridColor, DEFAULT_CHART_THEME.gridColor, context, "theme.gridColor"),
+    seriesColors,
+  };
+}
+
+const warnedColors = new Set<string>();
+
+/**
+ * Resolve a theme color to an RGBA tuple. Any color the browser accepts works: the computed or
+ * canvas-normalized value is parsed (including oklch(), lab(), and color() spaces), and as a last
+ * resort the color is painted into a 1x1 canvas and read back at 8-bit precision. Unparseable
+ * strings fall back to `fallback` with one development warning per string naming `source`.
+ */
+export function resolveThemeColor(color: ThemeColor | undefined, fallback: RgbaColor, context?: Element, source?: string): RgbaColor {
+  if (!color) return fallback;
+  if (typeof color !== "string") return color;
+
+  // An opaque hex color means the same thing everywhere, so it needs no probe element, forced
+  // style recalculation or scratch canvas. Everything else (names, var(), color-mix(), system
+  // colors) is resolved by the browser, and the canvas normalization is only a last resort.
+  const hex = color.trim();
+  if (hex.length === 4 || hex.length === 7) {
+    const direct = parseHexColor(hex);
+    if (direct) return direct;
+  }
+  // A literal color function (rgba(), oklch(), ...) is parsed as written: computed styles round alpha to
+  // 8 bits, so rgba(0, 0, 0, 0.001), a line meant to add up over thousands of others, would come back as 0.
+  if (!/var\(|calc\(|env\(|attr\(|\bfrom\b/i.test(hex)) {
+    const literal = parseCssColor(hex);
+    if (literal) return literal;
+  }
+  const resolved = resolveCssColor(color, context);
+  const parsed = parseCssColor(resolved ?? color) ?? canvasColor(resolved ?? color, context);
+  if (parsed) return parsed;
+  if (!warnedColors.has(color)) {
+    warnedColors.add(color);
+    devWarn(`could not parse the color "${color}"${source ? ` (${source})` : ""}; using the default color instead.`);
+  }
+  return fallback;
+}
+
+/** Convert a theme color to a CSS color string. */
+export function themeColorToCss(color: ThemeColor | undefined, fallback: string): string {
+  if (!color) return fallback;
+  return typeof color === "string" ? color : rgbaCss(color);
+}
+
+/** Convert a 0-1 RGBA tuple to an `rgba(...)` CSS string. */
+export function rgbaCss(color: RgbaColor): string {
+  return `rgba(${Math.round(color[0] * 255)}, ${Math.round(color[1] * 255)}, ${Math.round(color[2] * 255)}, ${color[3]})`;
+}
+
+/** Resolve a CSS color to a computed RGB(A) string. */
+export function resolveCssColor(color: string, context?: Element): string | null {
+  const doc = context?.ownerDocument ?? globalThis.document;
+  if (!doc?.documentElement || typeof (doc.defaultView ?? globalThis).getComputedStyle === "undefined") return null;
+
+  const parent = context?.nodeType === 1 ? (context as HTMLElement) : doc.documentElement;
+  const el = doc.createElement("span");
+  el.style.position = "absolute";
+  el.style.visibility = "hidden";
+  el.style.pointerEvents = "none";
+  // An invalid color is ignored and keeps the sentinel, instead of computing to the inherited text color.
+  const sentinel = "rgb(1, 2, 3)";
+  el.style.color = sentinel;
+  el.style.color = color;
+  parent.appendChild(el);
+
+  const resolved = (doc.defaultView ?? globalThis).getComputedStyle(el).color;
+  el.remove();
+  return resolved && resolved !== sentinel ? resolved : null;
+}
+
+function parseCssColor(color: string): RgbaColor | null {
+  const trimmed = color.trim();
+  return parseRgbColor(trimmed) ?? parseSrgbColor(trimmed) ?? parseHexColor(trimmed) ?? parseColorSpaceColor(trimmed);
+}
+
+/**
+ * Let a 2D canvas normalize the color and parse its serialization; when that is a syntax the
+ * parsers do not know, paint the color into the 1x1 canvas and read the pixel back.
+ */
+function canvasColor(color: string, context?: Element): RgbaColor | null {
+  const doc = context?.ownerDocument ?? globalThis.document;
+  if (!doc?.createElement) return null;
+
+  const canvas = doc.createElement("canvas");
+  canvas.width = canvas.height = 1;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+
+  const sentinel = "#010203";
+  ctx.fillStyle = sentinel;
+  ctx.fillStyle = color;
+  const normalized = String(ctx.fillStyle);
+  if (normalized === sentinel) return null;
+  const parsed = parseCssColor(normalized);
+  if (parsed) return parsed;
+  try {
+    ctx.fillRect(0, 0, 1, 1);
+    const [r = 0, g = 0, b = 0, a = 0] = ctx.getImageData(0, 0, 1, 1).data;
+    return [r / 255, g / 255, b / 255, a / 255];
+  } catch {
+    return null;
+  }
+}
+
+function parseRgbColor(color: string): RgbaColor | null {
+  const match = color.match(/^rgba?\((.*)\)$/i);
+  if (!match) return null;
+
+  const body = match[1]!.trim();
+  const slashParts = body.split("/").map((part) => part.trim());
+  const rgbPart = slashParts[0]!;
+  const alphaPart = slashParts[1];
+  const rgb = rgbPart.includes(",")
+    ? rgbPart.split(",").map((part) => part.trim()).filter(Boolean)
+    : rgbPart.split(/\s+/).filter(Boolean);
+
+  if (rgb.length < 3) return null;
+  const r = parseChannel(rgb[0]!, 255);
+  const g = parseChannel(rgb[1]!, 255);
+  const b = parseChannel(rgb[2]!, 255);
+  const a = parseAlpha(alphaPart ?? (rgb.length > 3 ? rgb[3]! : undefined));
+  if (r === null || g === null || b === null || a === null) return null;
+  return [r, g, b, a];
+}
+
+function parseSrgbColor(color: string): RgbaColor | null {
+  const match = color.match(/^color\(\s*srgb\s+(.+)\)$/i);
+  if (!match) return null;
+
+  const parts = match[1]!.split("/").map((part) => part.trim());
+  const channels = parts[0]!.split(/\s+/).filter(Boolean);
+  if (channels.length < 3) return null;
+
+  const r = parseChannel(channels[0]!);
+  const g = parseChannel(channels[1]!);
+  const b = parseChannel(channels[2]!);
+  const a = parseAlpha(parts[1]);
+  if (r === null || g === null || b === null || a === null) return null;
+  return [r, g, b, a];
+}
+
+function parseHexColor(color: string): RgbaColor | null {
+  const value = color.startsWith("#") ? color.slice(1) : "";
+  if (![3, 4, 6, 8].includes(value.length) || !/^[\da-f]+$/i.test(value)) return null;
+
+  const expanded = value.length <= 4
+    ? [...value].map((char) => char + char).join("")
+    : value;
+  const parsed = Number.parseInt(expanded, 16);
+  if (!Number.isFinite(parsed)) return null;
+
+  const r = ((parsed >> (expanded.length === 8 ? 24 : 16)) & 255) / 255;
+  const g = ((parsed >> (expanded.length === 8 ? 16 : 8)) & 255) / 255;
+  const b = ((parsed >> (expanded.length === 8 ? 8 : 0)) & 255) / 255;
+  const a = expanded.length === 8 ? (parsed & 255) / 255 : 1;
+  return [r, g, b, a];
+}
+
+function parseChannel(value: string, divisor: number = 1): number | null {
+  const number = Number.parseFloat(value);
+  return clamp01(value.endsWith("%") ? number / 100 : number / divisor);
+}
+
+function parseAlpha(value: string | undefined): number | null {
+  return value ? parseChannel(value) : 1;
+}
+
+function clamp01(value: number): number | null {
+  if (!Number.isFinite(value)) return null;
+  return Math.min(1, Math.max(0, value));
+}

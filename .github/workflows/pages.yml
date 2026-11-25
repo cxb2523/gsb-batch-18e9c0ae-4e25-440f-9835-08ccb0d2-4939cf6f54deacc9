@@ -1,0 +1,61 @@
+name: Pages
+
+# The website is deployed from `main` on every push, from the release workflow (so each merge deploys
+# once, and a release deploys after its tag exists). Website changes never wait for a library release.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - uses: ./.github/actions/setup
+
+      - name: Build site
+        run: bun run pages:build
+
+      - name: Assemble site
+        run: |
+          rm -rf build/pages/visual build/pages/interaction
+          # SPA fallback for the previews route, and a redirect for links to the old /next/ site.
+          mkdir -p build/pages/previews build/pages/next
+          cp build/pages/index.html build/pages/previews/index.html
+          cat > build/pages/next/index.html <<'HTML'
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>Redirecting…</title>
+          <link rel="canonical" href="/">
+          <meta http-equiv="refresh" content="0; url=/">
+          <script>location.replace("/" + location.pathname.replace(/^\/next\/?/, "") + location.search + location.hash);</script>
+          <a href="/">BlazePlot</a>
+          HTML
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: build/pages
+
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
