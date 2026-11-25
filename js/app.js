@@ -211,6 +211,8 @@
   const isFav = (uuid) => favorites.some(s => s.stationuuid === uuid);
   function toggleFavorite(st){
     if(!st) return;
+    // A draft being tested isn't in My stations yet, so it must not leak into favorites either.
+    if(preview && currentStation === st){ toast('Save the station before adding it to favorites', 2200); return; }
     if(isFav(st.stationuuid)){
       favorites = favorites.filter(s => s.stationuuid !== st.stationuuid);
       toast(`Removed “${stationName(st)}” from favorites`);
@@ -536,6 +538,73 @@
   let reconnectTimer = null, stallTimer = null, stableTimer = null;
   let actx = null, analyser = null, eqNodes = [], freqData = null;
 
+  // Testing a custom stream plays through this same engine, but as a disposable preview:
+  // it never reaches history / click stats, it can't trigger auto-reconnect, and ending it
+  // puts the playback that was running before the test back exactly as it was.
+  let preview = null;   // { snapshot: { station, queue, state, statusMsg, pausedAt, reconnects } }
+  let previewToken = 0;
+  let testSeq = 0;      // increments per "Test it" click so a late result can be recognised as stale
+  function snapshotPlayback(){
+    return { station: currentStation, queue: queue.slice(), state: playState, statusMsg, pausedAt, reconnects };
+  }
+  // Starts (or restarts) a preview run, cancelling the previous one's pending request and audio.
+  // The snapshot is only taken for the first test of a dialog, so re-testing another link never
+  // forgets what was playing beforehand.
+  function beginPreview(){
+    if(!preview) preview = { snapshot: snapshotPlayback() };
+    const token = ++previewToken;
+    cancelDraftRead();
+    playToken++;                        // invalidate any in-flight tune from an earlier test
+    stopAll();                          // and release its element / HLS attachments right away
+    clearTimeout(stableTimer);
+    randomRun++;                        // and stop any random scan from grabbing playback back
+    return token;
+  }
+  // Leaves a preview without restoring anything — used when a user action (stop, another station,
+  // a random scan, a shared link, media keys) is about to take over playback anyway.
+  function abandonPreview(){
+    if(!preview) return;
+    preview = null;
+    previewToken++;
+    testSeq++;          // any test still in flight is now stale and must not report a result
+    cancelDraftRead();
+    stopAll();
+    clearTimeout(stableTimer);
+    // The dialog may still be open: wipe the now-stale test note so it can't claim a result.
+    const note = document.getElementById('cNote');
+    if(note){ note.hidden = true; note.textContent = ''; note.classList.remove('ok'); }
+  }
+  // Ends the preview and restores the pre-test playback. `nextStation` (optional) carries the
+  // freshly saved data when the previewed station is the very one that was playing before.
+  function endPreview(nextStation){
+    if(!preview) return false;
+    const snap = preview.snapshot;
+    preview = null;
+    previewToken++;
+    playToken++;
+    stopAll();
+    clearTimeout(stableTimer);
+    reconnects = snap.reconnects || 0;
+    pausedAt = snap.pausedAt || 0;
+    queue = snap.queue.slice();
+    lastArt = null;   // the station's artwork may have been edited meanwhile
+    const prev = snap.station;
+    const resuming = !!prev && (snap.state === 'playing' || snap.state === 'connecting');
+    const st = (prev && nextStation && prev.stationuuid === nextStation.stationuuid) ? nextStation : prev;
+    if(st && resuming){
+      stationCache.set(st.stationuuid, st);
+      tune(st, { quiet: true });
+    } else if(st){
+      currentStation = st;
+      setState(snap.state === 'error' ? 'error' : snap.state === 'idle' ? 'paused' : snap.state, snap.statusMsg);
+    } else {
+      currentStation = null;
+      queue = [];
+      setState(snap.state === 'error' ? 'error' : 'idle', snap.statusMsg);
+    }
+    return true;
+  }
+
   function ensureGraph(){
     if(actx) return true;
     try{
@@ -649,13 +718,20 @@
 
   async function tune(st, opts = {}){
     if(!st) return false;
-    if(!opts.random && !opts.reconnect) randomRun++;
+    if(opts.preview){
+      // A late result from a cancelled/superseded test must never take over playback.
+      if(!preview || opts.preview !== previewToken) return false;
+    } else if(preview){
+      abandonPreview(); // a real tune takes over from the test session
+    }
+    if(!opts.random && !opts.reconnect && !opts.preview && !opts.quiet) randomRun++;
     const token = ++playToken;
     const fxPromise = graphReady(); // first, while we're still inside the click handler
     stopAll();
     if(!opts.reconnect) reconnects = 0;
     currentStation = st;
-    stationCache.set(st.stationuuid, st);
+    // A test stream is a throwaway draft (possibly an unsaved edit) — don't let it into the cache.
+    if(!opts.preview) stationCache.set(st.stationuuid, st);
     setState('connecting', opts.reconnect ? `Reconnecting… (${reconnects}/3)` : 'Tuning in…');
 
     const url = streamUrl(st);
@@ -696,10 +772,13 @@
     setState('playing');
     clearTimeout(stableTimer);
     stableTimer = setTimeout(() => { reconnects = 0; }, 30000);
-    if(!opts.reconnect){ if(!isCustom(st)) registerClick(st.stationuuid); addRecent(st); }
-    else toast('Reconnected ✓');
+    // A preview is a throwaway listen: never record it in history or the directory's click stats.
+    if(opts.preview) return;
+    if(opts.reconnect) toast('Reconnected ✓');
+    else if(!opts.quiet){ if(!isCustom(st)) registerClick(st.stationuuid); addRecent(st); }
   }
   function scheduleReconnect(){
+    if(preview) return; // a test session never keeps retrying on its own
     reconnects++;
     clearTimeout(reconnectTimer);
     setState('connecting', `Signal lost — reconnecting… (${reconnects}/3)`);
@@ -708,6 +787,8 @@
   }
   function onStreamLost(){
     if(playState !== 'playing' && playState !== 'connecting') return;
+    // A test session reports the drop in place — it must not keep retrying behind the dialog.
+    if(preview){ stopAll(); setState('error', navigator.onLine ? 'Stream lost — test again' : "You're offline"); return; }
     if(settings.reconnect && reconnects < 3 && navigator.onLine) scheduleReconnect();
     else { stopAll(); setState('error', navigator.onLine ? 'Signal lost — try again' : "You're offline"); }
   }
@@ -735,11 +816,26 @@
 
   function pause(){
     randomRun++;
+    if(preview){
+      // Pausing mid-test: keep the snapshot (closing still restores), just silence the preview.
+      testSeq++; playToken++; stopAll(); setState('paused', 'Preview paused');
+      setCNote('Preview paused — press play to hear it again.', true);
+      return;
+    }
     if(playState === 'connecting'){ playToken++; stopAll(); setState(currentStation ? 'paused' : 'idle'); return; }
     audio.pause(); pausedAt = Date.now(); setState('paused');
   }
   function resume(){
     if(!currentStation) return;
+    if(preview){
+      const token = previewToken;
+      setCNote('Connecting…', true);
+      tune(currentStation, { preview: token }).then(ok => {
+        if(!preview || token !== previewToken) return;
+        setCNote(ok ? '✓ It works! Save it to keep it.' : "Couldn't play this link. Check that it's a direct audio stream and that it's online.");
+      });
+      return;
+    }
     // Live radio: after a short pause just continue; after a longer one, re-tune to get back to "live".
     const fresh = Date.now() - pausedAt < 15000 && (audio.hasAttribute('src') || hls) && !audio.error;
     if(fresh){
@@ -760,11 +856,12 @@
     else resume();
   }
   function stop(){
-    randomRun++; playToken++; stopAll();
+    randomRun++; playToken++; abandonPreview(); stopAll();
     currentStation = null; queue = [];
     setState('idle');
   }
   function playFromList(st){
+    abandonPreview();
     queue = currentList.slice();
     if(currentStation && currentStation.stationuuid === st.stationuuid && (playState === 'playing' || playState === 'connecting')){ pause(); return; }
     tune(st);
@@ -785,6 +882,7 @@
     if(randomBusy) return;
     randomBusy = true;
     const run = ++randomRun;
+    abandonPreview();
     const btns = [el.ctaSurprise, el.btnSurprise2];
     btns.forEach(b => { b.disabled = true; });
     graphReady(); // unlock audio while we're still inside the click
@@ -862,11 +960,14 @@
       el.pArt.src = safeUrl(st.favicon) || FALLBACK_ICON;
     }
     const fav = isFav(st.stationuuid);
-    el.pFav.disabled = false;
+    // A previewed draft isn't saved yet: keep the star inert instead of offering to favorite it.
+    const isPreview = !!preview && currentStation === st;
+    el.pFav.disabled = isPreview;
     el.pFav.textContent = fav ? '★' : '☆';
     el.pFav.classList.toggle('active', fav);
     el.pFav.setAttribute('aria-label', fav ? 'Remove from favorites' : 'Add to favorites');
-    const stepList = queue.length ? queue : favorites;
+    // Prev/next while testing would leave the test for a random neighbouring station.
+    const stepList = isPreview ? [] : (queue.length ? queue : favorites);
     el.prevBtn.disabled = el.nextBtn.disabled = stepList.length < 2;
 
     el.lcdFreq.textContent = freqFor(st.stationuuid);
@@ -1178,6 +1279,7 @@
   const customDlg = $('#customDlg');
   const cNote = $('#cNote');
   let draftId = null, editingId = null;
+  let autoName = null; // the name we derived from the link, so a changed link can refresh it
   function newCustomId(){
     const rnd = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
     return 'custom-' + rnd;
@@ -1186,6 +1288,7 @@
   function openCustomEditor(st){
     editingId = st && st.stationuuid && isCustom(st) ? st.stationuuid : null;
     draftId = editingId || newCustomId();
+    autoName = null;
     $('#customTitle').textContent = editingId ? 'Edit station' : 'Add a station';
     $('#cSave').textContent = editingId ? 'Save changes' : 'Save station';
     $('#cUrl').value = (st && st.url) || '';
@@ -1198,9 +1301,10 @@
     ($('#cUrl').value ? $('#cName') : $('#cUrl')).focus();
   }
   // .pls / .m3u files are playlists that point at the real stream: read the first link out of them.
-  async function resolvePlaylist(url){
+  async function resolvePlaylist(url, signal){
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 6000);
+    if(signal) signal.addEventListener('abort', () => ctrl.abort(), { once: true });
     try{
       const res = await fetch(url, { signal: ctrl.signal });
       const text = (await res.text()).slice(0, 20000);
@@ -1209,18 +1313,32 @@
     }catch(e){ return null; }
     finally{ clearTimeout(t); }
   }
-  async function readDraft(){
+  // Cancels an in-flight playlist read when a newer test (or a closed dialog) takes over.
+  let draftReadCtrl = null;
+  function cancelDraftRead(){ if(draftReadCtrl){ draftReadCtrl.abort(); draftReadCtrl = null; } }
+  // Reads the form into a station draft. `stale` lets callers whose request may be superseded
+  // (another test click, a closed dialog) abort before writing anything back into the form.
+  async function readDraft(stale){
+    cancelDraftRead();
     let url = $('#cUrl').value.trim();
     if(!safeUrl(url)){ setCNote('Enter a stream link that starts with http:// or https://'); $('#cUrl').focus(); return null; }
     if(/\.(pls|m3u)($|\?)/i.test(url)){
       setCNote('Reading playlist…', true);
-      const real = await resolvePlaylist(url);
+      const ctrl = draftReadCtrl = new AbortController();
+      const real = await resolvePlaylist(url, ctrl.signal);
+      if(draftReadCtrl === ctrl) draftReadCtrl = null;
+      if(stale && stale()) return null;
       if(real){ url = real; $('#cUrl').value = real; setCNote(''); }
       else setCNote("Couldn't read that playlist file, so it will be tried as a stream.");
     }
     const tags = $('#cTags').value.split(',').map(t => t.trim().toLowerCase()).filter(Boolean).slice(0, 8).join(',');
+    // The name defaults to the link's host. If that auto-name is still untouched and the link
+    // changed (e.g. a second "Test it"), refresh it instead of showing the previous host.
     let name = $('#cName').value.trim();
-    if(!name){ name = hostOf(url).replace(/^www\./, '') || 'My station'; $('#cName').value = name; }
+    const auto = hostOf(url).replace(/^www\./, '') || 'My station';
+    if(!name || ($('#cName').value.trim() === autoName && name !== auto)){
+      name = auto; $('#cName').value = name; autoName = auto;
+    }
     return {
       stationuuid: draftId, custom: true, name, url, url_resolved: url,
       favicon: safeUrl($('#cLogo').value), tags,
@@ -1228,23 +1346,42 @@
     };
   }
   function replaceEverywhere(st){
+    const hadCurrent = !!(currentStation && currentStation.stationuuid === st.stationuuid);
+    const oldUrl = hadCurrent ? streamUrl(currentStation) : '';
     const swap = (list) => list.map(s => s.stationuuid === st.stationuuid ? slim(st) : s);
     favorites = swap(favorites); recent = swap(recent);
     store.set('favorites', favorites); store.set('recent', recent);
     const last = store.get('last', null);
     if(last && last.stationuuid === st.stationuuid) store.set('last', slim(st));
     stationCache.set(st.stationuuid, st);
-    if(currentStation && currentStation.stationuuid === st.stationuuid){ currentStation = st; lastArt = null; renderPlayer(); }
+    if(hadCurrent){
+      currentStation = st;
+      lastArt = null;
+      // The edit changed the stream address of the station we're listening to: retune to it.
+      if(oldUrl && streamUrl(st) && oldUrl !== streamUrl(st)){
+        if(playState === 'playing' || playState === 'connecting') tune(st, { quiet: true });
+        // Not on air: drop the old element source so the next resume tunes the new address.
+        else { playToken++; stopAll(); setState(playState === 'idle' ? 'paused' : playState, statusMsg); }
+      } else {
+        renderPlayer();
+      }
+    }
+    // An open details sheet should show the saved values, not the pre-edit ones.
+    if(el.detailDlg.open && el.detailDlg.dataset.uuid === st.stationuuid) openDetails(st);
   }
   $('#cTest').addEventListener('click', async () => {
-    const btn = $('#cTest');
-    const d = await readDraft(); if(!d) return;
-    btn.disabled = true;
+    // Clicking again (or after changing the link) supersedes the running test: its pending
+    // request and its audio are cancelled instead of being allowed to win later.
+    const seq = ++testSeq;
+    // Silence the running test immediately; its snapshot is kept for when we finally leave.
+    if(preview) beginPreview();
+    const d = await readDraft(() => seq !== testSeq || !customDlg.open); // may resolve .pls / .m3u
+    if(seq !== testSeq || !customDlg.open) return;      // superseded by a newer test / closed dialog
+    if(!d){ if(preview) endPreview(); return; }         // bad link: give playback back
+    const token = preview ? previewToken : beginPreview();
     setCNote('Connecting…', true);
-    queue = [];
-    const ok = await tune(d);
-    btn.disabled = false;
-    if(!customDlg.open) return;
+    const ok = await tune(d, { preview: token });
+    if(seq !== testSeq || !preview || token !== previewToken || !customDlg.open) return;
     if(ok) setCNote('✓ It works! Save it to keep it.', true);
     else if(playState === 'paused') setCNote('Press play in the player to start it.', true);
     else setCNote(PAGE_SECURE && /^http:/i.test(d.url)
@@ -1253,19 +1390,28 @@
   });
   $('#customForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const d = await readDraft(); if(!d) return;
+    // Take over from any test still connecting: its late result must not overwrite the save.
+    const seq = ++testSeq;
+    const d = await readDraft(() => seq !== testSeq || !customDlg.open);
+    if(seq !== testSeq || !d) return;
     const i = myStations.findIndex(s => s.stationuuid === d.stationuuid);
     if(i >= 0) myStations[i] = d; else myStations.unshift(d);
     store.set('custom', myStations);
+    // Leave the test first so playback returns to what it was before (using the saved data when
+    // the tested station is the one that was playing), then fan the saved data out everywhere.
+    endPreview(d);
     replaceEverywhere(d);
     customDlg.close();
     toast(i >= 0 ? 'Station updated' : `📻 Added “${d.name}” to My stations`);
     clearFilters();
     showMine();
   });
+  // Closing the dialog for any reason (✕, backdrop, Esc) discards the test and restores playback.
+  customDlg.addEventListener('close', () => { endPreview(); });
   function deleteCustom(st){
     if(!window.confirm(`Delete “${stationName(st)}” from My stations?`)) return false;
     const id = st.stationuuid;
+    const wasCurrent = !!(currentStation && currentStation.stationuuid === id);
     myStations = myStations.filter(s => s.stationuuid !== id);
     favorites = favorites.filter(s => s.stationuuid !== id);
     recent = recent.filter(s => s.stationuuid !== id);
@@ -1273,8 +1419,11 @@
     const last = store.get('last', null);
     if(last && last.stationuuid === id) store.set('last', null);
     queue = queue.filter(s => s.stationuuid !== id);
+    stationCache.delete(id);
     el.statFavs.textContent = favorites.length;
-    renderTabs(); refreshLibraryView(); renderPlayer();
+    // Deleting what's on air stops it and clears the queue instead of leaving a ghost in the player.
+    if(wasCurrent) stop(); else renderPlayer();
+    renderTabs(); refreshLibraryView();
     toast('Station deleted');
     return true;
   }
@@ -1455,7 +1604,7 @@
     if(!navigator.onLine){ el.navStat.textContent = 'offline'; }
     else if(statsText) el.navStat.textContent = statsText;
   }
-  window.addEventListener('online', () => { setOnline(); toast('Back online'); if(playState === 'error' && currentStation) tune(currentStation); });
+  window.addEventListener('online', () => { setOnline(); toast('Back online'); if(!preview && playState === 'error' && currentStation) tune(currentStation); });
   window.addEventListener('offline', () => { setOnline(); toast("You're offline"); });
 
   // Deep links: #station=<uuid>
@@ -1469,6 +1618,7 @@
       try{ st = cacheStations(await apiGet(`/json/stations/byuuid/${uuid}`))[0]; }catch(e){}
     }
     if(!st){ toast('That shared station could not be found'); return; }
+    abandonPreview();
     playToken++; stopAll();
     currentStation = st; queue = [];
     setState('paused', 'Shared with you — press play ▶');
