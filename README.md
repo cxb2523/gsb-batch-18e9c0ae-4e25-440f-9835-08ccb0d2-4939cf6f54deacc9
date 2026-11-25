@@ -227,6 +227,51 @@ audio.getLoopMode();               // Get current loop mode
 const instance = AudioX.getAudioInstance();  // Get raw audio element
 ```
 
+## Testing
+
+The test suite runs on [Vitest](https://vitest.dev/) with a [jsdom](https://github.com/jsdom/jsdom)
+environment. jsdom has no Web Audio implementation, so `test/setup/` provides
+instrumented fakes for `AudioContext`, its nodes and the HLS client.
+
+```bash
+npm test          # single run
+npm run test:watch
+npm run typecheck # type-check source and tests
+```
+
+The lifecycle suite (`test/audiox.lifecycle.test.ts`) covers the three
+critical paths:
+
+1. **Repeated `play()` / track changes / pause-resume** — the equalizer graph is
+   built exactly once and `setPreset` / `setCustomEQ` / `setBassBoost` stay
+   usable. With `enableEQ` off those methods only log an error and never throw.
+2. **HLS ⇄ regular source switching** — hls.js is attached for `.m3u8`, detached
+   when returning to a regular source, and the equalizer keeps working on the
+   shared audio element throughout.
+3. **`destroy()` then re-`init()`** — the `AudioContext` is closed, every node is
+   disconnected, the singletons and `eqStatus` reset, and a fresh graph is built
+   against a new audio element on the next `play()`.
+
+### How "nodes wire only once" is verified
+
+A media element can be passed to `createMediaElementSource()` only once in its
+lifetime; a second call throws `InvalidStateError` and kills the equalizer. The
+mock in `test/setup/webAudioMock.ts` reproduces that invariant and records
+every call:
+
+- `MockAudioContext.createdContexts` — how many contexts were created.
+- `context.createMediaElementSource` (spy) — wiring calls on one context; the
+  suite asserts `toHaveBeenCalledTimes(1)` after many `play()`/track changes.
+- `MockAudioContext.totalMediaElementSourceCalls` /
+  `globallyRoutedElements` — browser-wide counters proving each element enters a
+  graph exactly once, including across a `destroy()` → rebuild cycle.
+- `context.connectedNodes` — the full connect list, asserting the chain
+  `mediaElementSource → biquad filters → bass boost → compressor → destination`.
+
+Because the mock throws on a second routing of the same element, any regression
+that re-runs `createMediaElementSource` fails the test the same way it would fail
+in a real browser.
+
 ## Contributing
 
 Found a bug? Want to add a feature? Contributions are welcome! Please raise an issue or submit a PR.

@@ -26,18 +26,18 @@ import type {
 } from 'types/audio.types';
 import type { EqualizerStatus, Preset } from 'types/equalizer.types';
 
-let audioInstance: HTMLAudioElement;
+let audioInstance: HTMLAudioElement | undefined;
 
 class AudioX {
   private _audio: HTMLAudioElement;
   private isPlayLogEnabled: boolean;
-  private static _instance: AudioX;
+  private static _instance: AudioX | undefined;
   private _queue: MediaTrack[];
   private _currentQueueIndex = 0;
   private _fetchFn: (mediaTrack: MediaTrack) => Promise<void>;
   private eqStatus: EqualizerStatus = 'IDEAL';
   private isEqEnabled = false;
-  private eqInstance: Equalizer;
+  private eqInstance: Equalizer | undefined;
   private showNotificationsActions = false;
   private originalQueue: MediaTrack[] = [];
   private isShuffled = false;
@@ -121,12 +121,13 @@ class AudioX {
 
     if (enableHls) {
       const hls = new HlsAdapter();
-      hls.init(enablePlayLog, hlsConfig);
+      // Await so a subsequent addMedia() is guaranteed to find the HLS client.
+      await hls.init(enablePlayLog, hlsConfig);
     }
   }
 
   async addMedia(mediaTrack: MediaTrack, mediaFetchFn?: (mediaTrack: MediaTrack) => Promise<void>) {
-    if (!mediaTrack) {
+    if (!mediaTrack || !audioInstance) {
       return;
     }
 
@@ -143,16 +144,18 @@ class AudioX {
     }
 
     const mediaType = mediaTrack.source.includes('.m3u8') ? 'HLS' : 'DEFAULT';
+    const audio = audioInstance;
 
     if (this.isPlayLogEnabled) {
-      calculateActualPlayedLength(audioInstance, 'TRACK_CHANGE');
+      calculateActualPlayedLength(audio, 'TRACK_CHANGE');
     }
 
-    if (mediaType === 'HLS' && !audioInstance.canPlayType('application/vnd.apple.mpegurl')) {
+    if (mediaType === 'HLS' && !audio.canPlayType('application/vnd.apple.mpegurl')) {
       const hls = new HlsAdapter();
       const hlsInstance = hls.getHlsInstance();
       if (hlsInstance) {
-        hlsInstance.detachMedia();
+        // addHlsMedia detaches any previous binding before loading the new
+        // stream, keeping hls.js and the equalizer on the same audio element.
         hls.addHlsMedia(mediaTrack);
       } else {
         console.warn(
@@ -161,7 +164,13 @@ class AudioX {
         await this.reset();
       }
     } else {
-      audioInstance.src = mediaTrack.source;
+      // Switching to a regular source: unbind hls.js so it cannot keep driving
+      // (and overwriting the src of) the shared audio element.
+      const hls = new HlsAdapter();
+      if (hls.isMediaAttached()) {
+        hls.detachFromMedia();
+      }
+      audio.src = mediaTrack.source;
     }
 
     notify('AUDIO_STATE', {
@@ -171,22 +180,38 @@ class AudioX {
     });
 
     updateMetaData(mediaTrack);
-    audioInstance.load();
+    audio.load();
   }
 
+  /**
+   * Builds the equalizer graph once for the lifetime of this player instance.
+   *
+   * Guarded on every side: no-op when EQ is disabled, when a graph is already
+   * wired (`ACTIVE`) or when a previous attempt permanently failed. Because a
+   * media element can only enter an AudioContext a single time, the actual
+   * `createMediaElementSource` call happens at most once.
+   */
   attachEq() {
-    if (this.eqStatus === 'IDEAL') {
-      try {
-        const eq = new Equalizer();
-        this.eqStatus = eq.status();
-        this.eqInstance = eq;
-      } catch (_e) {
-        console.log('failed to enable equalizer');
-      }
+    if (!this.isEqEnabled || this.eqStatus !== 'IDEAL' || this.eqInstance) {
+      return;
+    }
+
+    try {
+      const eq = new Equalizer();
+      this.eqInstance = eq;
+      this.eqStatus = eq.status();
+    } catch (_e) {
+      // Record the failure so repeated play() calls do not keep retrying an
+      // unrecoverable graph (e.g. Web Audio unsupported).
+      this.eqStatus = 'FAILED';
+      console.error('failed to enable equalizer');
     }
   }
 
   async play() {
+    if (!audioInstance) {
+      return;
+    }
     const isSourceAvailable = audioInstance.src !== '';
     if (
       audioInstance?.paused &&
@@ -228,12 +253,11 @@ class AudioX {
     try {
       if (currentTrack) {
         this.addMedia(currentTrack).then(() => {
-          if (audioInstance.HAVE_ENOUGH_DATA === READY_STATE.HAVE_ENOUGH_DATA) {
+          if (audioInstance && audioInstance.HAVE_ENOUGH_DATA === READY_STATE.HAVE_ENOUGH_DATA) {
             setTimeout(async () => {
+              // play() owns EQ wiring, so no separate attachEq() is needed here;
+              // calling both would race on the same createMediaElementSource.
               await this.play();
-              if (this.isEqEnabled) {
-                this.attachEq();
-              }
             }, 950);
           }
         });
@@ -264,6 +288,10 @@ class AudioX {
   async reset() {
     if (audioInstance) {
       this.stop();
+      const hls = new HlsAdapter();
+      if (hls.isMediaAttached()) {
+        hls.detachFromMedia();
+      }
       audioInstance.src = '';
       audioInstance.srcObject = null;
     }
@@ -312,12 +340,31 @@ class AudioX {
     }
   }
 
+  /**
+   * Releases every resource owned by this player instance:
+   * - tears down the equalizer graph (nodes disconnected, AudioContext closed)
+   * - destroys the HLS client and unbinds it from the audio element
+   * - clears the audio element source and resets both singletons and EQ state,
+   *   so a subsequent `init()` + `play()` builds a fresh, working graph.
+   */
   async destroy() {
+    if (this.eqInstance) {
+      await this.eqInstance.destroy();
+      this.eqInstance = undefined;
+    }
+    this.eqStatus = 'IDEAL';
+    this.isEqEnabled = false;
+
+    new HlsAdapter().destroy();
+
     if (audioInstance) {
       await this.reset();
       audioInstance.removeAttribute('src');
       audioInstance.load();
     }
+
+    audioInstance = undefined;
+    AudioX._instance = undefined;
   }
 
   subscribe(eventName: string, callback: (data: any) => void, state: any = {}) {
@@ -326,7 +373,7 @@ class AudioX {
   }
 
   addEventListener(event: keyof HTMLMediaElementEventMap, callback: (data: any) => void) {
-    audioInstance.addEventListener(event, callback);
+    audioInstance?.addEventListener(event, callback);
   }
 
   getPresets() {
@@ -334,7 +381,7 @@ class AudioX {
   }
 
   setPreset(id: keyof Preset) {
-    if (this.isEqEnabled) {
+    if (this.isEqEnabled && this.eqInstance) {
       this.eqInstance.setPreset(id);
     } else {
       console.error('Equalizer not initialized, please set enableEq at init');
@@ -342,15 +389,15 @@ class AudioX {
   }
 
   setCustomEQ(gains: number[]) {
-    if (this.isEqEnabled) {
+    if (this.isEqEnabled && this.eqInstance) {
       this.eqInstance.setCustomEQ(gains);
     } else {
       console.error('Equalizer not initialized, please set enableEq at init');
     }
   }
 
-  setBassBoost(enabled: boolean, boost: number) {
-    if (this.isEqEnabled) {
+  setBassBoost(enabled: boolean, boost = 6) {
+    if (this.isEqEnabled && this.eqInstance) {
       this.eqInstance.setBassBoost(enabled, boost);
     } else {
       console.error('Equalizer not initialized, please set enableEq at init');

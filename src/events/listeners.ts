@@ -21,10 +21,10 @@ const attachEventListeners = (
   playLogEnabled = false,
 ) => {
   const audioInstance = AudioX.getAudioInstance();
-  if (isValidArray(Object.keys(eventListenersCallbackMap))) {
+  if (audioInstance && isValidArray(Object.keys(eventListenersCallbackMap))) {
     for (const evt of Object.keys(eventListenersCallbackMap)) {
       const event = evt as keyof AudioEvents;
-      audioInstance?.addEventListener(AUDIO_EVENTS[event], (e: Event) => {
+      audioInstance.addEventListener(AUDIO_EVENTS[event], (e: Event) => {
         if (evt && eventListenersCallbackMap[event]) {
           const listenerCallback = eventListenersCallbackMap[event];
           if (typeof listenerCallback === 'function') {
@@ -41,11 +41,11 @@ const attachCustomEventListeners = (
   enablePlayLog = false,
 ) => {
   const audioInstance = AudioX.getAudioInstance();
-  if (isValidArray(eventListenersList)) {
+  if (audioInstance && isValidArray(eventListenersList)) {
     for (const evt of eventListenersList) {
       const event = evt as keyof AudioEvents;
       if (Object.keys(AUDIO_EVENTS).includes(event)) {
-        audioInstance?.addEventListener(AUDIO_EVENTS[event], (e: Event) => {
+        audioInstance.addEventListener(AUDIO_EVENTS[event], (e: Event) => {
           notify(AUDIO_EVENTS[event], {
             e,
             audioInstance,
@@ -63,6 +63,9 @@ const attachHlsEventsListeners = (
 ) => {
   const hls = new HlsAdapter();
   const hlsInstance = hls.getHlsInstance();
+  if (!hlsInstance) {
+    return;
+  }
   if (isValidArray(Object.keys(hlsEventlistenerCallbackMap))) {
     for (const evt of Object.keys(hlsEventlistenerCallbackMap)) {
       const event = evt as keyof HlsEvents;
