@@ -1,10 +1,16 @@
-import fcntl
 import logging
 import os
 import select
 import socket
 import time
 from shutil import which
+
+try:
+    import fcntl
+except ImportError:
+    # fcntl is a POSIX-only module, the local VLC backend can not be used
+    # without it but the remote (network) backend still works on Windows.
+    fcntl = None
 
 from .utils import SilentPopen, iterate_forever
 
@@ -25,6 +31,12 @@ class UnsupportedEncoding(PlayerException):
 
 class PlayerUnusable(PlayerException):
     """Player can not be used on this system"""
+
+    pass
+
+
+class RemoteVLCConnectionError(PlayerException):
+    """Remote VLC control connection can not be established or recovered"""
 
     pass
 
@@ -266,6 +278,11 @@ class VLCPlayer(BasePlayer):
         caring about how much output there is we switch stdout to nonblocking
         mode and just read a large chunk of data.
         """
+        if fcntl is None:
+            raise PlayerUnusable(
+                "Local VLC requires the POSIX-only fcntl module"
+            )
+
         flags = fcntl.fcntl(self._process.stdout, fcntl.F_GETFL)
         fcntl.fcntl(self._process.stdout, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
@@ -285,32 +302,192 @@ class VLCPlayer(BasePlayer):
 
 
 class RemoteVLC(VLCPlayer):
+    # Number of times to attempt to rebuild a dead control connection before
+    # giving up on the current song.
+    RECONNECT_ATTEMPTS = 3
+    # Delay between reconnect attempts so we do not hot-loop against a host
+    # that is temporarily unreachable.
+    RECONNECT_DELAY = 1
+
     def __init__(self, host, port, callbacks, control_channel):
         self._connect_to = (host, int(port))
         self._control_sock = None
+        self._current_song = None
         super().__init__(callbacks, control_channel)
 
     def _get_select_readers(self):
         return [self._control_channel, self._control_sock]
 
-    def _send_cmd(self, cmd):
+    def _raw_send(self, cmd):
+        """Single best-effort write to the control socket"""
+        if self._control_sock is None:
+            # An OSError keeps this inside the same reconnect handling as a
+            # write to a dead socket rather than becoming an AttributeError.
+            raise OSError("Remote VLC control connection is not open")
         self._control_sock.sendall(f"{cmd}\n".encode())
 
+    def _send_cmd(self, cmd):
+        """Write a command to the remote VLC, reconnecting once on failure
+
+        A dead socket raises OSError when written to. Treat that as a lost
+        control connection, rebuild it, and retry the single command rather
+        than letting the exception unwind through the playback loop. Track
+        loads are not retried here because _reconnect re-issues them itself.
+        """
+        try:
+            self._raw_send(cmd)
+        except OSError:
+            log.warning(
+                "Lost remote VLC connection while sending, reconnecting"
+            )
+            self._reconnect()
+            try:
+                self._raw_send(cmd)
+            except OSError as ex:
+                raise RemoteVLCConnectionError(
+                    f"Unable to send command to remote VLC at "
+                    f"{self._connect_to[0]}:{self._connect_to[1]}: {ex}"
+                )
+
     def _read_from_process(self, handle):
-        return handle.recv(self.CHUNK_SIZE).strip()
+        """Read status output, rebuilding the connection if the peer closed
+
+        An empty read means the remote end shut the connection down. On a
+        healthy socket a non-blocking recv with no data raises BlockingIOError
+        instead, so an empty read is unambiguous.
+        """
+        try:
+            data = handle.recv(self.CHUNK_SIZE).strip()
+        except BlockingIOError:
+            # Non-blocking socket that is selectable but has no data yet,
+            # nothing to do this iteration.
+            return b""
+        except OSError:
+            data = b""
+
+        if not data:
+            log.warning("Remote VLC connection closed by peer, reconnecting")
+            self._reconnect()
+
+        return data
+
+    def _open_connection(self):
+        """Open a new control socket to the configured remote VLC"""
+        log.debug("Connecting to remote VLC at %r", self._connect_to)
+        sock = socket.create_connection(self._connect_to)
+        sock.setblocking(False)
+        return sock
+
+    def _close_socket(self):
+        """Close and discard the current control socket, if any"""
+        if self._control_sock is not None:
+            sock = self._control_sock
+            # Drop the reference first so a failing close can never leave a
+            # stale socket behind that blocks later reconnection or cleanup.
+            self._control_sock = None
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _reload_track(self):
+        """Re-issue the load command for the in-progress track
+
+        OSError is left to propagate so _reconnect treats a failed reload as
+        a failed attempt and retries, instead of stacking duplicate adds.
+        """
+        if self._current_song is None:
+            return
+
+        self._raw_send(f"add {self._current_song.audio_url}")
+
+    def _reconnect(self):
+        """Rebuild a dead control connection and resume the current song
+
+        Retries the same host:port a bounded number of times. The old socket
+        is always closed before opening a replacement so file descriptors do
+        not leak. The song-start callback is deliberately not re-invoked; the
+        same song simply continues after the load command is re-sent.
+        """
+        self._close_socket()
+
+        for attempt in range(1, self.RECONNECT_ATTEMPTS + 1):
+            try:
+                self._control_sock = self._open_connection()
+                self._reload_track()
+                log.info("Reconnected to remote VLC on attempt %d", attempt)
+                return
+            except OSError as ex:
+                log.warning(
+                    "Remote VLC reconnect attempt %d/%d failed: %s",
+                    attempt,
+                    self.RECONNECT_ATTEMPTS,
+                    ex,
+                )
+                self._close_socket()
+                if attempt < self.RECONNECT_ATTEMPTS:
+                    time.sleep(self.RECONNECT_DELAY)
+
+        self._close_socket()
+        raise RemoteVLCConnectionError(
+            f"Unable to reconnect to remote VLC at "
+            f"{self._connect_to[0]}:{self._connect_to[1]} after "
+            f"{self.RECONNECT_ATTEMPTS} attempts"
+        )
 
     def _ensure_started(self):
         if not self._control_sock:
-            log.debug("Connecting to remote VLC at %r", self._connect_to)
-            self._control_sock = socket.create_connection(self._connect_to)
-            self._control_sock.setblocking(False)
+            try:
+                self._control_sock = self._open_connection()
+            except OSError as ex:
+                raise PlayerUnusable(
+                    f"Unable to connect to VLC at "
+                    f"{self._connect_to[0]}:{self._connect_to[1]}: {ex}"
+                )
+
+    def _load_track(self, song):
+        # Remember the song so it can be re-loaded after a reconnect without
+        # re-firing the play callback. A dead socket at load time is treated
+        # like any other lost connection: rebuild it and let _reconnect issue
+        # the add command, so the song is queued exactly once.
+        self._current_song = song
+        try:
+            self._raw_send(f"add {song.audio_url}")
+        except OSError:
+            self._reconnect()
 
     def _find_path(self):
-        try:
-            self._ensure_started()
-        except OSError:
-            raise PlayerUnusable("Unable to connect to VLC")
+        # Construction-time connection failures are fatal and reported as
+        # PlayerUnusable so callers can fall back to another backend.
+        self._ensure_started()
 
     def _post_start(self):
         # This is a NOOP for network VLC
         pass
+
+    def stop(self):
+        """Stop playback unless the connection has already been released
+
+        end_station closes the socket before the outer play_station loop
+        calls stop; trying to send then would needlessly force a reconnect.
+        """
+        if self._control_sock is None:
+            return
+        super().stop()
+
+    def end_station(self):
+        # The playback loop is about to unwind, release the control socket.
+        self.close()
+        super().end_station()
+
+    def close(self):
+        """Shut down the remote control connection and free its socket"""
+        self._close_socket()
+
+    def __del__(self):
+        # Never raise from a destructor; the process may be tearing down.
+        try:
+            self.close()
+            super().__del__()
+        except Exception:
+            pass

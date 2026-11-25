@@ -18,6 +18,7 @@ from .audio_backend import (
     MPG123Player,
     PlayerUnusable,
     RemoteVLC,
+    RemoteVLCConnectionError,
     UnsupportedEncoding,
     VLCPlayer,
 )
@@ -296,7 +297,7 @@ class PlayerApp:
 
             try:
                 self.player.play_station(station)
-            except UnsupportedEncoding as ex:
+            except (UnsupportedEncoding, RemoteVLCConnectionError) as ex:
                 error = str(ex)
             except KeyboardInterrupt:
                 self.player.stop()
