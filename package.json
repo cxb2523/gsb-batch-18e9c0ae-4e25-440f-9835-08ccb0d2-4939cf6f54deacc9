@@ -2,5 +2,10 @@
   "name": "sleek-hub",
   "version": "0.1.0",
   "type": "module",
-  "main": "./src/index.ts"
+  "main": "./src/index.ts",
+  "scripts": {
+    "demo": "node examples/demo.ts",
+    "test": "node examples/demo.ts",
+    "basic": "node examples/basic.ts"
+  }
 }

@@ -1,4 +1,4 @@
 // build 56c6e301ce
 // (auto) 3d7379
-import { greet } from '../src';
+import { greet } from '../src/index.ts';
 console.log(greet('world'));
