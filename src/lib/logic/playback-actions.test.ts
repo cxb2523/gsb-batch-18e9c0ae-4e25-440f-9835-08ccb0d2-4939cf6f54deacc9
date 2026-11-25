@@ -1,0 +1,1793 @@
+/**
+ * Tests for playback actions: handleTrackRemoved auto-advance behavior,
+ * advance flow after failures, and play-count mirroring from the backend's
+ * level-triggered completion_seq.
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  createMockTrack,
+  createMockTracks,
+  createMockPlaylist,
+  createMockPlayerState,
+} from '$lib/test-helpers';
+
+const mockInvoke = vi.fn();
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: (...args: unknown[]) => mockInvoke(...args),
+}));
+
+import {
+  handleTrackRemoved,
+  handleTracksRemovedBatch,
+  removeUpcomingFromQueue,
+  reorderQueue,
+  autoAdvance,
+  startPlayingTrack,
+  handleGaplessTransition,
+  handleNext,
+  handlePrev,
+  toggleShuffle,
+  cycleRepeat,
+  applyPlayerStateEvent,
+  resetCompletionTracking,
+} from '$lib/logic/playback-actions';
+import type { PlayerState } from '$lib/types';
+import { getPlayerState } from '$lib/state/playerState.svelte';
+import { getPlaylistState } from '$lib/state/playlistState.svelte';
+import { getLibraryState } from '$lib/state/libraryState.svelte';
+import { getErrorState } from '$lib/state/errorState.svelte';
+
+function resetPlayerState() {
+  const player = getPlayerState();
+  player.playQueue = [];
+  player.currentIndex = -1;
+  player.currentTrack = null;
+  player.isPlaying = false;
+  player.positionSecs = 0;
+  player.durationSecs = 0;
+  player.repeatMode = 'off';
+  player.shuffleEnabled = false;
+  player.shuffledIndices = [];
+}
+
+function resetPlaylistState() {
+  const playlistState = getPlaylistState();
+  playlistState.playlists = [];
+}
+
+function pollEvent(overrides: Partial<PlayerState> = {}): PlayerState {
+  return createMockPlayerState(overrides);
+}
+
+describe('handleTrackRemoved — auto-advance', () => {
+  const player = getPlayerState();
+  const playlistState = getPlaylistState();
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    resetPlayerState();
+    resetPlaylistState();
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+    resetPlaylistState();
+  });
+
+  it('auto-plays the next track when removing the currently playing mid-queue track', async () => {
+    const tracks = createMockTracks(3);
+    player.playQueue = tracks;
+    player.currentIndex = 1;
+    player.currentTrack = tracks[1]; // Song 2
+    player.isPlaying = true;
+
+    await handleTrackRemoved(tracks[1].id);
+
+    // Should call stop, then play_track for Song 3
+    expect(mockInvoke).toHaveBeenCalledWith('stop');
+    expect(mockInvoke).toHaveBeenCalledWith('play_track', {
+      path: tracks[2].file_path,
+      trackId: tracks[2].id,
+      durationSecs: tracks[2].duration_secs,
+    });
+    expect(player.currentTrack?.id).toBe(tracks[2].id);
+    expect(player.isPlaying).toBe(true);
+    expect(player.playQueue).toHaveLength(2);
+  });
+
+  it('auto-plays the next track when removing the first track while playing', async () => {
+    const tracks = createMockTracks(3);
+    player.playQueue = tracks;
+    player.currentIndex = 0;
+    player.currentTrack = tracks[0]; // Song 1
+    player.isPlaying = true;
+
+    await handleTrackRemoved(tracks[0].id);
+
+    // Song 2 (originally at index 1, now at index 0) should play
+    expect(mockInvoke).toHaveBeenCalledWith('play_track', {
+      path: tracks[1].file_path,
+      trackId: tracks[1].id,
+      durationSecs: tracks[1].duration_secs,
+    });
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+    expect(player.isPlaying).toBe(true);
+  });
+
+  it('stops playback when removing the last track with repeat off', async () => {
+    const tracks = createMockTracks(3);
+    player.playQueue = tracks;
+    player.currentIndex = 2;
+    player.currentTrack = tracks[2]; // Song 3 (last)
+    player.isPlaying = true;
+    player.repeatMode = 'off';
+
+    await handleTrackRemoved(tracks[2].id);
+
+    expect(player.isPlaying).toBe(false);
+    expect(player.currentTrack).toBeNull();
+    expect(player.currentIndex).toBe(-1);
+    expect(player.playQueue).toHaveLength(2);
+  });
+
+  it('wraps to the first track when removing the last track with repeat-all', async () => {
+    const tracks = createMockTracks(3);
+    player.playQueue = tracks;
+    player.currentIndex = 2;
+    player.currentTrack = tracks[2]; // Song 3 (last)
+    player.isPlaying = true;
+    player.repeatMode = 'repeat-all';
+
+    await handleTrackRemoved(tracks[2].id);
+
+    // Should wrap to Song 1 (index 0)
+    expect(mockInvoke).toHaveBeenCalledWith('play_track', {
+      path: tracks[0].file_path,
+      trackId: tracks[0].id,
+      durationSecs: tracks[0].duration_secs,
+    });
+    expect(player.currentTrack?.id).toBe(tracks[0].id);
+    expect(player.isPlaying).toBe(true);
+  });
+
+  it('stops playback when removing the only track in queue', async () => {
+    const track = createMockTrack({ id: 1 });
+    player.playQueue = [track];
+    player.currentIndex = 0;
+    player.currentTrack = track;
+    player.isPlaying = true;
+
+    await handleTrackRemoved(track.id);
+
+    expect(player.isPlaying).toBe(false);
+    expect(player.currentTrack).toBeNull();
+    expect(player.playQueue).toHaveLength(0);
+    expect(player.currentIndex).toBe(-1);
+  });
+
+  it('adjusts currentIndex when removing a non-playing track before current', async () => {
+    const tracks = createMockTracks(3);
+    player.playQueue = tracks;
+    player.currentIndex = 1;
+    player.currentTrack = tracks[1]; // Song 2
+    player.isPlaying = true;
+
+    await handleTrackRemoved(tracks[0].id); // Remove Song 1
+
+    expect(player.isPlaying).toBe(true);
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+    expect(player.currentIndex).toBe(0); // Adjusted from 1 to 0
+    expect(player.playQueue).toHaveLength(2);
+    // play_track should NOT be called (only stop is not called either)
+    expect(mockInvoke).not.toHaveBeenCalledWith('play_track', expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith('stop');
+  });
+
+  it('does not change index when removing a non-playing track after current', async () => {
+    const tracks = createMockTracks(3);
+    player.playQueue = tracks;
+    player.currentIndex = 0;
+    player.currentTrack = tracks[0]; // Song 1
+    player.isPlaying = true;
+
+    await handleTrackRemoved(tracks[2].id); // Remove Song 3
+
+    expect(player.isPlaying).toBe(true);
+    expect(player.currentTrack?.id).toBe(tracks[0].id);
+    expect(player.currentIndex).toBe(0); // Unchanged
+    expect(player.playQueue).toHaveLength(2);
+    expect(mockInvoke).not.toHaveBeenCalledWith('stop');
+  });
+
+  it('advances to next track instead of repeating when in repeat-one mode', async () => {
+    const tracks = createMockTracks(3);
+    player.playQueue = tracks;
+    player.currentIndex = 1;
+    player.currentTrack = tracks[1]; // Song 2
+    player.isPlaying = true;
+    player.repeatMode = 'repeat-one';
+
+    await handleTrackRemoved(tracks[1].id);
+
+    // Should play Song 3, NOT try to repeat Song 2 (which is deleted)
+    expect(mockInvoke).toHaveBeenCalledWith('play_track', {
+      path: tracks[2].file_path,
+      trackId: tracks[2].id,
+      durationSecs: tracks[2].duration_secs,
+    });
+    expect(player.currentTrack?.id).toBe(tracks[2].id);
+    expect(player.isPlaying).toBe(true);
+  });
+
+  it('removes track from all playlists', async () => {
+    const tracks = createMockTracks(3);
+    player.playQueue = tracks;
+    player.currentIndex = 0;
+    player.currentTrack = tracks[0];
+    player.isPlaying = false;
+
+    playlistState.playlists = [
+      createMockPlaylist({ id: 1, name: 'PL1', track_ids: [1, 2, 3] }),
+      createMockPlaylist({ id: 2, name: 'PL2', track_ids: [2, 3] }),
+    ];
+
+    await handleTrackRemoved(2); // Remove track with id=2
+
+    expect(playlistState.playlists[0].track_ids).toEqual([1, 3]);
+    expect(playlistState.playlists[1].track_ids).toEqual([3]);
+  });
+});
+
+describe('handleTracksRemovedBatch', () => {
+  const player = getPlayerState();
+  const playlistState = getPlaylistState();
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    resetPlayerState();
+    resetPlaylistState();
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+    resetPlaylistState();
+  });
+
+  it('batch removes multiple non-playing tracks and adjusts playQueue', async () => {
+    const tracks = createMockTracks(5);
+    player.playQueue = [...tracks];
+    player.currentIndex = 2;
+    player.currentTrack = tracks[2]; // Song 3
+    player.isPlaying = true;
+
+    // Remove Song 1 and Song 5 (not currently playing)
+    await handleTracksRemovedBatch(new Set([1, 5]));
+
+    expect(player.playQueue).toHaveLength(3);
+    expect(player.playQueue.map((t) => t.id)).toEqual([2, 3, 4]);
+    // currentIndex should shift from 2 to 1 (Song 1 before it was removed)
+    expect(player.currentIndex).toBe(1);
+    expect(player.isPlaying).toBe(true);
+    expect(mockInvoke).not.toHaveBeenCalledWith('stop');
+  });
+
+  it('auto-advances when currently playing track is removed', async () => {
+    const tracks = createMockTracks(4);
+    player.playQueue = [...tracks];
+    player.currentIndex = 1;
+    player.currentTrack = tracks[1]; // Song 2
+    player.isPlaying = true;
+
+    await handleTracksRemovedBatch(new Set([2]));
+
+    expect(mockInvoke).toHaveBeenCalledWith('stop');
+    expect(mockInvoke).toHaveBeenCalledWith('play_track', {
+      path: tracks[2].file_path,
+      trackId: tracks[2].id,
+      durationSecs: tracks[2].duration_secs,
+    });
+    expect(player.currentTrack?.id).toBe(tracks[2].id);
+    expect(player.isPlaying).toBe(true);
+    expect(player.playQueue).toHaveLength(3);
+  });
+
+  it('skips consecutive removed tracks to find survivor', async () => {
+    const tracks = createMockTracks(5);
+    player.playQueue = [...tracks];
+    player.currentIndex = 1;
+    player.currentTrack = tracks[1]; // Song 2
+    player.isPlaying = true;
+
+    // Remove Song 2 (playing) and Song 3 (next) → should jump to Song 4
+    await handleTracksRemovedBatch(new Set([2, 3]));
+
+    expect(mockInvoke).toHaveBeenCalledWith('stop');
+    expect(mockInvoke).toHaveBeenCalledWith('play_track', {
+      path: tracks[3].file_path,
+      trackId: tracks[3].id,
+      durationSecs: tracks[3].duration_secs,
+    });
+    expect(player.currentTrack?.id).toBe(tracks[3].id);
+    expect(player.playQueue).toHaveLength(3);
+  });
+
+  it('stops when all tracks are removed', async () => {
+    const tracks = createMockTracks(3);
+    player.playQueue = [...tracks];
+    player.currentIndex = 0;
+    player.currentTrack = tracks[0];
+    player.isPlaying = true;
+
+    await handleTracksRemovedBatch(new Set([1, 2, 3]));
+
+    expect(player.isPlaying).toBe(false);
+    expect(player.currentTrack).toBeNull();
+    expect(player.currentIndex).toBe(-1);
+    expect(player.playQueue).toHaveLength(0);
+  });
+
+  it('cleans up playlists for all removed tracks', async () => {
+    const tracks = createMockTracks(4);
+    player.playQueue = [...tracks];
+    player.currentIndex = 0;
+    player.currentTrack = tracks[0];
+    player.isPlaying = false;
+
+    playlistState.playlists = [
+      createMockPlaylist({ id: 1, name: 'PL1', track_ids: [1, 2, 3, 4] }),
+      createMockPlaylist({ id: 2, name: 'PL2', track_ids: [2, 4] }),
+    ];
+
+    await handleTracksRemovedBatch(new Set([2, 4]));
+
+    expect(playlistState.playlists[0].track_ids).toEqual([1, 3]);
+    expect(playlistState.playlists[1].track_ids).toEqual([]);
+  });
+
+  it('updates shuffledIndices — filter + remap', async () => {
+    const tracks = createMockTracks(5);
+    player.playQueue = [...tracks];
+    player.currentIndex = 0;
+    player.currentTrack = tracks[0];
+    player.isPlaying = false;
+    player.shuffleEnabled = true;
+    player.shuffledIndices = [0, 3, 1, 4, 2]; // shuffle order
+
+    // Remove tracks at queue indices 1 and 3 (Song 2 and Song 4)
+    await handleTracksRemovedBatch(new Set([2, 4]));
+
+    // Original: [0, 3, 1, 4, 2]
+    // After filtering indices 1 and 3: [0, 4, 2]
+    // After remapping (index 1 removed: 0→0, 4→2, 2→1): [0, 2, 1]
+    expect(player.shuffledIndices).toEqual([0, 2, 1]);
+    expect(player.playQueue).toHaveLength(3);
+  });
+
+  it('handles tracks not in queue by only cleaning playlists', async () => {
+    const tracks = createMockTracks(2);
+    player.playQueue = [...tracks];
+    player.currentIndex = 0;
+    player.currentTrack = tracks[0];
+    player.isPlaying = false;
+
+    playlistState.playlists = [createMockPlaylist({ id: 1, name: 'PL1', track_ids: [1, 2, 99] })];
+
+    // Track 99 is not in queue
+    await handleTracksRemovedBatch(new Set([99]));
+
+    expect(player.playQueue).toHaveLength(2);
+    expect(playlistState.playlists[0].track_ids).toEqual([1, 2]);
+  });
+
+  it('adjusts currentIndex correctly when non-playing tracks before current are removed', async () => {
+    const tracks = createMockTracks(5);
+    player.playQueue = [...tracks];
+    player.currentIndex = 3; // Song 4
+    player.currentTrack = tracks[3];
+    player.isPlaying = true;
+
+    // Remove Song 1 and Song 2 (both before current)
+    await handleTracksRemovedBatch(new Set([1, 2]));
+
+    expect(player.playQueue).toHaveLength(3);
+    expect(player.playQueue.map((t) => t.id)).toEqual([3, 4, 5]);
+    expect(player.currentIndex).toBe(1); // adjusted from 3 to 1
+    expect(player.isPlaying).toBe(true);
+    expect(mockInvoke).not.toHaveBeenCalledWith('stop');
+  });
+});
+
+describe('autoAdvance — advance flow', () => {
+  const player = getPlayerState();
+  const library = getLibraryState();
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    resetPlayerState();
+    resetPlaylistState();
+    library.allTracks = [];
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+    resetPlaylistState();
+    library.allTracks = [];
+  });
+
+  /** Make every play_track call fail (e.g. files on an unmounted USB drive). */
+  function failPlayTrack() {
+    mockInvoke.mockImplementation((...args: unknown[]) =>
+      args[0] === 'play_track'
+        ? Promise.reject(new Error('Audio error: missing file'))
+        : Promise.resolve(undefined),
+    );
+  }
+
+  it('advances to the next track when the current one finishes', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+
+    await autoAdvance();
+
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+    // Crediting the finished track is the backend's job now — the frontend
+    // must not write play counts over IPC anymore
+    expect(mockInvoke).not.toHaveBeenCalledWith('increment_play_count', expect.anything());
+  });
+
+  it('continues advancing past a track that fails to load', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[0], tracks);
+
+    failPlayTrack();
+    // track 0 finishes, track 1 fails to start
+    await autoAdvance();
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+
+    mockInvoke.mockResolvedValue(undefined);
+    // file is reachable again (e.g. USB remounted): track 2 starts normally
+    await autoAdvance();
+    expect(player.currentTrack?.id).toBe(tracks[2].id);
+    expect(player.isPlaying).toBe(true);
+  });
+
+  it('repeat-one replays the same track on natural end', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+    player.repeatMode = 'repeat-one';
+
+    await autoAdvance();
+    await autoAdvance();
+
+    expect(player.currentTrack?.id).toBe(tracks[0].id);
+  });
+
+  it('stays stopped when an explicitly picked track fails to load', async () => {
+    const tracks = createMockTracks(2);
+    failPlayTrack();
+
+    await startPlayingTrack(tracks[0], tracks);
+
+    // The track is selected and shown in the player bar, but playback
+    // honestly reflects the failure instead of pretending to play
+    expect(player.currentTrack?.id).toBe(tracks[0].id);
+    expect(player.isPlaying).toBe(false);
+  });
+});
+
+describe('play count mirroring — completion_seq', () => {
+  const player = getPlayerState();
+  const library = getLibraryState();
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    resetPlayerState();
+    resetPlaylistState();
+    resetCompletionTracking();
+    library.allTracks = [];
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+    resetPlaylistState();
+    library.allTracks = [];
+  });
+
+  it('baselines on the first poll without crediting', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+    library.allTracks = [...tracks];
+
+    // The first event after a page (re)load can carry a non-zero sequence:
+    // its completions were already credited in the DB before this load.
+    applyPlayerStateEvent(
+      pollEvent({
+        is_playing: true,
+        current_track_id: tracks[0].id,
+        completion_seq: 5,
+        last_completed_track_id: tracks[1].id,
+      }),
+    );
+
+    expect(player.playQueue[1].play_count).toBe(0);
+    expect(library.allTracks[1].play_count).toBe(0);
+  });
+
+  it('mirrors a backend-credited completion into playQueue and library', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+    library.allTracks = [...tracks];
+
+    applyPlayerStateEvent(pollEvent({ is_playing: true, current_track_id: tracks[0].id }));
+    // Backend detected the gapless switch and already wrote the DB row
+    applyPlayerStateEvent(
+      pollEvent({
+        is_playing: true,
+        current_track_id: tracks[1].id,
+        gapless_transitioned: true,
+        completion_seq: 1,
+        last_completed_track_id: tracks[0].id,
+      }),
+    );
+
+    expect(player.playQueue[0].play_count).toBe(1);
+    expect(library.allTracks[0].play_count).toBe(1);
+    // No frontend IPC write — the backend polling thread owns the DB update
+    expect(mockInvoke).not.toHaveBeenCalledWith('increment_play_count', expect.anything());
+  });
+
+  it('does not credit again when polls repeat the same sequence', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+    library.allTracks = [...tracks];
+
+    applyPlayerStateEvent(pollEvent({ is_playing: true, current_track_id: tracks[0].id }));
+    const completed = {
+      is_playing: true,
+      current_track_id: tracks[1].id,
+      completion_seq: 1,
+      last_completed_track_id: tracks[0].id,
+    };
+    // Level-triggered fields repeat in every 250ms poll after the completion
+    applyPlayerStateEvent(pollEvent(completed));
+    applyPlayerStateEvent(pollEvent(completed));
+    applyPlayerStateEvent(pollEvent(completed));
+
+    expect(player.playQueue[0].play_count).toBe(1);
+    expect(library.allTracks[0].play_count).toBe(1);
+  });
+
+  it('credits every repeat-one loop — same track id, advancing sequence', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+    player.repeatMode = 'repeat-one';
+    library.allTracks = [...tracks];
+
+    applyPlayerStateEvent(pollEvent({ is_playing: true, current_track_id: tracks[0].id }));
+    // Two loop completions: the track id never changes, only the sequence —
+    // exactly the case the old one-shot events could silently drop
+    applyPlayerStateEvent(
+      pollEvent({
+        is_playing: true,
+        current_track_id: tracks[0].id,
+        gapless_transitioned: true,
+        completion_seq: 1,
+        last_completed_track_id: tracks[0].id,
+      }),
+    );
+    applyPlayerStateEvent(
+      pollEvent({
+        is_playing: true,
+        current_track_id: tracks[0].id,
+        gapless_transitioned: true,
+        completion_seq: 2,
+        last_completed_track_id: tracks[0].id,
+      }),
+    );
+
+    expect(player.playQueue[0].play_count).toBe(2);
+    expect(library.allTracks[0].play_count).toBe(2);
+  });
+
+  it('credits even while a manual track change is in flight', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[0], tracks);
+    library.allTracks = [...tracks];
+    applyPlayerStateEvent(pollEvent({ is_playing: true, current_track_id: tracks[0].id }));
+    mockInvoke.mockClear();
+
+    let resolvePlay!: (value?: unknown) => void;
+    mockInvoke.mockImplementation((...args: unknown[]) =>
+      args[0] === 'play_track'
+        ? new Promise((res) => {
+            resolvePlay = res;
+          })
+        : Promise.resolve(undefined),
+    );
+    const nextInFlight = handleNext();
+
+    // The in-flight guards drop the one-shot transition handling, but the
+    // sequence comparison runs unguarded — the count can no longer be lost
+    applyPlayerStateEvent(
+      pollEvent({
+        is_playing: true,
+        current_track_id: tracks[0].id,
+        gapless_transitioned: true,
+        completion_seq: 1,
+        last_completed_track_id: tracks[0].id,
+      }),
+    );
+    expect(player.playQueue[0].play_count).toBe(1);
+    expect(library.allTracks[0].play_count).toBe(1);
+
+    resolvePlay();
+    await nextInFlight;
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+  });
+
+  it('ignores a completion for a track absent from queue and library', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+    library.allTracks = [...tracks];
+
+    applyPlayerStateEvent(pollEvent({ is_playing: true, current_track_id: tracks[0].id }));
+    applyPlayerStateEvent(
+      pollEvent({
+        is_playing: true,
+        current_track_id: tracks[0].id,
+        completion_seq: 1,
+        last_completed_track_id: 999,
+      }),
+    );
+
+    expect(player.playQueue.every((t) => t.play_count === 0)).toBe(true);
+    expect(library.allTracks.every((t) => t.play_count === 0)).toBe(true);
+  });
+});
+
+describe('handleTracksRemovedBatch — concurrent queue', () => {
+  const player = getPlayerState();
+  const playlistState = getPlaylistState();
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    resetPlayerState();
+    resetPlaylistState();
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+    resetPlaylistState();
+  });
+
+  it('queues concurrent call and processes both', async () => {
+    const tracks = createMockTracks(4);
+    player.playQueue = [...tracks];
+    player.currentIndex = 0;
+    player.currentTrack = tracks[0];
+    player.isPlaying = false;
+
+    playlistState.playlists = [createMockPlaylist({ id: 1, name: 'PL1', track_ids: [1, 2, 3, 4] })];
+
+    // Fire two concurrent batch calls — second should be queued
+    const p1 = handleTracksRemovedBatch(new Set([2]));
+    const p2 = handleTracksRemovedBatch(new Set([3]));
+    await Promise.all([p1, p2]);
+
+    // Both track 2 and 3 should be removed
+    expect(player.playQueue.map((t) => t.id)).toEqual([1, 4]);
+    expect(playlistState.playlists[0].track_ids).toEqual([1, 4]);
+  });
+
+  it('merges multiple queued calls', async () => {
+    const tracks = createMockTracks(5);
+    player.playQueue = [...tracks];
+    player.currentIndex = 0;
+    player.currentTrack = tracks[0];
+    player.isPlaying = false;
+
+    playlistState.playlists = [
+      createMockPlaylist({ id: 1, name: 'PL1', track_ids: [1, 2, 3, 4, 5] }),
+    ];
+
+    // Fire three concurrent batch calls — second and third should be merged
+    const p1 = handleTracksRemovedBatch(new Set([2]));
+    const p2 = handleTracksRemovedBatch(new Set([3]));
+    const p3 = handleTracksRemovedBatch(new Set([4]));
+    await Promise.all([p1, p2, p3]);
+
+    // Only track 1 and 5 should remain
+    expect(player.playQueue.map((t) => t.id)).toEqual([1, 5]);
+    expect(playlistState.playlists[0].track_ids).toEqual([1, 5]);
+  });
+});
+
+describe('manual track change vs backend poll events — race protection', () => {
+  const player = getPlayerState();
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    resetPlayerState();
+    resetPlaylistState();
+    resetCompletionTracking();
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+    resetPlaylistState();
+  });
+
+  it('ignores a gapless event that arrives while a manual next is in flight', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+
+    // Make play_track hang so the manual next stays in flight
+    let resolvePlay!: (value?: unknown) => void;
+    mockInvoke.mockImplementation((...args: unknown[]) =>
+      args[0] === 'play_track'
+        ? new Promise((res) => {
+            resolvePlay = res;
+          })
+        : Promise.resolve(undefined),
+    );
+
+    const nextInFlight = handleNext(); // manual switch to track 1
+
+    // Backend poll reports the natural gapless switch to track 1 mid-flight.
+    // Without the in-flight guard the handler would run against the
+    // half-updated state and re-queue the next track on top of the pending
+    // load, reloading the track the user just picked.
+    await handleGaplessTransition(tracks[1].id);
+
+    expect(mockInvoke).not.toHaveBeenCalledWith('queue_next_track', expect.anything());
+
+    resolvePlay();
+    await nextInFlight;
+
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+    const playCalls = mockInvoke.mock.calls.filter(([cmd]) => cmd === 'play_track');
+    expect(playCalls).toHaveLength(1);
+  });
+
+  it('a second manual next preempts the first instead of being dropped', async () => {
+    const tracks = createMockTracks(4);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+
+    const playResolvers: Array<(value?: unknown) => void> = [];
+    mockInvoke.mockImplementation((...args: unknown[]) =>
+      args[0] === 'play_track'
+        ? new Promise((res) => {
+            playResolvers.push(res);
+          })
+        : Promise.resolve(undefined),
+    );
+
+    const firstNext = handleNext(); // -> track 1, in flight
+    const secondNext = handleNext(); // user double-clicks -> track 2
+
+    // The newer load finishes first; the stale one resolves last
+    playResolvers[1]?.(undefined);
+    playResolvers[0]?.(undefined);
+    await Promise.all([firstNext, secondNext]);
+
+    // Latest user intent wins, and the stale change must not run its
+    // post-load effects (it would re-queue on top of the newer track)
+    expect(player.currentTrack?.id).toBe(tracks[2].id);
+    expect(player.currentIndex).toBe(2);
+    const playCalls = mockInvoke.mock.calls.filter(([cmd]) => cmd === 'play_track');
+    expect(playCalls).toHaveLength(2);
+    const queueCalls = mockInvoke.mock.calls.filter(([cmd]) => cmd === 'queue_next_track');
+    expect(queueCalls).toHaveLength(1);
+  });
+
+  it('a user click during an in-flight auto-advance wins instead of being dropped', async () => {
+    const tracks = createMockTracks(4);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+
+    const playResolvers: Array<(value?: unknown) => void> = [];
+    mockInvoke.mockImplementation((...args: unknown[]) =>
+      args[0] === 'play_track'
+        ? new Promise((res) => {
+            playResolvers.push(res);
+          })
+        : Promise.resolve(undefined),
+    );
+
+    // Track 0 finishes; auto-advance to track 1 hangs on a slow load
+    const advance = autoAdvance();
+    // User explicitly picks track 3 while the advance is still in flight
+    const click = startPlayingTrack(tracks[3], tracks);
+
+    playResolvers[0]?.(undefined);
+    playResolvers[1]?.(undefined);
+    await Promise.all([advance, click]);
+
+    // The user's pick is never silently dropped, and the superseded
+    // auto-advance must not clobber it when its load resolves
+    expect(player.currentTrack?.id).toBe(tracks[3].id);
+    expect(player.currentIndex).toBe(3);
+  });
+
+  it('ignores track_ended describing a different track than the current one', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[1], tracks);
+    mockInvoke.mockClear();
+
+    // Stale event snapshotted before a manual track change: it describes
+    // track 0, but the UI is already on track 1.
+    applyPlayerStateEvent(
+      pollEvent({ track_ended: true, current_track_id: tracks[0].id, position_secs: 200 }),
+    );
+
+    expect(mockInvoke).not.toHaveBeenCalledWith('play_track', expect.anything());
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+  });
+
+  it('advances on track_ended when the event matches the current track', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+
+    applyPlayerStateEvent(pollEvent({ track_ended: true, current_track_id: tracks[0].id }));
+
+    await vi.waitFor(() => {
+      expect(player.currentTrack?.id).toBe(tracks[1].id);
+    });
+  });
+
+  it('does not advance on track_ended when nothing is playing', () => {
+    applyPlayerStateEvent(pollEvent({ track_ended: true, current_track_id: 7 }));
+
+    expect(mockInvoke).not.toHaveBeenCalledWith('play_track', expect.anything());
+    expect(player.currentTrack).toBeNull();
+  });
+
+  it('reconciles a dropped gapless transition from a later steady-state poll', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[0], tracks);
+    applyPlayerStateEvent(pollEvent({ is_playing: true, current_track_id: tracks[0].id }));
+    mockInvoke.mockClear();
+
+    // The one-shot gapless_transitioned event was dropped by an in-flight
+    // guard; a later poll just shows the backend already playing track 1,
+    // with the completion still visible in the level-triggered sequence.
+    applyPlayerStateEvent(
+      pollEvent({
+        is_playing: true,
+        current_track_id: tracks[1].id,
+        completion_seq: 1,
+        last_completed_track_id: tracks[0].id,
+      }),
+    );
+
+    await vi.waitFor(() => {
+      expect(player.currentTrack?.id).toBe(tracks[1].id);
+    });
+    // The finished track is still credited exactly once — mirrored from seq
+    expect(player.playQueue[0].play_count).toBe(1);
+    expect(player.currentIndex).toBe(1);
+  });
+
+  it('does not reconcile while a manual change is in flight', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+
+    let resolvePlay!: (value?: unknown) => void;
+    mockInvoke.mockImplementation((...args: unknown[]) =>
+      args[0] === 'play_track'
+        ? new Promise((res) => {
+            resolvePlay = res;
+          })
+        : Promise.resolve(undefined),
+    );
+
+    const nextInFlight = handleNext(); // manual switch to track 1, in flight
+
+    // Poll snapshotted before the manual play_track landed: backend still
+    // reports track 0 playing while the UI optimistically shows track 1.
+    // Reconciling here would "transition back" to the old track.
+    applyPlayerStateEvent(pollEvent({ is_playing: true, current_track_id: tracks[0].id }));
+    await Promise.resolve();
+
+    resolvePlay();
+    await nextInFlight;
+
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+    expect(player.currentIndex).toBe(1);
+  });
+
+  it('does not reconcile when backend and UI agree on the current track', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+
+    applyPlayerStateEvent(
+      pollEvent({ is_playing: true, current_track_id: tracks[0].id, position_secs: 42 }),
+    );
+    await Promise.resolve();
+
+    expect(player.currentTrack?.id).toBe(tracks[0].id);
+    // A transition would reset the position and re-queue the next track
+    expect(player.positionSecs).toBe(42);
+    expect(mockInvoke).not.toHaveBeenCalledWith('queue_next_track', expect.anything());
+  });
+
+  it('does not reconcile into a track missing from the queue', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+
+    // The backend gapless-transitioned into a track the user has since
+    // removed from the frontend queue. Polls keep reporting it every 250ms;
+    // reconciliation is impossible there and must not fire at all.
+    applyPlayerStateEvent(pollEvent({ is_playing: true, current_track_id: 999 }));
+    await Promise.resolve();
+    applyPlayerStateEvent(pollEvent({ is_playing: true, current_track_id: 999 }));
+    await Promise.resolve();
+
+    expect(mockInvoke).not.toHaveBeenCalledWith('queue_next_track', expect.anything());
+    expect(player.currentTrack?.id).toBe(tracks[0].id);
+  });
+
+  it('does not reconcile when the backend is not playing', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+
+    // Stale not-playing snapshot mentioning another track must not advance
+    applyPlayerStateEvent(pollEvent({ is_playing: false, current_track_id: tracks[1].id }));
+    await Promise.resolve();
+
+    expect(player.currentTrack?.id).toBe(tracks[0].id);
+  });
+
+  it('applies playback state fields from the event', () => {
+    applyPlayerStateEvent(
+      pollEvent({ is_playing: true, position_secs: 12.5, duration_secs: 300, volume: 0.7 }),
+    );
+
+    expect(player.isPlaying).toBe(true);
+    expect(player.positionSecs).toBe(12.5);
+    expect(player.durationSecs).toBe(300);
+    expect(player.volume).toBe(0.7);
+  });
+
+  it('keeps the known duration when the event reports 0', async () => {
+    const tracks = createMockTracks(1);
+    await startPlayingTrack(tracks[0], tracks);
+    player.durationSecs = 240;
+
+    applyPlayerStateEvent(pollEvent({ is_playing: true, duration_secs: 0 }));
+
+    expect(player.durationSecs).toBe(240);
+  });
+
+  it('gapless transition lands on the queued duplicate, not the first matching id', async () => {
+    const tracks = createMockTracks(3); // ids 1, 2, 3
+    // The same track appears twice in the queue: ids [1, 2, 1, 3]
+    const queue = [tracks[0], tracks[1], { ...tracks[0] }, tracks[2]];
+    await startPlayingTrack(tracks[1], queue); // playing index 1
+    mockInvoke.mockClear();
+
+    // The backend transitioned into the queued next: the duplicate at index 2.
+    // Resolving the id with findIndex alone would land on index 0 and queue
+    // the wrong follow-up track.
+    await handleGaplessTransition(tracks[0].id);
+
+    expect(player.currentIndex).toBe(2);
+    expect(mockInvoke).toHaveBeenCalledWith('queue_next_track', {
+      path: tracks[2].file_path,
+      nextId: tracks[2].id,
+      durationSecs: tracks[2].duration_secs,
+    });
+  });
+});
+
+describe('startPlayingTrack — shuffle order follows the new queue', () => {
+  const player = getPlayerState();
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    resetPlayerState();
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+  });
+
+  /** A permutation of 0..n-1 with `first` at index 0. */
+  function expectShuffleOrder(first: number, length: number) {
+    expect(player.shuffledIndices).toHaveLength(length);
+    expect([...player.shuffledIndices].sort((a, b) => a - b)).toEqual(
+      Array.from({ length }, (_, i) => i),
+    );
+    expect(player.shuffledIndices[0]).toBe(first);
+  }
+
+  it('regenerates when shuffle was enabled before anything was playing', async () => {
+    toggleShuffle();
+    expect(player.shuffledIndices).toEqual([]);
+
+    const tracks = createMockTracks(8);
+    await startPlayingTrack(tracks[3], tracks);
+
+    expectShuffleOrder(3, 8);
+  });
+
+  it('regenerates when a queue of a different length replaces the current one', async () => {
+    const first = createMockTracks(8);
+    await startPlayingTrack(first[0], first);
+    toggleShuffle();
+
+    const second = createMockTracks(5);
+    await startPlayingTrack(second[2], second);
+
+    expectShuffleOrder(2, 5);
+  });
+
+  it('regenerates for a same-length queue so the new track leads the order', async () => {
+    const first = createMockTracks(6);
+    await startPlayingTrack(first[0], first);
+    toggleShuffle();
+
+    const second = createMockTracks(6);
+    await startPlayingTrack(second[4], second);
+
+    expectShuffleOrder(4, 6);
+  });
+
+  it('leaves shuffledIndices untouched when shuffle is off', async () => {
+    const tracks = createMockTracks(4);
+    await startPlayingTrack(tracks[1], tracks);
+
+    expect(player.shuffleEnabled).toBe(false);
+    expect(player.shuffledIndices).toEqual([]);
+  });
+});
+
+/** Invoke calls for one backend command. */
+function callsOf(cmd: string) {
+  return mockInvoke.mock.calls.filter(([c]) => c === cmd);
+}
+
+/**
+ * Make one command hang until released, everything else resolves. Returns a
+ * release function that settles every pending call of that command.
+ */
+function holdCommand(cmd: string, value?: unknown): () => void {
+  const pending: Array<(v: unknown) => void> = [];
+  mockInvoke.mockImplementation((...args: unknown[]) =>
+    args[0] === cmd
+      ? new Promise((res) => {
+          pending.push(res);
+        })
+      : Promise.resolve(undefined),
+  );
+  return () => pending.splice(0).forEach((res) => res(value));
+}
+
+describe('handlePrev / handleNext — manual navigation', () => {
+  const player = getPlayerState();
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    resetPlayerState();
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+  });
+
+  it('handlePrev plays the previous track', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[2], tracks);
+    mockInvoke.mockClear();
+
+    await handlePrev();
+
+    expect(player.currentIndex).toBe(1);
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+    expect(mockInvoke).toHaveBeenCalledWith('play_track', {
+      path: tracks[1].file_path,
+      trackId: tracks[1].id,
+      durationSecs: tracks[1].duration_secs,
+    });
+  });
+
+  it('handlePrev does nothing at the first track with repeat off', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+
+    await handlePrev();
+
+    expect(player.currentTrack?.id).toBe(tracks[0].id);
+    expect(mockInvoke).not.toHaveBeenCalledWith('play_track', expect.anything());
+  });
+
+  it('handlePrev ignores a gapless event that arrives while it is in flight', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[2], tracks);
+    mockInvoke.mockClear();
+    const releasePlay = holdCommand('play_track');
+
+    const prevInFlight = handlePrev();
+    await handleGaplessTransition(tracks[0].id);
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+
+    releasePlay();
+    await prevInFlight;
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+  });
+
+  it.each([
+    ['handlePrev', handlePrev, 2],
+    ['handleNext', handleNext, 0],
+  ] as const)('%s releases the in-flight guard once done', async (_, navigate, startIdx) => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[startIdx], tracks);
+    await navigate(); // lands on index 1
+
+    // Dropped if the manual-change count leaked past the navigation
+    await autoAdvance();
+
+    expect(player.currentTrack?.id).toBe(tracks[2].id);
+  });
+});
+
+describe('cycleRepeat', () => {
+  afterEach(() => {
+    resetPlayerState();
+  });
+
+  it('cycles off → repeat-all → repeat-one → off', () => {
+    const player = getPlayerState();
+    const seen: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      cycleRepeat();
+      seen.push(player.repeatMode);
+    }
+    expect(seen).toEqual(['repeat-all', 'repeat-one', 'off']);
+  });
+});
+
+describe('toggleShuffle', () => {
+  const player = getPlayerState();
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    resetPlayerState();
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+  });
+
+  it('enabling shuffle builds an order led by the current track', async () => {
+    const tracks = createMockTracks(6);
+    await startPlayingTrack(tracks[3], tracks);
+
+    toggleShuffle();
+
+    expect(player.shuffleEnabled).toBe(true);
+    expect(player.shuffledIndices[0]).toBe(3);
+    expect([...player.shuffledIndices].sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+
+  it('re-queues the gapless next from the new shuffle order while playing', async () => {
+    const tracks = createMockTracks(4);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+
+    toggleShuffle();
+
+    const next = tracks[player.shuffledIndices[1]];
+    expect(callsOf('queue_next_track')).toEqual([
+      [
+        'queue_next_track',
+        { path: next.file_path, nextId: next.id, durationSecs: next.duration_secs },
+      ],
+    ]);
+  });
+
+  it('re-queues while paused too, so resuming does not play the stale next', async () => {
+    // The paused track still has its gapless next sitting in the backend
+    // queue; leaving it would play the pre-toggle track after resume.
+    const tracks = createMockTracks(4);
+    await startPlayingTrack(tracks[0], tracks);
+    player.isPlaying = false;
+    mockInvoke.mockClear();
+
+    toggleShuffle();
+
+    const next = tracks[player.shuffledIndices[1]];
+    expect(callsOf('queue_next_track')).toEqual([
+      [
+        'queue_next_track',
+        { path: next.file_path, nextId: next.id, durationSecs: next.duration_secs },
+      ],
+    ]);
+  });
+
+  it('does not queue anything when no track is loaded', () => {
+    player.playQueue = createMockTracks(4);
+    mockInvoke.mockClear();
+
+    toggleShuffle();
+
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+});
+
+describe('cover art loading', () => {
+  const player = getPlayerState();
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation((cmd: unknown, args?: unknown) =>
+      Promise.resolve(
+        cmd === 'get_track_cover' ? `cover-${(args as { id: number }).id}` : undefined,
+      ),
+    );
+    resetPlayerState();
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+  });
+
+  /** Hold the cover of one track id until released; other covers resolve at once. */
+  function holdCoverOf(trackId: number): (cover: string | null) => void {
+    let release!: (cover: string | null) => void;
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation((cmd: unknown, args?: unknown) =>
+      cmd === 'get_track_cover' && (args as { id: number }).id === trackId
+        ? new Promise((res) => {
+            release = res;
+          })
+        : base(cmd, args),
+    );
+    return (cover) => release(cover);
+  }
+
+  it('shows the cover of the track that started playing', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+
+    expect(player.currentTrack?.cover_art).toBe('cover-1');
+  });
+
+  it('drops a cover that arrives after the user switched tracks', async () => {
+    const tracks = createMockTracks(3);
+    const releaseCover1 = holdCoverOf(tracks[0].id);
+
+    const first = startPlayingTrack(tracks[0], tracks);
+    await vi.waitFor(() => expect(callsOf('get_track_cover')).toHaveLength(1));
+    await startPlayingTrack(tracks[2], tracks);
+    releaseCover1('cover-1');
+    await first;
+
+    expect(player.currentTrack?.id).toBe(tracks[2].id);
+    expect(player.currentTrack?.cover_art).toBe('cover-3');
+  });
+
+  it('shows the cover after a gapless transition', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+
+    await handleGaplessTransition(tracks[1].id);
+
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+    expect(player.currentTrack?.cover_art).toBe('cover-2');
+  });
+
+  it('drops a gapless cover that arrives after the user switched tracks', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[0], tracks);
+    const releaseCover2 = holdCoverOf(tracks[1].id);
+
+    const gapless = handleGaplessTransition(tracks[1].id);
+    await startPlayingTrack(tracks[2], tracks); // user actions are never dropped
+    releaseCover2('cover-2');
+    await gapless;
+
+    expect(player.currentTrack?.id).toBe(tracks[2].id);
+    expect(player.currentTrack?.cover_art).toBe('cover-3');
+  });
+});
+
+describe('play failure notification', () => {
+  const player = getPlayerState();
+  const errorState = getErrorState();
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    resetPlayerState();
+    errorState.errors = [];
+    // notifyCritical also logs; keep the test output clean
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+    vi.restoreAllMocks();
+  });
+
+  it('notifies when the picked track fails to start', async () => {
+    mockInvoke.mockImplementation((cmd: unknown) =>
+      cmd === 'play_track' ? Promise.reject(new Error('missing file')) : Promise.resolve(undefined),
+    );
+    const tracks = createMockTracks(2);
+
+    await startPlayingTrack(tracks[0], tracks);
+
+    // The user-visible notification is what matters, not the console log
+    expect(errorState.errors).toHaveLength(1);
+    expect(errorState.errors[0].level).toBe('error');
+    expect(errorState.errors[0].message).toContain('missing file');
+  });
+
+  it('stays silent when a superseded load fails late', async () => {
+    const tracks = createMockTracks(2);
+    let rejectFirst!: (err: Error) => void;
+    mockInvoke.mockImplementation((cmd: unknown, args?: unknown) =>
+      cmd === 'play_track' && (args as { trackId: number }).trackId === tracks[0].id
+        ? new Promise((_, rej) => {
+            rejectFirst = rej;
+          })
+        : Promise.resolve(undefined),
+    );
+
+    const first = startPlayingTrack(tracks[0], tracks);
+    await startPlayingTrack(tracks[1], tracks);
+    rejectFirst(new Error('slow device gave up'));
+    await first;
+
+    expect(errorState.errors).toEqual([]);
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+    expect(player.isPlaying).toBe(true);
+  });
+
+  it('does nothing when the picked track is not in the list', async () => {
+    const tracks = createMockTracks(2);
+
+    await startPlayingTrack(createMockTrack({ id: 99 }), tracks);
+
+    expect(mockInvoke).not.toHaveBeenCalledWith('play_track', expect.anything());
+  });
+});
+
+describe('advance guards', () => {
+  const player = getPlayerState();
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    resetPlayerState();
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+  });
+
+  it('drops a second auto-advance while one is in flight', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+    const releasePlay = holdCommand('play_track');
+
+    const first = autoAdvance();
+    await autoAdvance();
+    releasePlay();
+    await first;
+
+    expect(callsOf('play_track')).toHaveLength(1);
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+  });
+
+  it('drops an auto-advance while a manual change is in flight', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+    const releasePlay = holdCommand('play_track');
+
+    const next = handleNext();
+    await autoAdvance();
+    releasePlay();
+    await next;
+
+    expect(callsOf('play_track')).toHaveLength(1);
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+  });
+
+  it('drops an auto-advance while a gapless transition is still loading', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+    const releaseCover = holdCommand('get_track_cover', null);
+
+    const gapless = handleGaplessTransition(tracks[1].id);
+    await autoAdvance();
+    releaseCover();
+    await gapless;
+
+    expect(callsOf('play_track')).toHaveLength(0);
+    expect(player.currentTrack?.id).toBe(tracks[1].id);
+  });
+});
+
+describe('gapless transition and reconciliation — landing index', () => {
+  const player = getPlayerState();
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    resetPlayerState();
+    resetCompletionTracking();
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+  });
+
+  it('re-queues the same track after a repeat-one gapless loop', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+    player.repeatMode = 'repeat-one';
+    mockInvoke.mockClear();
+
+    applyPlayerStateEvent(
+      pollEvent({ is_playing: true, gapless_transitioned: true, current_track_id: tracks[0].id }),
+    );
+
+    await vi.waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith('queue_next_track', {
+        path: tracks[0].file_path,
+        nextId: tracks[0].id,
+        durationSecs: tracks[0].duration_secs,
+      }),
+    );
+    expect(player.currentIndex).toBe(0);
+  });
+
+  it('reconciles to the backend track even when it is not the expected next', async () => {
+    const tracks = createMockTracks(4);
+    await startPlayingTrack(tracks[0], tracks);
+
+    applyPlayerStateEvent(pollEvent({ is_playing: true, current_track_id: tracks[2].id }));
+    await Promise.resolve();
+
+    expect(player.currentIndex).toBe(2);
+    expect(player.currentTrack?.id).toBe(tracks[2].id);
+  });
+
+  it('reconciles from the last track, where no next track is expected', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[2], tracks);
+
+    applyPlayerStateEvent(pollEvent({ is_playing: true, current_track_id: tracks[0].id }));
+    await Promise.resolve();
+
+    expect(player.currentIndex).toBe(0);
+    expect(player.currentTrack?.id).toBe(tracks[0].id);
+  });
+
+  it('lands on index 0 when repeat-all wraps to the queue start', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[2], tracks);
+    player.repeatMode = 'repeat-all';
+
+    await handleGaplessTransition(tracks[0].id);
+
+    expect(player.currentIndex).toBe(0);
+    expect(player.currentTrack?.id).toBe(tracks[0].id);
+  });
+
+  it('ignores a transition into a track missing from the queue', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+
+    await handleGaplessTransition(999);
+
+    expect(player.currentIndex).toBe(0);
+    expect(player.currentTrack?.id).toBe(tracks[0].id);
+  });
+
+  it('does not reconcile or throw when nothing is current', () => {
+    // e.g. the playing track was removed and playback stopped, while the
+    // backend still reports it for a poll or two
+    const tracks = createMockTracks(2);
+    player.playQueue = tracks;
+    player.currentTrack = null;
+
+    expect(() =>
+      applyPlayerStateEvent(pollEvent({ is_playing: true, current_track_id: tracks[1].id })),
+    ).not.toThrow();
+    expect(player.currentTrack).toBeNull();
+  });
+});
+
+describe('handleTracksRemovedBatch — repeat modes', () => {
+  const player = getPlayerState();
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    resetPlayerState();
+    resetPlaylistState();
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+    resetPlaylistState();
+  });
+
+  function playing(tracks: ReturnType<typeof createMockTracks>, index: number) {
+    player.playQueue = tracks;
+    player.currentIndex = index;
+    player.currentTrack = tracks[index];
+    player.isPlaying = true;
+  }
+
+  it('repeat-one: skips a removed follow-up track to the next survivor', async () => {
+    const tracks = createMockTracks(4);
+    playing(tracks, 1);
+    player.repeatMode = 'repeat-one';
+
+    await handleTracksRemovedBatch(new Set([tracks[1].id, tracks[2].id]));
+
+    expect(player.currentTrack?.id).toBe(tracks[3].id);
+  });
+
+  it('repeat-one: removing the playing last track wraps to the first', async () => {
+    const tracks = createMockTracks(3);
+    playing(tracks, 2);
+    player.repeatMode = 'repeat-one';
+
+    await handleTrackRemoved(tracks[2].id);
+
+    expect(player.currentTrack?.id).toBe(tracks[0].id);
+  });
+
+  it('repeat off: removing the current track and everything after it stops', async () => {
+    const tracks = createMockTracks(4);
+    playing(tracks, 2);
+
+    await handleTracksRemovedBatch(new Set([tracks[2].id, tracks[3].id]));
+
+    expect(player.currentTrack).toBeNull();
+    expect(player.isPlaying).toBe(false);
+    expect(mockInvoke).not.toHaveBeenCalledWith('play_track', expect.anything());
+  });
+
+  it('repeat-one: removing the current track and everything after it wraps to the first', async () => {
+    const tracks = createMockTracks(4);
+    playing(tracks, 2);
+    player.repeatMode = 'repeat-one';
+
+    await handleTracksRemovedBatch(new Set([tracks[2].id, tracks[3].id]));
+
+    expect(player.currentTrack?.id).toBe(tracks[0].id);
+  });
+
+  it('repeat-all: removing every track stops instead of cycling forever', async () => {
+    const tracks = createMockTracks(3);
+    playing(tracks, 0);
+    player.repeatMode = 'repeat-all';
+
+    await handleTracksRemovedBatch(new Set(tracks.map((t) => t.id)));
+
+    expect(player.playQueue).toEqual([]);
+    expect(player.currentTrack).toBeNull();
+    expect(player.isPlaying).toBe(false);
+  });
+});
+
+describe('gapless next follows queue changes', () => {
+  const player = getPlayerState();
+
+  const queueArgs = (t: { file_path: string; id: number; duration_secs: number }) => [
+    'queue_next_track',
+    { path: t.file_path, nextId: t.id, durationSecs: t.duration_secs },
+  ];
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    resetPlayerState();
+    resetPlaylistState();
+  });
+
+  afterEach(() => {
+    resetPlayerState();
+    resetPlaylistState();
+  });
+
+  it('re-queues the new next when the upcoming track is removed', async () => {
+    // Regression: playing a of [a, b, c], removing b left b in the backend
+    // gapless queue, so b played anyway.
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+
+    await handleTrackRemoved(tracks[1].id);
+
+    expect(player.currentTrack?.id).toBe(tracks[0].id);
+    expect(callsOf('stop')).toEqual([]);
+    expect(callsOf('queue_next_track')).toEqual([queueArgs(tracks[2])]);
+  });
+
+  it('clears the queued next when the removed track was the last one', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[0], tracks);
+    mockInvoke.mockClear();
+
+    await handleTrackRemoved(tracks[1].id);
+
+    expect(callsOf('queue_next_track')).toEqual([]);
+    expect(callsOf('clear_queued_next_track')).toHaveLength(1);
+  });
+
+  it('re-queues after a removal while paused', async () => {
+    const tracks = createMockTracks(3);
+    await startPlayingTrack(tracks[0], tracks);
+    player.isPlaying = false;
+    mockInvoke.mockClear();
+
+    await handleTrackRemoved(tracks[1].id);
+
+    expect(callsOf('queue_next_track')).toEqual([queueArgs(tracks[2])]);
+  });
+
+  it('cycleRepeat re-queues the next for the new repeat mode', async () => {
+    const tracks = createMockTracks(2);
+    await startPlayingTrack(tracks[1], tracks); // last track, repeat off → no next
+    mockInvoke.mockClear();
+
+    cycleRepeat(); // repeat-all → wraps to the first track
+    expect(callsOf('queue_next_track')).toEqual([queueArgs(tracks[0])]);
+
+    mockInvoke.mockClear();
+    cycleRepeat(); // repeat-one → the same track again
+    expect(callsOf('queue_next_track')).toEqual([queueArgs(tracks[1])]);
+
+    mockInvoke.mockClear();
+    cycleRepeat(); // off → nothing follows the last track
+    expect(callsOf('queue_next_track')).toEqual([]);
+    expect(callsOf('clear_queued_next_track')).toHaveLength(1);
+  });
+
+  describe('removeUpcomingFromQueue', () => {
+    it('drops the tracks from the queue and re-queues the next', async () => {
+      const tracks = createMockTracks(4);
+      await startPlayingTrack(tracks[1], tracks);
+      mockInvoke.mockClear();
+
+      removeUpcomingFromQueue(new Set([tracks[0].id, tracks[2].id]));
+
+      expect(player.playQueue.map((t) => t.id)).toEqual([tracks[1].id, tracks[3].id]);
+      expect(player.currentIndex).toBe(0);
+      expect(player.currentTrack?.id).toBe(tracks[1].id);
+      expect(callsOf('stop')).toEqual([]);
+      expect(callsOf('queue_next_track')).toEqual([queueArgs(tracks[3])]);
+    });
+
+    it('keeps the currently playing track in the queue', async () => {
+      const tracks = createMockTracks(3);
+      await startPlayingTrack(tracks[1], tracks);
+      mockInvoke.mockClear();
+
+      removeUpcomingFromQueue(new Set([tracks[1].id, tracks[2].id]));
+
+      expect(player.playQueue.map((t) => t.id)).toEqual([tracks[0].id, tracks[1].id]);
+      expect(player.currentIndex).toBe(1);
+      expect(player.currentTrack?.id).toBe(tracks[1].id);
+      expect(callsOf('stop')).toEqual([]);
+      expect(callsOf('play_track')).toEqual([]);
+    });
+
+    it('remaps the shuffle order', async () => {
+      const tracks = createMockTracks(4);
+      await startPlayingTrack(tracks[0], tracks);
+      player.shuffleEnabled = true;
+      player.shuffledIndices = [0, 3, 1, 2];
+      mockInvoke.mockClear();
+
+      removeUpcomingFromQueue(new Set([tracks[1].id]));
+
+      expect(player.shuffledIndices).toEqual([0, 2, 1]);
+      expect(callsOf('queue_next_track')).toEqual([queueArgs(tracks[3])]);
+    });
+
+    it('does nothing when no queued track matches', async () => {
+      const tracks = createMockTracks(2);
+      await startPlayingTrack(tracks[0], tracks);
+      mockInvoke.mockClear();
+
+      removeUpcomingFromQueue(new Set([999]));
+
+      expect(player.playQueue).toHaveLength(2);
+      expect(mockInvoke).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('reorderQueue', () => {
+    it('follows the new order and re-queues the next', async () => {
+      const [a, b, c] = createMockTracks(3);
+      await startPlayingTrack(a, [a, b, c]);
+      mockInvoke.mockClear();
+
+      reorderQueue([a.id, c.id, b.id]);
+
+      expect(player.playQueue.map((t) => t.id)).toEqual([a.id, c.id, b.id]);
+      expect(player.currentIndex).toBe(0);
+      expect(player.currentTrack?.id).toBe(a.id);
+      expect(callsOf('play_track')).toEqual([]);
+      expect(callsOf('queue_next_track')).toEqual([queueArgs(c)]);
+    });
+
+    it('moves the current index along with the playing track', async () => {
+      const [a, b, c] = createMockTracks(3);
+      await startPlayingTrack(a, [a, b, c]);
+      mockInvoke.mockClear();
+
+      reorderQueue([b.id, c.id, a.id]);
+
+      expect(player.currentIndex).toBe(2);
+      expect(player.currentTrack?.id).toBe(a.id);
+      // a is now last and repeat is off: nothing may follow it
+      expect(callsOf('queue_next_track')).toEqual([]);
+      expect(callsOf('clear_queued_next_track')).toHaveLength(1);
+    });
+
+    it('keeps queued tracks that are not in the new order in their slot', async () => {
+      const [a, b, c, d] = createMockTracks(4);
+      await startPlayingTrack(b, [a, b, c, d]);
+      mockInvoke.mockClear();
+
+      // b was removed from the playlist while playing, so it is not listed
+      reorderQueue([d.id, c.id, a.id]);
+
+      expect(player.playQueue.map((t) => t.id)).toEqual([d.id, b.id, c.id, a.id]);
+      expect(player.currentIndex).toBe(1);
+      expect(callsOf('queue_next_track')).toEqual([queueArgs(c)]);
+    });
+
+    it('keeps the shuffle order pointing at the same tracks', async () => {
+      const [a, b, c] = createMockTracks(3);
+      await startPlayingTrack(a, [a, b, c]);
+      player.shuffleEnabled = true;
+      player.shuffledIndices = [0, 2, 1]; // a, c, b
+      mockInvoke.mockClear();
+
+      reorderQueue([c.id, b.id, a.id]);
+
+      expect(player.shuffledIndices.map((i) => player.playQueue[i].id)).toEqual([a.id, c.id, b.id]);
+      expect(player.currentIndex).toBe(2);
+    });
+
+    it('does nothing when the order is unchanged', async () => {
+      const [a, b, c] = createMockTracks(3);
+      await startPlayingTrack(a, [a, b, c]);
+      mockInvoke.mockClear();
+
+      reorderQueue([a.id, b.id, c.id]);
+
+      expect(mockInvoke).not.toHaveBeenCalled();
+    });
+  });
+});

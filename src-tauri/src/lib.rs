@@ -1,0 +1,216 @@
+pub mod audio;
+pub mod commands;
+pub mod error;
+pub mod lock;
+pub mod logging;
+pub mod metadata;
+pub mod models;
+pub mod scanner;
+pub mod storage;
+pub mod tray;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use audio::AudioPlayer;
+use audio::SharedPlayer;
+use lock::LockRecover;
+use rusqlite::Connection;
+use storage::db;
+use tauri::{Emitter, Manager};
+
+pub struct DbState(pub Arc<Mutex<Connection>>);
+pub struct WatcherState(pub Mutex<Option<scanner::watcher::FolderWatcher>>);
+
+fn spawn_player_polling(
+    shutdown: Arc<AtomicBool>,
+    app_handle: tauri::AppHandle,
+    player: SharedPlayer,
+    db: Arc<Mutex<Connection>>,
+) {
+    std::thread::spawn(move || {
+        // Play counts are credited here, not in the frontend: completion
+        // detection (check_gapless_transition / acknowledge_track_ended)
+        // and crediting happen in this one thread, so exactly-once holds by
+        // construction — no cross-IPC guard flags needed. The DB write lands
+        // before the emit, so the event announcing a completion never races
+        // ahead of the row it describes.
+        let mut credited_seq: u64 = 0;
+        while !shutdown.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let state = {
+                let mut p = player.lock_recover();
+                let transitioned = p.check_gapless_transition();
+                let ended = p.has_track_ended();
+                if ended {
+                    p.acknowledge_track_ended();
+                }
+                crate::models::player_state::PlayerState {
+                    is_playing: p.is_playing(),
+                    current_track_id: p.get_current_track_id(),
+                    position_secs: p.get_pos(),
+                    duration_secs: p.get_duration(),
+                    volume: p.get_volume(),
+                    track_ended: ended,
+                    gapless_queued: p.is_gapless_queued(),
+                    gapless_transitioned: transitioned,
+                    completion_seq: p.completion_seq(),
+                    last_completed_track_id: p.last_completed_track_id(),
+                }
+            };
+            // DB write outside the player lock — lock scopes stay disjoint.
+            // At most one completion can occur per poll cycle for real-length
+            // tracks, so crediting last_completed_track_id per seq advance
+            // covers every completion.
+            if state.completion_seq > credited_seq {
+                credited_seq = state.completion_seq;
+                if let Some(id) = state.last_completed_track_id {
+                    let conn = db.lock_recover();
+                    if let Err(e) = storage::library_repo::increment_play_count(&conn, id) {
+                        log::error!("failed to credit play count for track {id}: {e}");
+                    }
+                }
+            }
+            let _ = app_handle.emit("player-state-changed", &state);
+        }
+    });
+}
+
+/// Create the folder watcher and start watching all saved scan folders.
+/// Returns `None` when the watcher cannot be created — the app still works,
+/// only live library updates are disabled.
+fn init_watcher(
+    db_arc: &Arc<Mutex<Connection>>,
+    app_handle: &tauri::AppHandle,
+    pending_error: &scanner::watcher::PendingWatcherError,
+) -> Option<scanner::watcher::FolderWatcher> {
+    let watcher = match scanner::watcher::FolderWatcher::new(
+        Arc::<Mutex<Connection>>::clone(db_arc),
+        app_handle.clone(),
+        pending_error.clone(),
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            log::error!("folder watcher unavailable, live library updates disabled: {e}");
+            pending_error.set(e.to_string());
+            return None;
+        }
+    };
+
+    match storage::library_repo::get_all_scan_folders(&db_arc.lock_recover()) {
+        Ok(folders) => {
+            for folder in folders {
+                if let Err(e) = watcher.watch(&folder) {
+                    log::warn!("failed to watch folder {folder}: {e}");
+                }
+            }
+        }
+        Err(e) => log::error!("failed to load scan folders for watching: {e}"),
+    }
+
+    Some(watcher)
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // First, so that everything after it (including a failed setup,
+            // which panics) ends up in the log file.
+            logging::init(app.handle());
+            log::info!("started, version {}", env!("CARGO_PKG_VERSION"));
+
+            let conn = db::init_db(app.handle())?;
+            let db_arc = Arc::new(Mutex::new(conn));
+            app.manage(DbState(Arc::<Mutex<Connection>>::clone(&db_arc)));
+
+            let pending_watcher_error = scanner::watcher::PendingWatcherError::default();
+            let watcher = init_watcher(&db_arc, app.handle(), &pending_watcher_error);
+            app.manage(pending_watcher_error);
+            app.manage(WatcherState(Mutex::new(watcher)));
+
+            // No output device must not keep the app from starting: the
+            // device is opened again on the next play.
+            let player = AudioPlayer::new().unwrap_or_else(|e| {
+                log::warn!("audio output unavailable at startup: {e}");
+                AudioPlayer::without_device()
+            });
+            app.manage(SharedPlayer::new(Mutex::new(player)));
+            tray::create_tray(app)?;
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_for_thread = Arc::<AtomicBool>::clone(&shutdown);
+            let shutdown_for_event = Arc::<AtomicBool>::clone(&shutdown);
+
+            let player_for_thread = Arc::clone(app.state::<SharedPlayer>().inner());
+            spawn_player_polling(
+                shutdown_for_thread,
+                app.handle().clone(),
+                player_for_thread,
+                Arc::<Mutex<Connection>>::clone(&db_arc),
+            );
+
+            let main_window = app.get_webview_window("main");
+            if let Some(window) = main_window {
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::Destroyed = event {
+                        shutdown_for_event.store(true, Ordering::Relaxed);
+                    }
+                });
+            }
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            // Playback commands
+            commands::playback::play_track,
+            commands::playback::pause,
+            commands::playback::resume,
+            commands::playback::stop,
+            commands::playback::seek,
+            commands::playback::set_volume,
+            commands::playback::get_player_state,
+            commands::playback::queue_next_track,
+            commands::playback::clear_queued_next_track,
+            // Library commands
+            commands::library::scan_folder,
+            commands::library::get_all_tracks,
+            commands::library::get_track_cover,
+            commands::library::search_tracks,
+            commands::library::remove_track,
+            commands::library::trash_track,
+            commands::library::trash_tracks,
+            commands::library::remove_tracks,
+            commands::library::get_track_details,
+            commands::library::get_track_lyrics,
+            commands::library::fetch_lyrics_online,
+            commands::library::import_paths,
+            commands::library::update_track_metadata,
+            commands::library::get_all_artists,
+            commands::library::get_all_albums,
+            commands::library::get_tracks_by_artist,
+            commands::library::get_tracks_by_album,
+            commands::library::get_most_played_tracks,
+            commands::library::start_watching,
+            commands::library::stop_watching,
+            commands::library::get_watched_folders,
+            commands::library::take_watcher_error,
+            // Playlist commands
+            commands::playlist::create_playlist,
+            commands::playlist::rename_playlist,
+            commands::playlist::get_all_playlists,
+            commands::playlist::get_playlist_tracks,
+            commands::playlist::add_to_playlist,
+            commands::playlist::remove_from_playlist,
+            commands::playlist::batch_add_to_playlist,
+            commands::playlist::batch_remove_from_playlist,
+            commands::playlist::reorder_playlist,
+            commands::playlist::reorder_playlists,
+            commands::playlist::delete_playlist,
+            commands::playlist::save_playback_position,
+            commands::playlist::get_last_playback_position,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

@@ -1,0 +1,56 @@
+[package]
+name = "lyra-music"
+version = "0.1.9"
+description = "Lyra Music - A lightweight Linux desktop music player"
+authors = ["twtrubiks"]
+license = "MIT"
+repository = "https://github.com/twtrubiks/lyra-music"
+edition = "2024"
+rust-version = "1.91"
+
+[lib]
+name = "lyra_music_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset", "tray-icon"] }
+tauri-plugin-dialog = "2"
+rodio = "0.23"
+lofty = "0.25"
+rusqlite = { version = "0.39", features = ["bundled"] }
+walkdir = "2.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+thiserror = "2"
+trash = "5"
+notify = "9"
+ureq = "3"
+tauri-plugin-log = "2"
+log = "0.4"
+
+[features]
+audio-tests = []
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+needless_pass_by_value = "allow"
+unwrap_used = "warn"
+clone_on_ref_ptr = "warn"

@@ -1,0 +1,209 @@
+<p align="center">
+  <img src="docs/images/logo.png" alt="Lyra Music" width="140" />
+</p>
+
+# Lyra Music
+
+English | [繁體中文](README.md)
+
+[![CI](https://github.com/twtrubiks/lyra-music/actions/workflows/ci.yml/badge.svg)](https://github.com/twtrubiks/lyra-music/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/twtrubiks/lyra-music)](https://github.com/twtrubiks/lyra-music/releases)
+[![AppImageHub](https://img.shields.io/badge/AppImageHub-listed-blue.svg)](https://appimage.github.io/Lyra_Music/)
+[![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB.svg)](https://tauri.app/)
+[![Svelte](https://img.shields.io/badge/Svelte-5-FF3E00.svg)](https://svelte.dev/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-6-3178c6.svg)](https://www.typescriptlang.org/)
+[![Rust](https://img.shields.io/badge/Rust-dea584.svg)](https://www.rust-lang.org/)
+[![rodio](https://img.shields.io/badge/rodio-0.23-e2603a.svg)](https://github.com/RustAudio/rodio)
+
+A desktop music player built with Tauri 2 + Svelte 5 + Rust. Fully local playback; the core never depends on an online service. The only network feature is the user-triggered online lyrics search.
+
+## Screenshots
+
+![Main Interface - Music Library & Player](docs/images/main-player-library.png)
+
+![Mini Player Mode](docs/images/mini-player.png)
+
+![Main Interface - Lyrics](docs/images/main-player-lyrics.png)
+
+## Why Lyra Music?
+
+Lyra's design principles:
+
+**Zero-dependency startup** -- The audio engine uses [rodio](https://github.com/RustAudio/rodio) (pure Rust), requiring no GStreamer, MPV, or FFmpeg. Just download the binary and run.
+
+**Lightweight, not limited** -- Tauri 2 doesn't bundle Chromium, resulting in significantly lower memory usage compared to Electron-based solutions. Yet it retains the features most users actually need: Gapless Playback, resume playback, playlist management, metadata editing, and System Tray.
+
+**Your music stays on your machine** -- No telemetry (no background data collection or transmission), no accounts, no automatic network access. The only request ever sent is the LRCLIB lookup when you click "search lyrics online", carrying just artist, title, album and duration. MIT licensed, fully transparent source code.
+
+## Download
+
+Go to **[GitHub Releases](https://github.com/twtrubiks/lyra-music/releases/latest)** to download the latest version (supports AppImage, deb, rpm).
+
+The AppImage is also listed on [AppImageHub](https://appimage.github.io/Lyra_Music/).
+
+## Technical Architecture
+
+Further reading: [Why Rust](docs/why-rust.md), [Tauri 2 Introduction](docs/tauri2-introduction.md)
+
+| Layer             | Technology                 | Description                                                                            |
+| ----------------- | -------------------------- | -------------------------------------------------------------------------------------- |
+| Frontend          | Svelte 5 + TypeScript      | Reactive state management using Svelte 5 runes                                         |
+| Build Tool        | Vite 8                     | Dev server and frontend bundling                                                       |
+| Desktop Framework | Tauri 2                    | Native windows, system tray, IPC communication                                         |
+| Backend           | Rust                       | Audio processing, file scanning, database operations                                   |
+| Audio Engine      | rodio 0.23                 | Pure Rust implementation, no need for GStreamer, MPV, or other system audio frameworks |
+| Metadata Parsing  | lofty 0.25                 | Read/write ID3/Vorbis/MP4 tags and cover art                                           |
+| File Watching     | notify 9                   | Real-time folder change detection, automatic music library updates                     |
+| Database          | SQLite (rusqlite, bundled) | WAL mode, schema migration management                                                  |
+| Online Lyrics     | ureq 3 (rustls)            | Manual LRCLIB API search, synced lyrics cached as `.lrc` sidecar                       |
+| Testing           | Vitest + cargo test        | Frontend unit tests, backend integration tests                                         |
+
+## Key Features
+
+**Local music playback** -- Supports MP3, FLAC, WAV, OGG, M4A, and AAC formats. The audio engine is based on rodio with full play / pause / stop / seek controls. Volume uses quadratic curve mapping (UI 0.5 maps to actual 0.25) for a more natural listening experience.
+
+**Gapless playback** -- Pre-decodes the next track and appends it to the same sink for seamless transitions. Does not require matching sample rates between consecutive tracks.
+
+**Playlists & resume playback** -- Create, edit, and delete playlists with drag-and-drop reordering. Each playlist records the last played track ID and position in seconds, automatically restoring playback progress when switching playlists.
+
+**Mini Player + System Tray** -- Press `m` to switch to a compact 420x80 window (always-on-top). System tray supports Play/Pause, previous, next, show window, and quit. Closing the window automatically minimizes to the system tray.
+
+**Tauri 2 + Svelte 5 + Rust architecture** -- Frontend and backend communicate through Tauri commands via IPC. The frontend manages state with Svelte 5 runes, while the backend handles audio decoding, file I/O, and database operations in Rust.
+
+Other features:
+
+- Time-synced scrolling lyrics and online lyrics search (LRCLIB) -- see [Lyrics](#lyrics) for how to get them
+- Artist / Album browse views (grid covers, search filtering, detail views)
+- Track metadata editing (title, artist, album written back to file)
+- Real-time folder watching (add/modify/delete automatically syncs music library; same-filesystem moves/renames preserve play stats and playlist membership on Linux and Windows — macOS FSEvents cannot pair old and new paths, so a rename there is treated as delete + re-import; watched folders can be viewed and removed without affecting imported tracks, with missing paths flagged)
+- Column header sorting (preferences persisted), play count tracking (Most Played ranking view)
+- Recursive music library scanning with automatic metadata reading and cover art caching
+- Playback modes (loop/repeat-one/shuffle), instant search filtering, multi-select operations, context menu, drag-and-drop import (dropping onto an open playlist also adds the tracks to it)
+- Traditional Chinese / English interface (follows the system locale by default, switchable from the sidebar)
+
+## Lyrics
+
+Press `l` while a track is playing (or click the Lyrics button on the player bar) to open the lyrics panel. Lyrics sources, in priority order:
+
+1. **Sidecar `.lrc` file** -- same directory and filename as the audio file, UTF-8 encoded:
+
+   ```text
+   ~/Music/
+   ├── Artist - Song.mp3
+   └── Artist - Song.lrc
+   ```
+
+2. **Embedded lyrics tags** -- lyrics stored in the file itself (e.g. USLT for MP3, LYRICS for FLAC).
+3. **Online search (LRCLIB)** -- when neither exists, the lyrics panel shows an online search button; plain-text lyrics can also be upgraded to a synced version. Synced hits are automatically saved as a sidecar `.lrc` (never overwriting existing files), so they work offline afterwards.
+
+Notes:
+
+- Online search matches by artist + title + duration, so missing or incorrect tags yield no results -- **right-click the track -> "Properties" -> "Edit"** to fix the title/artist/album (written back to file), then search again; the search button is hidden when the artist tag is missing.
+- `.lrc` files must be UTF-8; other encodings (GBK/Big5) are ignored, falling back to embedded tags.
+- Synced lyrics scroll with playback; plain-text lyrics are shown statically. The dot on the Lyrics button: gray = plain text, red = synced.
+
+## Prerequisites
+
+- [Node.js](https://nodejs.org/) (LTS)
+- [Rust toolchain](https://rustup.rs/) (rustup, Rust 1.91+)
+- Tauri 2 system dependencies: see [Tauri Prerequisites](https://v2.tauri.app/start/prerequisites/) (macOS/Windows usually require no additional installation)
+
+Linux (Debian/Ubuntu) additionally requires:
+
+```
+sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
+  libssl-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev
+```
+
+## Installation & Running
+
+```bash
+npm install           # Install frontend dependencies
+npm run tauri dev     # Development mode (starts both Vite dev server and Tauri window)
+npm run tauri build   # Production build
+```
+
+Build artifacts are located in `src-tauri/target/release/bundle/`, supporting deb, AppImage (Linux), dmg (macOS), and nsis/msi (Windows).
+
+## Testing
+
+```bash
+npm run test                    # Frontend unit tests (Vitest)
+npm run check                   # Type checking
+cd src-tauri && cargo test      # Backend integration tests (audio tests skipped by default)
+cd src-tauri && cargo test --features audio-tests  # With audio tests (requires audio device)
+npm run quality                 # Code quality checks (ESLint + Prettier + Stylelint + Clippy + rustfmt)
+```
+
+## Keyboard Shortcuts
+
+All shortcuts are disabled when an input field is focused.
+
+| Key                                                                        | Action                                                              |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `Space`                                                                    | Play / Pause                                                        |
+| `ArrowLeft` / `ArrowRight`                                                 | Rewind / Fast-forward 5 seconds                                     |
+| `ArrowUp` / `ArrowDown`                                                    | Increase / Decrease volume by 5% (when track list is not focused)   |
+| `n` / `p`                                                                  | Next / Previous track                                               |
+| `s`                                                                        | Toggle shuffle                                                      |
+| `r`                                                                        | Toggle repeat mode (off / repeat-all / repeat-one)                  |
+| `m`                                                                        | Toggle Mini Player                                                  |
+| `l`                                                                        | Toggle lyrics panel                                                 |
+| `Escape`                                                                   | Close lyrics panel / Exit Mini Player                               |
+| `Ctrl+F` / `Cmd+F`                                                         | Focus search box                                                    |
+| `Ctrl+J` / `Cmd+J`                                                         | Go to the playing track (or click the track info in the player bar) |
+| `←` `→` / `PageUp` `PageDown` / `Home` `End` with the progress bar focused | Seek 5 s, 30 s, or jump to start / end                              |
+| `?`                                                                        | Show keyboard shortcuts help                                        |
+
+**When track list is focused:**
+
+| Key                                           | Action                                                                                                  |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `ArrowUp` / `ArrowDown`                       | Previous / Next track                                                                                   |
+| `Shift+ArrowUp` / `Shift+ArrowDown`           | Extend selection up / down                                                                              |
+| `Ctrl+A` / `Cmd+A`                            | Select all tracks                                                                                       |
+| `Enter`                                       | Play focused track                                                                                      |
+| `Home` / `End`                                | Jump to first / last track                                                                              |
+| `Ctrl+Shift+ArrowUp` / `Ctrl+Shift+ArrowDown` | Move selected tracks up / down (within a playlist)                                                      |
+| `Delete`                                      | Remove selected tracks (from the playlist in playlist view; from the library elsewhere, files are kept) |
+| `Shift+Delete`                                | Move selected tracks to trash                                                                           |
+
+**In playlist view:**
+
+| Key                                           | Action                                             |
+| --------------------------------------------- | -------------------------------------------------- |
+| `Ctrl+Shift+ArrowUp` / `Ctrl+Shift+ArrowDown` | Move the current playlist up / down in the sidebar |
+
+## Project Structure
+
+```
+src/                              # Frontend (Svelte 5 + TypeScript)
+  lib/
+    api/                          # Tauri IPC call wrappers (playback, library, playlist)
+    components/                   # UI components (Player, Library, Browse, Playlist, Sidebar, Settings, Help)
+    state/                        # Reactive state management (Svelte 5 runes)
+    logic/                        # Pure function logic (playback modes, shortcuts, formatting, selection, sorting)
+    i18n/                         # UI translations (typed dictionaries, Traditional Chinese + English)
+    types/                        # TypeScript type definitions
+src-tauri/                        # Backend (Rust)
+  src/
+    audio/                        # Audio engine (rodio sink, gapless queue)
+    scanner/                      # Folder scanning & file watching (walkdir, notify)
+    metadata/                     # Metadata read/write & cover art caching (lofty)
+    storage/                      # SQLite database (schema v9, WAL mode)
+    commands/                     # Tauri command handlers (IPC interfaces)
+    models/                       # Data structure definitions (track, playlist, player_state)
+  tests/                          # Integration tests
+```
+
+## Logs
+
+Backend errors and warnings (files skipped during a scan, folder watching failures, audio device errors, panics) and UI errors (failed-action notifications, uncaught exceptions) are written to a log file. Please attach it when reporting a problem:
+
+| Platform | Location                                      |
+| -------- | --------------------------------------------- |
+| Linux    | `~/.local/share/com.lyra.music/logs/lyra.log` |
+| macOS    | `~/Library/Logs/com.lyra.music/lyra.log`      |
+| Windows  | `%LOCALAPPDATA%\com.lyra.music\logs\lyra.log` |
+
+The file is capped at 1 MB; when it fills up it is renamed to `lyra_<date>_<time>.log` next to it, and only the most recent of those is kept. Timestamps are UTC. The log contains file paths, so review it before sharing.

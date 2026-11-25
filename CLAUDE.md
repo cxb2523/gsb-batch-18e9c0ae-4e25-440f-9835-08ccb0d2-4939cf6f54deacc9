@@ -1,0 +1,134 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## 專案概述
+
+Lyra Music 是一個輕量級 Linux 桌面音樂播放器，採用 **Tauri 2**（Rust 後端 + Svelte 5 前端）。音訊播放使用 **rodio**（純 Rust，無需 FFmpeg/GStreamer）。資料儲存於 **SQLite**（rusqlite，WAL 模式）。音樂元資料透過 **lofty** 讀寫。
+
+## 常用指令
+
+### 開發
+
+```bash
+npm install                  # 安裝前端依賴
+npm run tauri dev            # 啟動開發模式（Vite + Tauri 視窗）
+```
+
+### 測試
+
+```bash
+# 前端（Vitest, jsdom）
+npm run test                 # 執行所有前端測試
+npm run test:watch           # 監看模式
+npx vitest run src/lib/logic/format.test.ts   # 執行單一測試檔案
+
+# 後端（Rust 整合測試）
+cd src-tauri && cargo test                          # 所有測試
+cd src-tauri && cargo test storage_test             # 單一測試檔案
+cd src-tauri && cargo test --features audio-tests   # 包含音訊裝置測試
+```
+
+### 程式碼檢查與格式化
+
+```bash
+npm run quality              # 完整檢查：prettier + eslint + stylelint + rust fmt + clippy + 型別檢查
+npm run lint                 # ESLint（僅 src/）
+npm run format               # Prettier 格式化
+npm run stylelint            # CSS/Svelte lint
+npm run rust:fmt             # cargo fmt
+npm run rust:clippy          # cargo clippy -D warnings
+npm run check                # svelte-check + tsc
+```
+
+### 建置
+
+```bash
+npm run tauri build          # 正式建置（輸出 deb/AppImage/rpm 至 src-tauri/target/release/bundle/）
+```
+
+## 架構
+
+```text
+Frontend (Svelte 5)  ──IPC (invoke/listen)──  Backend (Rust/Tauri 2)
+```
+
+**前端**（`src/`）：
+
+- `lib/api/` — Tauri IPC 封裝（`playback.ts`、`library.ts`、`playlist.ts`）
+- `lib/state/` — Svelte 5 runes 響應式狀態（透過 `getPlayerState()` 等取得單例）
+- `lib/logic/` — 抽離的純函式，便於測試（播放動作、斷點續播、鍵盤快捷鍵、排序、選取、虛擬捲動、格式化）
+- `lib/components/` — 依功能分組的 UI 元件（Player/、Library/、Browse/、Playlist/、Sidebar/、Settings/、Help/）
+- `lib/i18n/` — 自製型別字典（零相依，繁中 + 英文）。`locales/en.ts` 為基準並定義 `MessageKey`，`locales/zh-TW.ts` 型別為 `Messages`（缺 key 編譯失敗）；`locale.ts` 為純函式（偵測、儲存、插值、`Intl.PluralRules` 複數）；`index.svelte.ts` 持有 `$state` 語系並匯出 `t()`。語系順序：`localStorage`（`lyra-locale`）→ `navigator.languages`（任何 `zh*` → zh-TW）→ en。**使用者可見字串一律走 `t(key)`，不可寫死**；`t()` 讀響應式狀態，須在 template、`$derived` 或函式內呼叫，不可在模組／元件頂層存成常數（切換語言後不會更新）。`notifyCritical` 第一個參數是 `action.*` 的 key。系統匣選單與 Rust `AppError` 前綴不在 i18n 範圍內（維持英文）
+- `lib/types/index.ts` — 所有 TypeScript 介面（Track、Playlist 等）
+- `lib/__mocks__/` — 測試用 Tauri/dialog mock
+- 路徑別名：`$lib` → `src/lib`
+
+**後端**（`src-tauri/src/`）：
+
+- `commands/` — Tauri command handler（playback、library、playlist）。library/playlist 指令一律標 `#[tauri::command(async)]`（見「已知問題」的主執行緒說明）；playback 指令刻意留同步（不碰 DB 鎖、需 FIFO 保序）。碰檔案 I/O 的指令採短鎖模式：短鎖取資料 → 放鎖做檔案 I/O → 需要時再上鎖寫 DB（`get_track_lyrics`、`update_track_metadata` 為範例）
+- `storage/` — Repository 模式：`library_repo.rs`（Track CRUD）、`playlist_repo.rs`（Playlist CRUD）、`db.rs`（schema + migrations）
+- `audio/player.rs` — rodio sink 封裝，支援無縫播放（pre-decode + 排入同一 sink）。rodio 的 `Player` 只能從佇列前端跳過、無法抽掉尾端，所以已排入的下一首以 `audio/cancellable.rs` 的 `Cancellable` 包裝：`queue_next` 再呼叫即替換、`clear_queued_next` 取消（被取消的來源輪到時立刻結束）。前端在「下一首可能改變」時（刪除曲目、切換隨機／循環、從來源播放清單移除或重新排序）必須呼叫 `requeueNext` 重新同步，否則舊的下一首照播
+- `scanner/` — `folder_scanner.rs`（walkdir 掃描）、`watcher.rs`（notify 即時監控；事件經 2 秒 debounce 合批（持續事件流下批次最長累積 10 秒就強制處理），notify 回報的錯誤與事件佇列溢位（inotify 以帶 rescan 旗標的一般事件回報，不是 `Err`）以 `watcher-error` 事件通知前端（60 秒限流）；啟動時前端還沒監聽，最近一筆錯誤另存於 `PendingWatcherError`，前端載入後以 `take_watcher_error` 取一次，一批至多發一次無 payload 的 `library-changed`，前端全量重抓——App 重抓 `allTracks` 後以 `updateExistingTracks`/`updateCurrentTrack` 同步播放佇列與 currentTrack 的 `file_path`（改名後 Next／無縫預載才不用舊路徑），持本地清單的詳細檢視經 `watchLibraryChanged` 重載自癒（幽靈列、舊路徑、外部標籤變更）；刪除走 `tracks-removed` 帶 track ids，App 集中清理佇列與播放清單。匯入先去重同檔重複事件後重用 `import_audio_files`（鎖外解析、分塊短鎖插入），不持 DB 鎖做檔案 I/O。刻意不做增量 payload——重抓已被合批且不佔主執行緒，桌面音樂庫規模下不值得引入事件契約與前端 merge 邏輯）
+- `metadata/` — `reader.rs`（lofty 讀取；含歌詞：sidecar `.lrc` 優先、fallback 內嵌標籤）、`writer.rs`（標籤寫入）、`lyrics_online.rs`（LRCLIB 線上歌詞查詢，僅使用者手動觸發；兩段式：`/api/get` 精確匹配優先——duration 容差僅 ±2 秒，重轉檔/尾端靜音必漏——404 後 fallback `/api/search`，title 正規化後須完全相等（排除 medley），artist 採雙向包含比對——接受「Jay Chou 周杰倫」式裝飾異寫（部分曲目在 LRCLIB 上只有這種寫法），拒絕不同歌手，兩側須非空（`contains("")` 恆真）——並在 ±15 秒內取時長最接近本地檔者（更遠視為不同版本，寧可回報找不到）；同步歌詞以 `create_new` 快取為 sidecar，不覆蓋既有檔）
+- `models/` — Serde 結構體：Track、Playlist、PlayerState、ArtistSummary、AlbumSummary
+- `error.rs` — `AppError` 列舉（thiserror）
+- `lock.rs` — `LockRecover::lock_recover()`：上鎖並在鎖中毒（持鎖的執行緒 panic）時復原、清除中毒旗標、記一筆 error。**App 內的 `Mutex` 一律用 `lock_recover()`，不要用 `lock()`**——否則一次 panic 就讓播放器或資料庫整個不能用，直到重開 App
+- `logging.rs` — 診斷日誌（tauri-plugin-log 的設定）：`log::error!`／`warn!`／`info!` 同時寫 stderr 與 app log 目錄的 `lyra.log`（上限 1 MB，寫滿改名為 `lyra_<日期>_<時間>.log` 並只留一個，UTC 時間戳）；相依套件的訊息只收 warn 以上。模組另外補上外掛沒有的兩件事：panic hook 寫入日誌、日誌檔開不了時退回只寫 stderr（不擋啟動）。打包後沒有終端機，**後端要回報問題一律用 `log::` 巨集，不要用 `eprintln!`**。前端經 `lib/logic/frontend-log.ts` 寫進同一個檔（`@tauri-apps/plugin-log` + `log:default` 權限）：`notifyCritical`／`warnNonCritical` 與全域未捕捉例外／未處理的 Promise 失敗，每分鐘上限 30 筆；前端回報錯誤一律走這兩個函式，不要直接 `console.error`
+- `tray.rs` — 系統匣整合
+- `lib.rs` — 應用程式初始化：DB 設定、音訊播放器、資料夾監控、系統匣、播放器輪詢執行緒（250ms；**play_count 在此入帳**——完成偵測與 DB 寫入同執行緒同鎖，前端僅透過 level-triggered 的 `completion_seq` 鏡像顯示，不再經 IPC 計數）
+
+## 關鍵慣例
+
+### Rust
+
+- **Clippy pedantic** 強制啟用（`-D warnings`），`unsafe_code` 禁用
+- `unwrap_used` = warn、`clone_on_ref_ptr` = warn
+- rustfmt：`max_width = 100`、`use_field_init_shorthand = true`
+- MSRV：1.91（edition 2024）
+
+### Pre-commit Hook
+
+執行 `lint-staged`（prettier + eslint + stylelint + rustfmt + clippy）及 `npm run check`。
+
+### 版本一致性
+
+版本號必須在 `package.json`、`src-tauri/Cargo.toml` 及 `src-tauri/tauri.conf.json` 之間保持一致。Release CI 會驗證版本號與 git tag 是否吻合。
+
+## 開發原則
+
+- 簡單方案優先，不要 over-engineer
+- README 不要用過多 emoji 和行銷語調，保持開發者風格
+
+### 可逆性與回滾優先
+
+- 保持變更易於還原（小範圍、小型 commit、清晰的影響範圍）
+- 對於有風險的變更，在合併前定義回滾路徑
+- 避免阻礙安全回滾的混合巨型補丁
+- 實作前用程式碼搜尋驗證假設
+- 優先選擇確定性行為而非聰明的捷徑
+- 如果不確定，留下帶有驗證脈絡的具體 TODO，而非隱藏的猜測
+
+### 反模式（禁止事項）
+
+- 不要為了小便利而新增重量級相依
+- 不要靜默弱化安全策略或存取約束
+- 不要「以防萬一」地新增推測性的設定/功能旗標
+- 不要將大量純格式化變更與功能變更混合
+- 不要「順便」修改無關模組
+- 不要在沒有明確說明的情況下繞過失敗的檢查
+- 不要在重構 commit 中隱藏改變行為的副作用
+- 不要在測試資料、範例、文件或 commit 中包含個人身分或敏感資訊
+- 除非維護者明確要求，否則不要嘗試儲存庫品牌重塑/身分替換
+- 除非維護者明確要求，否則不要引入新的平台面（例如 `web` 應用、儀表板、UI 入口）
+
+## 已知問題
+
+- **lofty**：含非數字 ASCII 字元的 timestamp（如 `H17.10.26`）在預設的 `BestAttempt` 解析模式下會讓整個檔案讀取失敗。`metadata/reader.rs` 與 `writer.rs` 因此統一使用 `ParsingMode::Relaxed`（共用 `read_tagged_file`；壞的 timestamp frame 會被跳過，其餘標籤保留）。取捨：編輯標籤存檔時壞 frame 會被移除——比起這類檔案永遠無法編輯標籤，這是較好的行為。
+- **watcher 與搬移/改名**：同檔案系統的搬移/改名要配成 `RenameMode::Both` 事件才會由 `watcher.rs` 的 `apply_rename_events` 直接 UPDATE `file_path`（保留 play_count 與播放清單歸屬）。Linux 的 inotify 後端自己以 rename cookie 配對，且所有 rename 事件都帶 tracker；Windows 後端只發無 tracker 的 `From`／`To` 兩個相鄰事件，由 `pair_split_renames` 以「無 tracker 且緊鄰」規則配成 Both——帶 tracker 的 From/To 是 inotify 真正落單的一半（移出／移入監控樹），不可配對。macOS FSEvents 兩側都是 `RenameMode::Any` 且無順序保證，不配對，改名退化為 delete + re-import。目錄改名以前綴 UPDATE 子曲目（inotify 與 Windows 都不發子檔案事件），前綴用 `MAIN_SEPARATOR_STR` 而非寫死 `/`。跨檔案系統搬移（copy+delete，無 cookie）同樣是 delete + re-import，歷史不保留。
+- **掃描 symlink 去重的範圍**：`folder_scanner.rs` 以 canonical path 記錄已走訪目錄並 `skip_current_dir()`，但 `visited_dirs` 只活在單次 `scan_folder` 內。同一目錄在**同一次掃描**裡經實體路徑與 symlink 各被走到時只匯入一次，保留的是檔案系統先列舉到的那條路徑（不保證是實體路徑）；若使用者把實體資料夾和指向它的 symlink 分別加成兩個音樂庫來源，仍會以兩個 `file_path` 各匯入一筆（DB 以路徑字串去重，不 canonicalize）。修正前已重複匯入的曲目不會自動清理。
+- **封面 asset protocol scope 耦合**：專輯牆封面經 `convertFileSrc` 直接載檔，`tauri.conf.json` 的 assetProtocol scope（`$APPDATA/covers/**`）與 `metadata/reader.rs` `save_cover_art` 的 `covers` 目錄名稱耦合——改目錄名必須同步改 scope，否則封面會靜默載不出來。
+- **lofty 歌詞 ItemKey**：ID3 的 USLT frame 對映到 `ItemKey::UnsyncLyrics`，不是 `ItemKey::Lyrics`（後者對映 Vorbis `LYRICS`/MP4 `©lyr`）。`read_lyrics` 兩個都查才同時支援 MP3 與 FLAC。sidecar `.lrc` 僅支援 UTF-8，非 UTF-8（GBK/Big5 常見）會跳過並 fallback 內嵌標籤，不會顯示亂碼。
+- **lofty 錯誤訊息**：0.25 起 `FileParseError`／`FileEncodingError` 的 `Display` 只有 `failed to parse file`／`failed to write to file`，真正原因（找不到檔案、權限不足）在 `source()` 鏈裡。會送到前端或寫進日誌的 lofty 錯誤一律用 `metadata/reader.rs` 的 `error_chain` 格式化，不要直接 `{e}`／`to_string()`。
+- **Tauri 同步指令跑主執行緒**：不帶 `async` 的 `#[tauri::command]` 在主執行緒執行——慢指令（全表查詢、掃描匯入）會阻塞所有其他 IPC 與事件派送，DB 鎖切得再細也救不了。因此所有碰 DB／檔案 I/O 的指令必須標 `#[tauri::command(async)]`（丟到 thread pool，簽章不變）；playback 指令刻意留同步——不碰 DB 鎖，且主執行緒 FIFO 天然保序（play → queue_next 不會重排）。
+- **線上歌詞 HTTP client 選型**：用 ureq 3（預設 rustls + ring + webpki-roots，零系統依賴），不用 reqwest——reqwest 0.13 的 `rustls` feature 走 aws-lc-rs，建置需要 cmake（本機與 CI 未必有）；`native-tls` 則吃系統 openssl-dev。blocking API 也與全 sync command + `#[tauri::command(async)]` 的既有模式一致。網路請求全在 Rust 端，`tauri.conf.json` 的 CSP `default-src 'self'` 不需放寬。
