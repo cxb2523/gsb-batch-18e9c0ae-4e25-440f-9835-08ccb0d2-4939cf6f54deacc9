@@ -14,6 +14,7 @@ var audioCtx = null;
 var sourceNode = null;
 var analyserNode = null;
 var analyserL = null, analyserR = null;
+var splitterNode = null;
 var isPlaying = false;
 var startTime = 0;
 var pauseOffset = 0;
@@ -21,6 +22,12 @@ var rafId = null;
 var worker = null;
 var essentiaInstance = null;
 var essentiaLoaded = false;
+
+// Monotonic session token. Every file-processing run (and every reset) gets a
+// new value; any callback from an older session is ignored.
+var sessionId = 0;
+// Playback generation: invalidates onended callbacks of superseded nodes.
+var playbackToken = 0;
 
 /* ═══════════════════════════════════════════════════════════════════════════
    ESSENTIA.JS LOADING (async, non-blocking)
@@ -95,24 +102,116 @@ function initDropZone() {
     var fi = document.getElementById('azFileInput');
 
     dz.addEventListener('click', function() { fi.click(); });
-    fi.addEventListener('change', function() { if (fi.files.length) processFile(fi.files[0]); });
+    fi.addEventListener('change', function() {
+        if (fi.files.length) processFile(fi.files[0]);
+        // Allow the same file to be selected again later.
+        fi.value = '';
+    });
 
     dz.addEventListener('dragover', function(e) { e.preventDefault(); dz.classList.add('drag-over'); });
     dz.addEventListener('dragleave', function() { dz.classList.remove('drag-over'); });
     dz.addEventListener('drop', function(e) {
         e.preventDefault(); dz.classList.remove('drag-over');
         if (e.dataTransfer.files.length) processFile(e.dataTransfer.files[0]);
+        // Handled here; don't let the document-level drop handler run twice.
+        e.stopPropagation();
+    });
+
+    // Accept drops anywhere on the page when the drop zone itself is not
+    // reachable: the results view is showing, or the loading overlay covers the
+    // page mid-analysis. This lets a second file be dropped at any time.
+    document.addEventListener('dragover', function(e) {
+        if (delayDropToDocument()) e.preventDefault();
+    });
+    document.addEventListener('drop', function(e) {
+        if (!delayDropToDocument()) return;
+        if (!e.dataTransfer || !e.dataTransfer.files.length) return;
+        e.preventDefault();
+        processFile(e.dataTransfer.files[0]);
     });
 
     document.getElementById('azNewBtn').addEventListener('click', resetUI);
 }
 
+function delayDropToDocument() {
+    var resultsVisible = !document.getElementById('azResults').classList.contains('az-hidden');
+    var loadingVisible = !document.getElementById('azLoading').classList.contains('az-hidden');
+    return resultsVisible || loadingVisible;
+}
+
+// Invalidate the current session, tear down anything it owns, and restore the
+// page to its initial state.
 function resetUI() {
-    stopPlayback();
+    sessionId++;
+    abortSessionWork();
     document.getElementById('azDropZone').classList.remove('az-hidden');
     document.getElementById('azResults').classList.add('az-hidden');
     audioBuffer = null;
     analysisData = null;
+    hideLoading();
+}
+
+// ── Reset helpers ─────────────────────────────────────────────────────────
+function resetTransportUI() {
+    document.getElementById('azPlayBtn').textContent = 'Play';
+    document.getElementById('azCurTime').textContent = '0:00';
+    document.getElementById('azTotalTime').textContent = '0:00';
+    var msg = document.getElementById('azProgressMsg');
+    if (msg) msg.textContent = '';
+}
+
+function clearVisualizations() {
+    ['azWaveform', 'azSpectrum', 'azGonio'].forEach(function(id) {
+        var canvas = document.getElementById(id);
+        if (!canvas) return;
+        var rect = canvas.getBoundingClientRect();
+        if (!rect.width || !rect.height) return;
+        var r = setupCanvas(canvas);
+        r.ctx.fillStyle = '#0d0f14';
+        r.ctx.fillRect(0, 0, r.w, r.h);
+    });
+}
+
+function resetMetricDisplay() {
+    document.getElementById('azFileName').textContent = '—';
+    document.getElementById('azDuration').textContent = '—';
+    document.getElementById('azSampleRate').textContent = '—';
+    document.getElementById('azChannels').textContent = '—';
+    document.getElementById('vLufs').textContent = '—';
+    document.getElementById('sLufs').textContent = 'Integrated Loudness';
+    document.getElementById('vTp').textContent = '—';
+    document.getElementById('sTp').textContent = 'dBTP';
+    document.getElementById('vBpm').textContent = '...';
+    document.getElementById('sBpm').textContent = 'BPM';
+    document.getElementById('vKey').textContent = '...';
+    document.getElementById('sKey').textContent = '—';
+    document.getElementById('vWidth').textContent = '—';
+    document.getElementById('sWidth').textContent = 'M/S Ratio';
+    document.getElementById('vStLufs').textContent = '—';
+    document.getElementById('vLra').textContent = '—';
+    document.getElementById('vRms').textContent = '—';
+    document.getElementById('vCrest').textContent = '—';
+    document.getElementById('vPhase').textContent = '—';
+    document.getElementById('vPeak').textContent = '—';
+    ['fLufs', 'fTp', 'fWidth'].forEach(function(id) {
+        var el = document.getElementById(id);
+        el.style.width = '0%';
+    });
+    document.getElementById('azStreamTable').innerHTML = '';
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SESSION LIFECYCLE
+   ═══════════════════════════════════════════════════════════════════════════ */
+// Start a new processing session: invalidates every callback belonging to the
+// previous one and tears down everything it owned.
+function beginSession() {
+    sessionId++;
+    abortSessionWork();
+    // Hide the previous file's results immediately; the loading overlay is up.
+    document.getElementById('azResults').classList.add('az-hidden');
+    document.getElementById('azDropZone').classList.remove('az-hidden');
+    return sessionId;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -124,37 +223,47 @@ async function processFile(file) {
         alert('File too large (' + sizeMB.toFixed(0) + ' MB). Maximum is 500 MB to avoid browser crashes.');
         return;
     }
+
+    var sid = beginSession();
+
     if (sizeMB > 200) {
         showLoading('Loading large file (' + sizeMB.toFixed(0) + ' MB) — this may take a moment...');
     } else {
         showLoading('Decoding audio...');
     }
+
+    var decoded;
     try {
         var arrayBuf = await file.arrayBuffer();
+        if (sid !== sessionId) return;
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        audioBuffer = await audioCtx.decodeAudioData(arrayBuf);
+        decoded = await audioCtx.decodeAudioData(arrayBuf);
+        if (sid !== sessionId) return;
     } catch (e) {
+        if (sid !== sessionId) return;
         hideLoading();
         alert('Could not decode this file. Make sure it is a valid audio file.');
         return;
     }
 
+    audioBuffer = decoded;
+
     // Update file info
     document.getElementById('azFileName').textContent = file.name;
-    document.getElementById('azDuration').textContent = fmtTime(audioBuffer.duration);
-    document.getElementById('azSampleRate').textContent = audioBuffer.sampleRate + ' Hz';
-    document.getElementById('azChannels').textContent = audioBuffer.numberOfChannels === 1 ? 'Mono' : 'Stereo';
-    document.getElementById('azTotalTime').textContent = fmtTime(audioBuffer.duration);
+    document.getElementById('azDuration').textContent = fmtTime(decoded.duration);
+    document.getElementById('azSampleRate').textContent = decoded.sampleRate + ' Hz';
+    document.getElementById('azChannels').textContent = decoded.numberOfChannels === 1 ? 'Mono' : 'Stereo';
+    document.getElementById('azTotalTime').textContent = fmtTime(decoded.duration);
 
     // Run analysis
     showLoading('Analyzing...');
-    runAnalysis(audioBuffer);
+    runAnalysis(decoded, sid);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    WORKER ANALYSIS
    ═══════════════════════════════════════════════════════════════════════════ */
-function runAnalysis(buffer) {
+function runAnalysis(buffer, sid) {
     // Prepare channel data
     var channels = [];
     for (var c = 0; c < buffer.numberOfChannels; c++) {
@@ -162,68 +271,96 @@ function runAnalysis(buffer) {
     }
 
     // Create worker from separate file (requires HTTP server, not file://)
-    if (worker) worker.terminate();
+    if (worker) { try { worker.terminate(); } catch (e) {} worker = null; }
+    var w;
     try {
-        worker = new Worker('js/worker.js');
+        w = new Worker('js/worker.js');
     } catch (e) {
-        hideLoading();
-        alert('Web Workers require an HTTP server.\n\nRun: python3 -m http.server\nThen open: http://localhost:8000');
+        if (sid === sessionId) {
+            hideLoading();
+            alert('Web Workers require an HTTP server.\n\nRun: python3 -m http.server\nThen open: http://localhost:8000');
+        }
         return;
     }
+    worker = w;
 
-    worker.onmessage = function(e) {
+    w.onmessage = function(e) {
+        // Drop anything coming from a superseded session or a stale worker.
+        if (sid !== sessionId || worker !== w) return;
+
         if (e.data.type === 'progress') {
             var msg = document.getElementById('azProgressMsg');
             if (msg) msg.textContent = e.data.msg;
         } else if (e.data.type === 'result') {
-            analysisData = e.data.data;
+            var data = e.data.data;
 
-            // Try essentia.js for better Key/BPM
-            var essentiaResult = essentiaAnalyze(buffer);
-            if (essentiaResult) {
-                if (essentiaResult.key && essentiaResult.key.key) {
-                    analysisData.key = {
-                        key: essentiaResult.key.key,
-                        scale: essentiaResult.key.scale === 'minor' ? 'Minor' : 'Major',
-                        strength: Math.round((essentiaResult.key.strength || 0) * 100)
-                    };
-                }
-                if (essentiaResult.bpm && essentiaResult.bpm.bpm > 0) {
-                    var bpm = essentiaResult.bpm.bpm;
-                    while (bpm < 60) bpm *= 2;
-                    while (bpm > 180) bpm /= 2;
-                    analysisData.bpm = Math.round(bpm * 10) / 10;
-                }
-            }
+            // Optional essentia.js refinement of Key/BPM, bound to this session.
+            data = enhanceWithEssentia(data, buffer, sid);
+            if (sid !== sessionId) return;
+            analysisData = data;
+
+            w.terminate();
+            if (worker === w) worker = null;
 
             // Show results container BEFORE rendering canvases (they need dimensions)
             document.getElementById('azDropZone').classList.add('az-hidden');
             document.getElementById('azResults').classList.remove('az-hidden');
             hideLoading();
-            // Small delay to let layout settle before canvas rendering
+            // Small delay to let layout settle before canvas rendering.
+            // Guarded again: the user may pick another file within this window.
             setTimeout(function() {
+                if (sid !== sessionId) return;
                 displayResults(analysisData, buffer);
             }, 50);
-            worker.terminate();
-            worker = null;
         } else if (e.data.type === 'error') {
             hideLoading();
             alert('Analysis error: ' + e.data.msg);
-            worker.terminate();
-            worker = null;
+            w.terminate();
+            if (worker === w) worker = null;
         }
     };
 
-    worker.onerror = function(e) {
+    w.onerror = function(e) {
+        if (sid !== sessionId || worker !== w) return;
         hideLoading();
         alert('Worker error: ' + (e.message || 'Unknown error'));
-        worker.terminate();
+        w.terminate();
         worker = null;
     };
 
     // Transfer channel data to worker
     var transferable = channels.map(function(ch) { return ch.buffer; });
-    worker.postMessage({ channels: channels, sampleRate: buffer.sampleRate }, transferable);
+    w.postMessage({ channels: channels, sampleRate: buffer.sampleRate }, transferable);
+}
+
+// Apply essentia.js results to a worker result object. Checks the session
+// before and after the (potentially costly) analysis so a result computed for
+// an old file can never land on the current one.
+function enhanceWithEssentia(data, buffer, sid) {
+    if (sid !== sessionId) return data;
+    var essentiaResult;
+    try {
+        essentiaResult = essentiaAnalyze(buffer);
+    } catch (e) {
+        return data;
+    }
+    if (sid !== sessionId) return data;
+    if (!essentiaResult) return data;
+
+    if (essentiaResult.key && essentiaResult.key.key) {
+        data.key = {
+            key: essentiaResult.key.key,
+            scale: essentiaResult.key.scale === 'minor' ? 'Minor' : 'Major',
+            strength: Math.round((essentiaResult.key.strength || 0) * 100)
+        };
+    }
+    if (essentiaResult.bpm && essentiaResult.bpm.bpm > 0) {
+        var bpm = essentiaResult.bpm.bpm;
+        while (bpm < 60) bpm *= 2;
+        while (bpm > 180) bpm /= 2;
+        data.bpm = Math.round(bpm * 10) / 10;
+    }
+    return data;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -284,11 +421,13 @@ function displayResults(d, buffer) {
     renderGoniometer(d.goniometer);
     buildStreamingTable(d.lufs, d.truePeak);
 
-    // Setup playback
-    pauseOffset = 0;
-    isPlaying = false;
-    document.getElementById('azPlayBtn').textContent = 'Play';
-    document.getElementById('azCurTime').textContent = '0:00';
+    // Transport belongs to the current session. Rewind it unless the user has
+    // already started playback in the brief window since the results appeared.
+    if (!isPlaying) {
+        pauseOffset = 0;
+        document.getElementById('azPlayBtn').textContent = 'Play';
+        document.getElementById('azCurTime').textContent = '0:00';
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -603,9 +742,12 @@ async function togglePlay() {
     if (!audioBuffer) return;
     if (playTransition) return;
     playTransition = true;
+    var sid = sessionId;
     try {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         if (audioCtx.state === 'suspended') await audioCtx.resume();
+        // A new file may have been dropped while resuming the context.
+        if (sid !== sessionId || !audioBuffer) return;
         if (isPlaying) {
             stopPlayback();
         } else {
@@ -620,6 +762,9 @@ function startPlayback() {
     if (!audioBuffer || !audioCtx) return;
     stopPlayback();
 
+    // This playback generation owns the nodes and the animation frame below.
+    playbackToken++;
+    var token = playbackToken;
     var node = audioCtx.createBufferSource();
     node.buffer = audioBuffer;
 
@@ -630,8 +775,9 @@ function startPlayback() {
     node.connect(analyserNode);
     analyserNode.connect(audioCtx.destination);
 
+    var splitter = null;
     if (audioBuffer.numberOfChannels >= 2) {
-        var splitter = audioCtx.createChannelSplitter(2);
+        splitter = audioCtx.createChannelSplitter(2);
         analyserL = audioCtx.createAnalyser(); analyserL.fftSize = 1024;
         analyserR = audioCtx.createAnalyser(); analyserR.fftSize = 1024;
         node.connect(splitter);
@@ -640,6 +786,7 @@ function startPlayback() {
     } else {
         analyserL = analyserR = null;
     }
+    splitterNode = splitter;
 
     sourceNode = node;
     startTime = audioCtx.currentTime;
@@ -648,20 +795,34 @@ function startPlayback() {
     document.getElementById('azPlayBtn').textContent = 'Pause';
 
     node.onended = function() {
-        if (sourceNode !== node) return;
+        // Only the playback generation that owns the current source node may
+        // touch the transport state.
+        if (token !== playbackToken || sourceNode !== node) return;
         isPlaying = false;
         pauseOffset = 0;
         sourceNode = null;
+        if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+        releasePlaybackNodes();
         document.getElementById('azPlayBtn').textContent = 'Play';
         document.getElementById('azCurTime').textContent = '0:00';
         renderWaveform(0);
-        if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
     };
 
-    updatePlaybackUI();
+    updatePlaybackUI(token);
 }
 
-function stopPlayback() {
+// Disconnect and drop the analyser / splitter nodes created by startPlayback.
+function releasePlaybackNodes() {
+    if (analyserNode) { try { analyserNode.disconnect(); } catch(e) {} analyserNode = null; }
+    if (analyserL) { try { analyserL.disconnect(); } catch(e) {} analyserL = null; }
+    if (analyserR) { try { analyserR.disconnect(); } catch(e) {} analyserR = null; }
+    if (splitterNode) { try { splitterNode.disconnect(); } catch(e) {} splitterNode = null; }
+}
+
+// Stop playback. When `resetPosition` is true the transport is rewound and the
+// playhead redrawn at zero; otherwise the position is kept for resume/seek.
+function stopPlayback(resetPosition) {
+    playbackToken++;
     if (sourceNode) {
         var node = sourceNode;
         sourceNode = null;
@@ -669,18 +830,25 @@ function stopPlayback() {
         try { node.stop(); } catch(e) {}
         try { node.disconnect(); } catch(e) {}
     }
-    if (analyserNode) { try { analyserNode.disconnect(); } catch(e) {} analyserNode = null; }
-    if (analyserL) { try { analyserL.disconnect(); } catch(e) {} analyserL = null; }
-    if (analyserR) { try { analyserR.disconnect(); } catch(e) {} analyserR = null; }
-    if (isPlaying) {
+    releasePlaybackNodes();
+    if (isPlaying && audioCtx) {
         pauseOffset += audioCtx.currentTime - startTime;
+        if (audioBuffer) {
+            pauseOffset = Math.max(0, Math.min(pauseOffset, audioBuffer.duration));
+        }
     }
     isPlaying = false;
-    document.getElementById('azPlayBtn').textContent = 'Play';
     if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    document.getElementById('azPlayBtn').textContent = 'Play';
+    if (resetPosition) {
+        pauseOffset = 0;
+        document.getElementById('azCurTime').textContent = '0:00';
+        renderWaveform(0);
+    }
 }
 
 function seekTo(time) {
+    if (!audioBuffer) return;
     var wasPlaying = isPlaying;
     if (isPlaying) stopPlayback();
     pauseOffset = Math.max(0, Math.min(time, audioBuffer.duration - 0.01));
@@ -689,8 +857,9 @@ function seekTo(time) {
     if (wasPlaying) startPlayback();
 }
 
-function updatePlaybackUI() {
-    if (!isPlaying) return;
+function updatePlaybackUI(token) {
+    if (token !== undefined && token !== playbackToken) return;
+    if (!isPlaying || !audioBuffer || !audioCtx) return;
     var currentTime = pauseOffset + (audioCtx.currentTime - startTime);
     var pos = currentTime / audioBuffer.duration;
 
@@ -732,7 +901,22 @@ function updatePlaybackUI() {
         renderSpectrum(analysisData.spectrum, Array.from(rtBands));
     }
 
-    rafId = requestAnimationFrame(updatePlaybackUI);
+    rafId = requestAnimationFrame(function() { updatePlaybackUI(token); });
+}
+
+// Release everything the current session owns (worker, playback nodes,
+// animation frame) and rewind transport state. Leaves UI visibility alone.
+function abortSessionWork() {
+    if (worker) {
+        try { worker.terminate(); } catch (e) {}
+        worker = null;
+    }
+    stopPlayback(true);
+    audioBuffer = null;
+    analysisData = null;
+    resetTransportUI();
+    resetMetricDisplay();
+    clearVisualizations();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
