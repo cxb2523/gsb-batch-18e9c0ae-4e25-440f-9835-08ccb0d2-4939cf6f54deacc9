@@ -428,7 +428,15 @@ export function GlassLens({ value, disabled = false }: GlassLensProps) {
     const touchAction = root.style.touchAction
     root.style.touchAction = 'pan-y'
     const io = new IntersectionObserver(([entry]) => {
-      view.visible = entry.isIntersecting
+      const next = entry.isIntersecting
+      if (next === view.visible) return
+      view.visible = next
+      // Coming back on screen: the loop skipped this view while it was off screen, so ask for a
+      // fresh frame. Going off screen: nothing to do, the loop will not draw it.
+      if (next) {
+        view.dirty = true
+        engine.wake()
+      }
     })
     io.observe(root)
     const ro = new ResizeObserver(() => {

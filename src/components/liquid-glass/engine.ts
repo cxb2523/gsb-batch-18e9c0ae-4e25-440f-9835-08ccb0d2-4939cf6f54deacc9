@@ -233,6 +233,12 @@ export type GlassEngine = {
   wake: () => void
   /** Any CSS colour (oklch, var(), color-mix…) → 0..1 RGBA. */
   resolveColor: (css: string) => Rgba
+  /** Debug/test introspection only; not part of the component-facing API. */
+  debug: () => {
+    viewCount: number
+    totalDraws: number
+    views: { visible: boolean; dirty: boolean; draws: number; width: number; height: number }[]
+  }
 }
 
 /** Damped spring. `omega` = speed (rad/s), `zeta` = damping ratio (< 1 bounces). Returns true while moving. */
@@ -1553,6 +1559,9 @@ function createEngine(): GlassEngine | null {
   const views = new Set<GlassView>()
   const reduced = window.matchMedia('(prefers-reduced-motion: reduce)')
   let dead = false
+  // Per-view GPU draw counts, for lifecycle/visibility tests (debug introspection only).
+  const drawCounts = new WeakMap<GlassView, number>()
+  let totalDraws = 0
 
   // Colour resolving: paint any CSS colour into a 1×1 canvas and read it back.
   const probeCanvas = document.createElement('canvas')
@@ -2304,6 +2313,8 @@ function createEngine(): GlassEngine | null {
       frostPassHeld = 0
     }
     gl.drawArrays(gl.TRIANGLES, 0, 3)
+    totalDraws++
+    drawCounts.set(v, (drawCounts.get(v) ?? 0) + 1)
     v.ctx.clearRect(0, 0, devW, devH)
     v.ctx.drawImage(glCanvas, 0, glCanvas.height - devH, devW, devH, 0, 0, devW, devH)
     v.drawn?.()
@@ -2339,6 +2350,11 @@ function createEngine(): GlassEngine | null {
     let regroup = meltsChanged
     meltsChanged = false
     for (const v of views) {
+      // Off-screen or unmounted views take no part in a frame: their springs and lights are not
+      // advanced, they are never drawn, and they cannot keep the loop running. When one comes
+      // back on screen its IntersectionObserver marks it dirty and wakes the engine, so it picks
+      // up from a settled state on its first frame.
+      if (!v.visible) continue
       const stepped = v.step(dt, still)
       // After the view's own springs: its `grow` is this frame's.
       const pulled = stepPull(v, dt, still)
@@ -2350,7 +2366,6 @@ function createEngine(): GlassEngine | null {
       if (moving || glowing) running = busy = true
       const melts = melting && v.button === true
       if (melts && v.visible !== shownButtons.has(v)) regroup = true
-      if (!v.visible) continue
       const again = v.repaint === true
       if (moving || glowing || v.dirty || again || relight) {
         const refresh = v.dirty
@@ -2389,6 +2404,9 @@ function createEngine(): GlassEngine | null {
       for (const [v, a] of mirrored) {
         if (!a.busy) continue
         a.busy = false
+        // An off-screen view must not be woken for a deferred reflection: it keeps the picture due
+        // and takes it on the first frame after it is visible again (its observer marks it dirty).
+        if (!v.visible) continue
         a.due = true
         a.at = 0
         v.repaint = true
@@ -2400,9 +2418,33 @@ function createEngine(): GlassEngine | null {
   const wake = () => {
     if (!raf && !dead) raf = requestAnimationFrame(frame)
   }
-  const invalidateAll = () => {
-    for (const v of views) v.dirty = true
-    wake()
+  // Only views still on the page and on screen take part in a frame. A theme change re-reads the
+  // colours of those alone: an unmounted view is no longer in `views`, and an off-screen one is
+  // left asleep — the IntersectionObserver marks it dirty when it comes back, and it then reads
+  // the current theme on its first frame.
+  const invalidateVisible = () => {
+    let any = false
+    for (const v of views) {
+      if (!v.visible) continue
+      v.dirty = true
+      any = true
+    }
+    if (any) wake()
+  }
+  // A theme change is a change to data-theme, a `dark` class on <html>, or the color-scheme
+  // style (set by the head script). Other class/style edits must not repaint every glass.
+  const THEME_CLASS = /(?:^|\s)dark(?:\s|$)/
+  const html = document.documentElement
+  // The theme signature as it was when the glass was last invalidated. A mutation that leaves it
+  // unchanged (an unrelated class or style edit) repaints nothing.
+  const htmlThemeSignature = () =>
+    `${html.getAttribute('data-theme') ?? ''}|${THEME_CLASS.test(html.className) ? 1 : 0}|${html.style.colorScheme ?? ''}`
+  let lastHtmlTheme = htmlThemeSignature()
+  const htmlThemeChanged = () => {
+    const next = htmlThemeSignature()
+    if (next === lastHtmlTheme) return false
+    lastHtmlTheme = next
+    return true
   }
 
   window.addEventListener(
@@ -2617,15 +2659,33 @@ function createEngine(): GlassEngine | null {
     },
     true,
   )
-  // Theme switches (class="dark", data-theme, color-scheme) re-read every colour.
-  new MutationObserver(invalidateAll).observe(document.documentElement, {
+  // Theme switches (class="dark", data-theme, color-scheme) re-read the colours of every glass
+  // that is still mounted and on screen. Only a real theme change wakes the loop: an unrelated
+  // class or style edit on <html> must not repaint a page full of glass.
+  new MutationObserver(() => {
+    if (!htmlThemeChanged()) return
+    invalidateVisible()
+  }).observe(html, {
     attributes: true,
     attributeFilter: ['class', 'data-theme', 'style'],
   })
-  new MutationObserver(invalidateAll).observe(document.body, { attributes: true, attributeFilter: ['data-theme'], subtree: true })
-  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', invalidateAll)
+  // A scoped data-theme on a wrapper only repaints the glass beneath it that is on screen.
+  new MutationObserver((records) => {
+    let woke = false
+    for (const record of records) {
+      const root = record.target
+      if (!(root instanceof Element)) continue
+      for (const v of views) {
+        if (!v.visible || !root.contains(v.canvas)) continue
+        v.dirty = true
+        woke = true
+      }
+    }
+    if (woke) wake()
+  }).observe(document.body, { attributes: true, attributeFilter: ['data-theme'], subtree: true })
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', invalidateVisible)
   // A radial bend scales with the viewport.
-  window.addEventListener('resize', invalidateAll, { passive: true })
+  window.addEventListener('resize', invalidateVisible, { passive: true })
   glCanvas.addEventListener('webglcontextlost', () => {
     dead = true
     for (const v of views) {
@@ -2669,6 +2729,10 @@ function createEngine(): GlassEngine | null {
         if (host && pulled.moved) host.style.translate = ''
         if (host && pulled.scaled) host.style.scale = ''
       }
+      // Forget every frame this view ever produced: its uniforms and its CSS box. Left behind,
+      // they would be read as the new view's starting state if the same canvas element were
+      // mounted again, so its first real frame could be skipped as "unchanged".
+      shown.delete(v)
       const a = mirrored.get(v)
       if (a) {
         mirrored.delete(v)
@@ -2676,13 +2740,25 @@ function createEngine(): GlassEngine | null {
         gl.deleteTexture(a.pic.tex)
       }
       const p = painted.get(v)
-      if (!p) return
-      painted.delete(v)
-      gl.deleteTexture(p.back.tex)
-      gl.deleteTexture(p.front.tex)
+      if (p) {
+        painted.delete(v)
+        gl.deleteTexture(p.back.tex)
+        gl.deleteTexture(p.front.tex)
+      }
     },
     wake,
     resolveColor,
+    debug: () => ({
+      viewCount: views.size,
+      totalDraws,
+      views: [...views].map((v) => ({
+        visible: v.visible,
+        dirty: v.dirty,
+        draws: drawCounts.get(v) ?? 0,
+        width: v.canvas.width,
+        height: v.canvas.height,
+      })),
+    }),
   }
 }
 
@@ -2693,4 +2769,10 @@ export function getGlassEngine(): GlassEngine | null {
   if (typeof window === 'undefined') return null
   if (engine === undefined) engine = createEngine()
   return engine
+}
+
+/** Debug/test introspection only: view and draw counts of the shared engine. Not component-facing API. */
+export function getGlassEngineDebug() {
+  const e = engine
+  return e ? e.debug() : { viewCount: 0, totalDraws: 0, views: [] }
 }

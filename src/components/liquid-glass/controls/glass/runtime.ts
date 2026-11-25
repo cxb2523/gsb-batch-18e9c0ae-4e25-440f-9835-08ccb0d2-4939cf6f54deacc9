@@ -96,6 +96,10 @@ type View = {
   light: { glow: Spring; x: number; y: number; press: boolean; key: boolean }
   renders: number
   renderMs: number
+  /** The theme this view last drew with, so a non-theme class change does not repaint it. */
+  theme: GlassThemeName
+  /** Once disposed the view is dead: the loop, observers and theme changes must never touch it. */
+  disposed: boolean
 }
 
 function createUniforms() {
@@ -344,28 +348,45 @@ async function createRuntime() {
   }
 
   const io = new IntersectionObserver((entries) => {
+    let woke = false
     for (const entry of entries) {
       for (const v of views) {
-        if (v.canvas === entry.target) {
-          v.visible = entry.isIntersecting
-          if (v.visible) v.dirty = true
+        if (v.disposed || v.canvas !== entry.target) continue
+        v.visible = entry.isIntersecting
+        // A view that comes back on screen repaints once; one that leaves is only skipped by the
+        // loop — it is never woken or drawn while off screen.
+        if (v.visible) {
+          v.dirty = true
+          woke = true
         }
       }
     }
-    wake()
+    if (woke) wake()
   })
-  // Theme switches anywhere re-render every view.
+  // Theme switches re-render the views that can actually see them and whose theme really
+  // changed. A scoped data-theme on an ancestor only affects the controls beneath it; the <html>
+  // theme (data-theme or a `dark` class) affects every control. Disposed and off-screen views are
+  // never marked or woken, and an unrelated class edit that leaves the theme alone does nothing.
   const themeChanged = () => {
-    views.forEach((v) => (v.dirty = true))
-    wake()
+    let woke = false
+    for (const v of views) {
+      if (v.disposed || !v.visible) continue
+      const next = themeOf(v.canvas)
+      if (next === v.theme) continue
+      v.theme = next
+      v.dirty = true
+      woke = true
+    }
+    if (woke) wake()
   }
+  // One observer over the document: subtree so a per-control data-theme on a wrapper (see
+  // Switch/Checkbox/RangeSlider) is seen as well as <html>'s data-theme and `dark` class. The
+  // per-view theme comparison above makes the broad `class` filter cheap.
   new MutationObserver(themeChanged).observe(document.documentElement, {
     attributes: true,
-    attributeFilter: ['data-theme'],
+    attributeFilter: ['data-theme', 'class'],
     subtree: true,
   })
-  // class="dark" is only watched on <html> (a subtree class watch would fire on every re-render).
-  new MutationObserver(themeChanged).observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
 
   function resizeLayers(v: View, spec: GlassViewSpec) {
     const dpr = Math.min(window.devicePixelRatio || 1, 2)
@@ -448,7 +469,7 @@ async function createRuntime() {
   const lift = (e: PointerEvent) => {
     if (e.pointerId !== beam.id) return
     beam.id = -1
-    for (const v of views) v.light.press = false
+    for (const v of views) if (!v.disposed) v.light.press = false
   }
   window.addEventListener('pointerup', lift, { passive: true, capture: true })
   window.addEventListener('pointercancel', lift, { passive: true, capture: true })
@@ -458,6 +479,7 @@ async function createRuntime() {
     if (down && (!LIGHT.on || e.repeat)) return
     const focused = document.activeElement
     for (const v of views) {
+      if (v.disposed) continue
       const host = v.canvas.parentElement
       const held = down && !!focused && !!host && (host.contains(focused) || focused.contains(host))
       if (held && !v.light.key && !v.light.press) v.light.x = v.light.y = 0
@@ -470,7 +492,7 @@ async function createRuntime() {
   window.addEventListener(
     'focusout',
     () => {
-      for (const v of views) v.light.key = false
+      for (const v of views) if (!v.disposed) v.light.key = false
       wake()
     },
     true,
@@ -557,6 +579,8 @@ async function createRuntime() {
     const spec = v.spec()
     resizeLayers(v, spec)
     const theme = themeOf(v.canvas)
+    // This frame is drawn in the current theme; keep the observer's comparison baseline in step.
+    v.theme = theme
     const tokens = glassTokens[theme]
 
     const bg = v.bgCanvas.getContext('2d')!
@@ -635,15 +659,20 @@ async function createRuntime() {
     pointer.moved = false
     let running = pointer.mix !== mixTarget
     for (const v of views) {
+      // A disposed view can never be reached by a frame: its textures and material are gone.
+      if (v.disposed) continue
       // A view still compiling keeps both loops going until it is ready.
       if (!v.ready) {
         running = true
         continue
       }
+      // Off-screen or unmounted views take no part in a frame: their springs are not advanced,
+      // they never render, and nothing they do can keep the loop running. The next time they
+      // become visible the IntersectionObserver marks them dirty and wakes the loop.
+      if (!v.visible) continue
       const spec = v.spec()
       const moving = spec.step?.(dt, reducedMotion.matches) ?? false
       if (moving) running = true
-      if (!v.visible) continue
       const lit = pointerLight(v, spec, dt, reducedMotion.matches)
       if (lit.moving) running = true
       if (moving || v.dirty || spec.alwaysRender) {
@@ -654,8 +683,8 @@ async function createRuntime() {
         if (v.dirty || spec.alwaysRender) running = true
       } else if (relight && v.devW > 0) {
         // Only the light moved: re-shade with the existing layers, no redraw or upload.
-        const spec = v.spec()
-        if ((spec.cursorLight && aimLight(v, spec)) || lit.changed) present(v)
+        const spec2 = v.spec()
+        if ((spec2.cursorLight && aimLight(v, spec2)) || lit.changed) present(v)
       } else if (lit.changed && v.devW > 0) {
         present(v)
       }
@@ -710,29 +739,62 @@ async function createRuntime() {
         light: { glow: { x: 0, v: 0 }, x: 0, y: 0, press: false, key: false },
         renders: 0,
         renderMs: 0,
+        theme: themeOf(canvas),
+        disposed: false,
       }
       views.add(view)
       wake()
       io.observe(canvas)
       resizeLayers(view, spec())
-      await renderer.compileAsync(scene, camera)
-      view.ready = true
-      wake()
-      return {
+      let disposed = false
+      const release = () => {
+        view.disposed = true
+        views.delete(view)
+        io.unobserve(canvas)
+        material.dispose()
+        bgLayer.tex.dispose()
+        fgLayer.tex.dispose()
+        // Drop the picture this canvas showed and any per-view state, so a later control
+        // reusing this canvas element starts from a clean one.
+        view.ctx.clearRect(0, 0, canvas.width, canvas.height)
+        view.dirty = false
+        view.light.press = false
+        view.light.key = false
+      }
+      const handle: GlassViewHandle = {
         invalidate: () => {
+          if (disposed || view.disposed) return
           view.dirty = true
           wake()
         },
         stats: () => ({ renders: view.renders, ms: view.renderMs }),
+        // Idempotent: safe to call while the shader is still compiling, or more than once.
         dispose: () => {
-          views.delete(view)
-          io.unobserve(canvas)
-          material.dispose()
-          bgLayer.tex.dispose()
-          fgLayer.tex.dispose()
+          if (disposed) return
+          disposed = true
+          release()
         },
       }
+      await renderer.compileAsync(scene, camera)
+      // The control may have unmounted while the shader compiled in the background. Its GPU
+      // resources were already released in dispose; never bring the dead view into the loop.
+      if (!disposed) {
+        view.ready = true
+        wake()
+      }
+      return handle
     },
+    debug: () => ({
+      views: [...views].map((v) => ({
+        renders: v.renders,
+        visible: v.visible,
+        ready: v.ready,
+        disposed: v.disposed,
+        theme: v.theme,
+        width: v.devW,
+        height: v.devH,
+      })),
+    }),
   }
 }
 
@@ -742,4 +804,14 @@ let runtime: ReturnType<typeof createRuntime> | null = null
 export function getGlassRuntime() {
   runtime ??= createRuntime()
   return runtime
+}
+
+/**
+ * Debug/test introspection only: the live render counts and lifecycle flags of every view the
+ * shared renderer currently holds, keyed by canvas. Not part of the component-facing API.
+ */
+export async function getGlassRuntimeDebug() {
+  const r = runtime
+  if (!r) return { views: [] as Array<{ renders: number; visible: boolean; ready: boolean; disposed: boolean; theme: string }> }
+  return (await r).debug()
 }
