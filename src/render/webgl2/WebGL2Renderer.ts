@@ -91,6 +91,9 @@ export class WebGL2Renderer implements ChartRenderer {
     this.streamFloats = 0;
     this.fieldBytesUsed = 0;
     this.commands.length = 0;
+    // While lost (including a failed restore waiting for its next retry) the backend belongs to a dead
+    // context generation: record the frame's CPU state but issue no GL calls into the old backend.
+    if (this.isLost) return;
     this.backend.viewport(0, 0, width, height);
     this.backend.clear(0, 0, 0, 0);
   }
@@ -99,6 +102,12 @@ export class WebGL2Renderer implements ChartRenderer {
   endFrame(): FrameReport {
     const commands = this.commands;
     if (commands.length === 0) return { uploadBytes: 0, drawCalls: 0 };
+    // Never submit into a lost backend: during restore retries that would draw against the dead context
+    // (or a test double of the discarded backend). Drop the frame; the next healthy frame re-uploads.
+    if (this.isLost) {
+      commands.length = 0;
+      return { uploadBytes: 0, drawCalls: 0 };
+    }
     const drawCalls = commands.length;
     try {
       this.backend.submit(this.stream, this.streamFloats, commands);
