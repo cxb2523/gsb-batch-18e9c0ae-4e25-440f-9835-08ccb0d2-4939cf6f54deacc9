@@ -30,6 +30,12 @@ function createBuffer(gl, data) {
 }
 
 function createTexture(gl, filter, data, width, height) {
+  // WebGL sizes textures in whole texels. Rounding here (instead of relying on
+  // implicit truncation) keeps the texture, the viewport and any CPU-side
+  // buffer (`width * height * 4`) exactly in sync.
+  width = Math.max(1, Math.round(width));
+  height = Math.max(1, Math.round(height));
+
   var texture = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, texture);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -60,17 +66,34 @@ function bindAttribute(gl, buffer, attribute, numComponents) {
 
 function createProgram(gl, vertexSource, fragmentSource) {
   var program = gl.createProgram();
+  var vertexShader;
+  var fragmentShader;
+  var unloaded = false;
 
-  var vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexSource);
-  var fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentSource);
+  try {
+    vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexSource);
+    fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentSource);
 
-  gl.attachShader(program, vertexShader);
-  gl.attachShader(program, fragmentShader);
+    gl.attachShader(program, vertexShader);
+    gl.attachShader(program, fragmentShader);
 
-  gl.linkProgram(program);
-  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      throw new Error(gl.getProgramInfoLog(program));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        throw new Error(gl.getProgramInfoLog(program));
+    }
+  } catch (e) {
+    // Don't leak partially created GL objects when compilation/linking fails.
+    if (vertexShader) gl.deleteShader(vertexShader);
+    if (fragmentShader) gl.deleteShader(fragmentShader);
+    gl.deleteProgram(program);
+    throw e;
   }
+
+  // The linked program keeps its own copy of the shaders' code.
+  gl.detachShader(program, vertexShader);
+  gl.detachShader(program, fragmentShader);
+  gl.deleteShader(vertexShader);
+  gl.deleteShader(fragmentShader);
 
   var wrapper = {
     program: program,
@@ -89,9 +112,14 @@ function createProgram(gl, vertexSource, fragmentSource) {
       wrapper[uniform.name] = gl.getUniformLocation(program, uniform.name);
   }
 
-  return wrapper; 
+  return wrapper;
 
   function unload() {
+    // Guard against double release: several owners may race to dispose the
+    // same wrapper while a rebuild is in flight.
+    if (unloaded) return;
+    unloaded = true;
+
     gl.deleteProgram(program);
   }
 }
@@ -102,7 +130,9 @@ function createShader(gl, type, source) {
 
   gl.compileShader(shader);
   if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-      throw new Error(gl.getShaderInfoLog(shader));
+      var log = gl.getShaderInfoLog(shader);
+      gl.deleteShader(shader);
+      throw new Error(log);
   }
 
   return shader;

@@ -115,9 +115,20 @@ export default function initScene(gl) {
 
   // screen rendering;
   var screenProgram = createScreenProgram(ctx);
-  var drawProgram = createDrawParticlesProgram(ctx);
+  var drawProgram = createDrawParticlesProgram(ctx, {
+    // Once a new vector field is compiled, traces drawn for the old field
+    // no longer belong on screen. We only mark the screen for reset here; the
+    // actual clearing happens at the beginning of the next frame, so a frame
+    // in progress never observes half-released resources.
+    onCodeUpdated() {
+      screenProgram.resetScreen();
+    }
+  });
   var cursorUpdater = createCursorUpdater(ctx);
   var vectorFieldEditorState = createVectorFieldEditorState(drawProgram);
+
+  var disposed = false;
+  var pendingSceneReady = null;
 
   // particles
   updateParticlesCount(particleCount);
@@ -166,13 +177,16 @@ export default function initScene(gl) {
   var panzoom = initPanzoom();
   restoreBBox();
 
-  setTimeout(() => {
+  pendingSceneReady = setTimeout(() => {
+    pendingSceneReady = null;
+    if (disposed) return;
     bus.fire('scene-ready', api);
   })
 
   return api;
 
   function moveBoundingBox(changes) {
+    if (disposed) return;
     if (!changes) return;
     var parsedBoundingBox = Object.assign({}, ctx.bbox);
 
@@ -284,8 +298,14 @@ export default function initScene(gl) {
   }
 
   function onResize() {
+    if (disposed) return;
+
     setWidthHeight(window.innerWidth, window.innerHeight);
 
+    // Screen textures must follow the canvas rectangle: particle positions are
+    // projected through the bounding box, and that bounding box is derived from
+    // `canvasRect`. If the two sizes disagree, particles are drawn into the
+    // wrong place.
     screenProgram.updateScreenTextures();
 
     updateBoundingBox(currentPanZoomTransform);
@@ -294,8 +314,11 @@ export default function initScene(gl) {
   function setWidthHeight(w, h) {
     var dx = Math.max(w * 0.02, 30);
     var dy = Math.max(h * 0.02, 30);
-    canvasRect.width = w + 2 * dx;
-    canvasRect.height = h + 2 * dy;
+    // Keep the canvas backing store and the screen textures at exactly the same
+    // integer size. Fractional dimensions would otherwise be truncated
+    // differently by the canvas, the texture allocation and the viewport.
+    canvasRect.width = Math.max(1, Math.round(w + 2 * dx));
+    canvasRect.height = Math.max(1, Math.round(h + 2 * dy));
     canvasRect.top = - dy;
     canvasRect.left = - dx;
 
@@ -308,14 +331,30 @@ export default function initScene(gl) {
   }
 
   function dispose() {
+      if (disposed) return;
+      disposed = true;
+
       stop();
       panzoom.dispose();
       window.removeEventListener('resize', onResize, true);
       cursorUpdater.dispose();
       vectorFieldEditorState.dispose();
+
+      if (pendingSceneReady) {
+        clearTimeout(pendingSceneReady);
+        pendingSceneReady = null;
+      }
+
+      // Release all WebGL resources owned by the rendering programs.
+      drawProgram.dispose();
+      screenProgram.dispose();
+
+      if (ctx.framebuffer) gl.deleteFramebuffer(ctx.framebuffer);
+      if (ctx.quadBuffer) gl.deleteBuffer(ctx.quadBuffer);
   }
 
   function nextFrame() {
+    if (disposed) return;
     if (lastAnimationFrame) return;
 
     if (isPaused) return;
@@ -330,6 +369,7 @@ export default function initScene(gl) {
 
   function draw() {
     lastAnimationFrame = 0;
+    if (disposed) return;
 
     drawScreen();
 
@@ -339,6 +379,8 @@ export default function initScene(gl) {
   }
 
   function drawScreen() {
+    if (disposed) return;
+
     screenProgram.fadeOutLastFrame()
     drawProgram.drawParticles();
     screenProgram.renderCurrentScreen();

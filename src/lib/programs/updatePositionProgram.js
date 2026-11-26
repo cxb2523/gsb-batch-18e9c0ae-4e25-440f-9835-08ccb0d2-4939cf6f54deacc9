@@ -15,36 +15,60 @@ export default function updatePositionProgram(ctx) {
   var particleStateResolution;
   var updateProgram;
   var readVelocity = makeReadProgram(ctx);
+  var disposed = false;
 
   // If someone needs to get vectors out from the GPU, they send a `vector-lines-request`
   // over the bus. This request is delayed until next compute frame. Once it is handled,
   // we send them back response with calculated vectors.
   var pendingVectorLines;
 
-  // TODO: need to make sure we are not leaking.
   bus.on('vector-lines-request', putVectorLinesRequestIntoQueue);
 
   return {
+    createProgram,
+    setProgram,
     updateCode,
     updateParticlesPositions,
     updateParticlesCount,
     prepareToDraw,
+    dispose,
   };
 
-  function updateCode(vectorField) {
+  /**
+   * Compiles the particle update shader for the given vector field without
+   * touching the currently active program. Callers can compile everything
+   * first, and only then swap programs in `setProgram` - this guarantees we
+   * never render a frame with a half-updated or already released program.
+   */
+  function createProgram(vectorField) {
     particlePositionShaderCodeBuilder.setCustomVectorField(vectorField);
     let fragment = particlePositionShaderCodeBuilder.getFragmentShader();
     let vertex = particlePositionShaderCodeBuilder.getVertexShader();
 
-    let newProgram = util.createProgram(gl, vertex, fragment);
+    return util.createProgram(gl, vertex, fragment);
+  }
 
-    if (updateProgram) updateProgram.unload();
+  function setProgram(newProgram) {
+    if (disposed) {
+      if (newProgram) newProgram.unload();
+      return;
+    }
+
+    var prevProgram = updateProgram;
     updateProgram = newProgram;
+    // Release the previous program only after the new one is in place.
+    if (prevProgram) prevProgram.unload();
 
     if (ctx.colorMode === ColorMode.VELOCITY) readVelocity.requestSpeedUpdate();
   }
-  
+
+  function updateCode(vectorField) {
+    if (disposed) return;
+    setProgram(createProgram(vectorField));
+  }
+
   function updateParticlesCount(x, y) {
+    if (disposed) return;
     particleStateResolution = ctx.particleStateResolution;
 
     var dimensions = [{
@@ -55,11 +79,15 @@ export default function updatePositionProgram(ctx) {
       particleState: y
     }];
 
+    // build new collections first, only then release the old ones
+    var nextReadTextures = textureCollection(gl, dimensions, particleStateResolution);
+    var nextWriteTextures = textureCollection(gl, dimensions, particleStateResolution);
+
     if (readTextures) readTextures.dispose();
-    readTextures = textureCollection(gl, dimensions, particleStateResolution);
+    readTextures = nextReadTextures;
 
     if (writeTextures) writeTextures.dispose();
-    writeTextures = textureCollection(gl, dimensions, particleStateResolution);
+    writeTextures = nextWriteTextures;
 
     readVelocity.updateParticlesCount();
   }
@@ -72,11 +100,15 @@ export default function updatePositionProgram(ctx) {
   }
 
   function updateParticlesPositions() {
+    if (disposed) return;
+
     var program = updateProgram;
+    if (!program || !readTextures || !writeTextures) return;
+
     gl.useProgram(program.program);
-  
+
     util.bindAttribute(gl, ctx.quadBuffer, program.a_pos, 2);
-  
+
     ctx.inputs.updateBindings(program);
 
     // TODO: Remove this.
@@ -86,7 +118,7 @@ export default function updatePositionProgram(ctx) {
     }
 
     readTextures.bindTextures(gl, program);
-  
+
     gl.uniform1f(program.u_rand_seed, ctx.frameSeed);
     gl.uniform1f(program.u_h, ctx.integrationTimeStep);
     gl.uniform1f(program.frame, ctx.frame);
@@ -98,7 +130,7 @@ export default function updatePositionProgram(ctx) {
     gl.uniform2f(program.u_max, bbox.maxX, bbox.maxY);
 
     gl.uniform1f(program.u_drop_rate, ctx.dropProbability);
-  
+
     // Draw each coordinate individually
     for(var i = 0; i < writeTextures.length; ++i) {
       var writeInfo = writeTextures.get(i);
@@ -123,6 +155,29 @@ export default function updatePositionProgram(ctx) {
     var temp = readTextures;
     readTextures = writeTextures;
     writeTextures = temp;
+  }
+
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+
+    bus.off('vector-lines-request', putVectorLinesRequestIntoQueue);
+    pendingVectorLines = null;
+
+    if (readTextures) {
+      readTextures.dispose();
+      readTextures = null;
+    }
+    if (writeTextures) {
+      writeTextures.dispose();
+      writeTextures = null;
+    }
+    if (updateProgram) {
+      updateProgram.unload();
+      updateProgram = null;
+    }
+
+    readVelocity.dispose();
   }
 
   function putVectorLinesRequestIntoQueue(request) {
